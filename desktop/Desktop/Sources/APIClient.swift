@@ -20,6 +20,17 @@ actor APIClient {
     return ""
   }
 
+  var selectedBackendTarget: DesktopBackendEnvironment.BackendTarget {
+    DesktopBackendEnvironment.selectedBackendTarget
+  }
+
+  var isUsingLocalDaemon: Bool {
+    selectedBackendTarget.mode == .localDaemon
+  }
+
+  /// Matches `LOCAL_DEFAULT_CHAT_SESSION_ID` in `desktop/local-backend` (implicit default-chat thread).
+  static let localDaemonDefaultChatSessionId = "00000000-0000-4000-8000-000000000001"
+
   let session: URLSession
   private let decoder: JSONDecoder
 
@@ -75,7 +86,9 @@ actor APIClient {
 
   // MARK: - Request Building
 
-  func buildHeaders(requireAuth: Bool = true) async throws -> [String: String] {
+  func buildHeaders(requireAuth: Bool = true, includeBYOK: Bool = false) async throws
+    -> [String: String]
+  {
     var headers: [String: String] = [
       "Content-Type": "application/json",
       "X-App-Platform": "macos",
@@ -92,10 +105,10 @@ actor APIClient {
       }
     }
 
-    // BYOK: attach user-provided keys so the backend uses them for LLM/STT
-    // calls this request triggers. Sent per-request; never stored server-side.
-    for (provider, entry) in APIKeyService.byokSnapshot {
-      headers[provider.headerName] = entry.key
+    // BYOK keys are raw provider credentials. Only attach them to explicit
+    // provider/STT work, never to ordinary account, settings, session, or support requests.
+    if includeBYOK {
+      headers.merge(APIKeyService.byokHeaders()) { _, new in new }
     }
 
     return headers
@@ -114,7 +127,7 @@ actor APIClient {
     request.httpMethod = "GET"
     request.allHTTPHeaderFields = try await buildHeaders(requireAuth: requireAuth)
 
-    return try await performRequest(request)
+    return try await performRequest(request, retryOnUnauthorized: requireAuth)
   }
 
   func post<T: Decodable, B: Encodable>(
@@ -131,7 +144,7 @@ actor APIClient {
     request.allHTTPHeaderFields = try await buildHeaders(requireAuth: requireAuth)
     request.httpBody = try JSONEncoder().encode(body)
 
-    return try await performRequest(request)
+    return try await performRequest(request, retryOnUnauthorized: requireAuth)
   }
 
   func post<T: Decodable>(
@@ -145,7 +158,23 @@ actor APIClient {
     request.httpMethod = "POST"
     request.allHTTPHeaderFields = try await buildHeaders(requireAuth: requireAuth)
 
-    return try await performRequest(request)
+    return try await performRequest(request, retryOnUnauthorized: requireAuth)
+  }
+
+  func put<T: Decodable, B: Encodable>(
+    _ endpoint: String,
+    body: B,
+    requireAuth: Bool = true,
+    customBaseURL: String? = nil
+  ) async throws -> T {
+    let base = customBaseURL ?? baseURL
+    let url = URL(string: base + endpoint)!
+    var request = URLRequest(url: url)
+    request.httpMethod = "PUT"
+    request.allHTTPHeaderFields = try await buildHeaders(requireAuth: requireAuth)
+    request.httpBody = try JSONEncoder().encode(body)
+
+    return try await performRequest(request, retryOnUnauthorized: requireAuth)
   }
 
   func delete(
@@ -174,9 +203,68 @@ actor APIClient {
     }
   }
 
+  func checkSelectedBackendHealth() async throws -> LocalDaemonHealth {
+    let target = selectedBackendTarget
+    return try await get("health", requireAuth: target.requiresAuth, customBaseURL: target.baseURL)
+  }
+
+  func getSelectedBackendSettings() async throws -> [LocalDaemonSetting] {
+    let target = selectedBackendTarget
+    guard target.mode == .localDaemon else {
+      return []
+    }
+    let response: LocalDaemonSettingsResponse = try await get(
+      "v1/settings",
+      requireAuth: false,
+      customBaseURL: target.baseURL
+    )
+    return response.settings
+  }
+
+  func updateSelectedBackendSettings(_ values: [String: String]) async throws
+    -> [LocalDaemonSetting]
+  {
+    try await updateSelectedBackendSettings(
+      values.mapValues { LocalDaemonSettingUpdateValue.string($0) })
+  }
+
+  func updateSelectedBackendSettings(_ values: [String: LocalDaemonSettingUpdateValue]) async throws
+    -> [LocalDaemonSetting]
+  {
+    let target = selectedBackendTarget
+    guard target.mode == .localDaemon else {
+      return []
+    }
+    let response: LocalDaemonSettingsResponse = try await put(
+      "v1/settings",
+      body: values,
+      requireAuth: false,
+      customBaseURL: target.baseURL
+    )
+    return response.settings
+  }
+
+  func testHybridProvider(key: String) async throws -> LocalDaemonTestProviderResponse {
+    let target = selectedBackendTarget
+    guard target.mode == .localDaemon else {
+      throw APIError.featureUnavailable(
+        feature: "test_hybrid_provider",
+        reason: "Provider tests are only available in local daemon mode."
+      )
+    }
+    return try await post(
+      "v1/settings/test-provider",
+      body: LocalDaemonTestProviderRequest(key: key),
+      requireAuth: false,
+      customBaseURL: target.baseURL
+    )
+  }
+
   // MARK: - Request Execution
 
-  private func performRequest<T: Decodable>(_ request: URLRequest) async throws -> T {
+  private func performRequest<T: Decodable>(_ request: URLRequest, retryOnUnauthorized: Bool)
+    async throws -> T
+  {
     let (data, response) = try await session.data(for: request)
 
     guard let httpResponse = response as? HTTPURLResponse else {
@@ -185,6 +273,9 @@ actor APIClient {
 
     // Handle 401 - token might be expired
     if httpResponse.statusCode == 401 {
+      guard retryOnUnauthorized else {
+        throw APIError.unauthorized
+      }
       // Try to refresh token and retry once
       let authService = await MainActor.run { AuthService.shared }
       _ = try await authService.getIdToken(forceRefresh: true)
@@ -249,6 +340,7 @@ enum APIError: LocalizedError {
   case unauthorized
   case httpError(statusCode: Int)
   case decodingError(Error)
+  case featureUnavailable(feature: String, reason: String)
 
   var errorDescription: String? {
     switch self {
@@ -260,6 +352,96 @@ enum APIError: LocalizedError {
       return "HTTP error: \(statusCode)"
     case .decodingError(let error):
       return "Failed to decode response: \(error.localizedDescription)"
+    case .featureUnavailable(let feature, let reason):
+      return "\(feature) is unavailable: \(reason)"
+    }
+  }
+}
+
+struct LocalDaemonHealth: Decodable, Equatable {
+  let service: String
+  let mode: String
+  let version: String
+  let bindAddress: String?
+  let dataDir: String?
+
+  enum CodingKeys: String, CodingKey {
+    case service, mode, version
+    case bindAddress = "bind_addr"
+    case dataDir = "data_dir"
+  }
+}
+
+struct LocalDaemonSettingsResponse: Decodable {
+  let settings: [LocalDaemonSetting]
+}
+
+struct LocalDaemonTestProviderRequest: Encodable {
+  let key: String
+}
+
+struct LocalDaemonTestProviderResponse: Decodable, Equatable {
+  let ok: Bool
+  let key: String
+  let message: String
+}
+
+struct LocalDaemonSetting: Decodable, Equatable {
+  let key: String
+  let valueJson: String
+  let updatedAt: Date
+
+  enum CodingKeys: String, CodingKey {
+    case key
+    case valueJson = "value_json"
+    case updatedAt = "updated_at"
+  }
+}
+
+enum LocalDaemonSettingUpdateValue: Encodable, Equatable, ExpressibleByStringLiteral,
+  ExpressibleByBooleanLiteral, ExpressibleByIntegerLiteral, ExpressibleByFloatLiteral
+{
+  case string(String)
+  case bool(Bool)
+  case int(Int)
+  case double(Double)
+  case object([String: LocalDaemonSettingUpdateValue])
+  case array([LocalDaemonSettingUpdateValue])
+  case null
+
+  init(stringLiteral value: String) {
+    self = .string(value)
+  }
+
+  init(booleanLiteral value: Bool) {
+    self = .bool(value)
+  }
+
+  init(integerLiteral value: Int) {
+    self = .int(value)
+  }
+
+  init(floatLiteral value: Double) {
+    self = .double(value)
+  }
+
+  func encode(to encoder: Encoder) throws {
+    var container = encoder.singleValueContainer()
+    switch self {
+    case .string(let value):
+      try container.encode(value)
+    case .bool(let value):
+      try container.encode(value)
+    case .int(let value):
+      try container.encode(value)
+    case .double(let value):
+      try container.encode(value)
+    case .object(let value):
+      try container.encode(value)
+    case .array(let value):
+      try container.encode(value)
+    case .null:
+      try container.encodeNil()
     }
   }
 }
@@ -267,6 +449,31 @@ enum APIError: LocalizedError {
 // MARK: - Conversation API
 
 extension APIClient {
+
+  private var mvpBackendTarget: DesktopBackendEnvironment.BackendTarget {
+    selectedBackendTarget
+  }
+
+  private func requireCapability(_ capability: DesktopBackendEnvironment.Capability) throws {
+    let target = selectedBackendTarget
+    guard DesktopBackendEnvironment.isCapability(capability, availableIn: target.mode) else {
+      throw APIError.featureUnavailable(
+        feature: capability.rawValue,
+        reason: DesktopBackendEnvironment.unavailableReason(for: capability, in: target.mode)
+          ?? "Unavailable in the selected backend mode."
+      )
+    }
+  }
+
+  private static func isoString(_ date: Date) -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter.string(from: date)
+  }
+
+  private static func queryValue(_ value: String) -> String {
+    value.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? value
+  }
 
   /// Fetches conversations from the API with optional filtering
   func getConversations(
@@ -279,6 +486,33 @@ extension APIClient {
     folderId: String? = nil,
     starred: Bool? = nil
   ) async throws -> [ServerConversation] {
+    let target = mvpBackendTarget
+    if target.mode == .localDaemon {
+      var queryItems: [String] = [
+        "limit=\(limit)",
+        "offset=\(offset)",
+      ]
+      if let startDate = startDate {
+        queryItems.append("start_date=\(Self.queryValue(Self.isoString(startDate)))")
+      }
+      if let endDate = endDate {
+        queryItems.append("end_date=\(Self.queryValue(Self.isoString(endDate)))")
+      }
+      if let starred = starred {
+        queryItems.append("starred=\(starred)")
+      }
+      if let folderId = folderId {
+        queryItems.append("folder_id=\(Self.queryValue(folderId))")
+      }
+      let endpoint = "v1/conversations?\(queryItems.joined(separator: "&"))"
+      let response: LocalConversationsResponse = try await get(
+        endpoint,
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return response.conversations.map { $0.toServerConversation(transcriptSegments: []) }
+    }
+
     var queryItems: [String] = [
       "limit=\(limit)",
       "offset=\(offset)",
@@ -314,16 +548,49 @@ extension APIClient {
 
   /// Fetches a single conversation by ID
   func getConversation(id: String) async throws -> ServerConversation {
+    let target = mvpBackendTarget
+    if target.mode == .localDaemon {
+      let response: LocalConversationResponse = try await get(
+        "v1/conversations/\(id)",
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return response.conversation.toServerConversation(
+        transcriptSegments: response.transcriptSegments.map { $0.toTranscriptSegment() }
+      )
+    }
+
     return try await get("v1/conversations/\(id)")
   }
 
   /// Deletes a conversation by ID
   func deleteConversation(id: String) async throws {
+    let target = mvpBackendTarget
+    if target.mode == .localDaemon {
+      try await delete("v1/conversations/\(id)", requireAuth: false, customBaseURL: target.baseURL)
+      return
+    }
+
     try await delete("v1/conversations/\(id)")
   }
 
   /// Updates the starred status of a conversation
   func setConversationStarred(id: String, starred: Bool) async throws {
+    struct StarredUpdate: Encodable {
+      let starred: Bool
+    }
+
+    let target = mvpBackendTarget
+    if target.mode == .localDaemon {
+      let _: LocalConversationEnvelope = try await patch(
+        "v1/conversations/\(id)",
+        body: StarredUpdate(starred: starred),
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return
+    }
+
     let url = URL(string: baseURL + "v1/conversations/\(id)/starred?starred=\(starred)")!
     var request = URLRequest(url: url)
     request.httpMethod = "PATCH"
@@ -342,6 +609,8 @@ extension APIClient {
   ///   - id: The conversation ID
   ///   - visibility: The visibility level ("shared", "public", or "private")
   func setConversationVisibility(id: String, visibility: String = "shared") async throws {
+    try requireCapability(.publicSharing)
+
     let url = URL(
       string: baseURL
         + "v1/conversations/\(id)/visibility?value=\(visibility)&visibility=\(visibility)")!
@@ -361,6 +630,8 @@ extension APIClient {
   /// - Parameter id: The conversation ID
   /// - Returns: The shareable URL for the conversation
   func getConversationShareLink(id: String) async throws -> String {
+    try requireCapability(.publicSharing)
+
     // Set visibility to shared
     try await setConversationVisibility(id: id, visibility: "shared")
     // Return the web URL for the shared conversation
@@ -371,6 +642,17 @@ extension APIClient {
   func updateConversationTitle(id: String, title: String) async throws {
     struct TitleUpdate: Encodable {
       let title: String
+    }
+
+    let target = mvpBackendTarget
+    if target.mode == .localDaemon {
+      let _: LocalConversationEnvelope = try await patch(
+        "v1/conversations/\(id)",
+        body: TitleUpdate(title: title),
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return
     }
 
     let url = URL(string: baseURL + "v1/conversations/\(id)")!
@@ -394,6 +676,20 @@ extension APIClient {
     perPage: Int = 10,
     includeDiscarded: Bool = false
   ) async throws -> ConversationSearchResult {
+    let target = mvpBackendTarget
+    if target.mode == .localDaemon {
+      let response: LocalConversationSearchResponse = try await get(
+        "v1/search/conversations?q=\(Self.queryValue(query))&limit=\(perPage)",
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return ConversationSearchResult(
+        items: response.results.map { $0.toServerConversation() },
+        currentPage: 1,
+        totalPages: 1
+      )
+    }
+
     struct SearchRequest: Encodable {
       let query: String
       let page: Int
@@ -422,6 +718,20 @@ extension APIClient {
     includeDiscarded: Bool = false,
     statuses: [ConversationStatus] = [.completed, .processing]
   ) async throws -> Int {
+    struct CountResponse: Decodable {
+      let count: Int
+    }
+
+    let target = mvpBackendTarget
+    if target.mode == .localDaemon {
+      let response: CountResponse = try await get(
+        "v1/conversations/count",
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return response.count
+    }
+
     if let cache = conversationsCountCache, let time = conversationsCountCacheTime,
       Date().timeIntervalSince(time) < 5
     {
@@ -439,14 +749,107 @@ extension APIClient {
 
     let endpoint = "v1/conversations/count?\(queryItems.joined(separator: "&"))"
 
-    struct CountResponse: Decodable {
-      let count: Int
-    }
-
     let response: CountResponse = try await get(endpoint)
     conversationsCountCache = response.count
     conversationsCountCacheTime = Date()
     return response.count
+  }
+
+  func createLocalDaemonConversation(
+    sessionId: String? = nil,
+    title: String? = nil,
+    overview: String? = nil,
+    startedAt: Date? = nil
+  ) async throws -> ServerConversation {
+    let target = selectedBackendTarget
+    guard target.mode == .localDaemon else {
+      throw APIError.httpError(statusCode: 400)
+    }
+
+    struct Request: Encodable {
+      let sessionId: String?
+      let title: String?
+      let overview: String?
+      let startedAt: String?
+
+      enum CodingKeys: String, CodingKey {
+        case title, overview
+        case sessionId = "session_id"
+        case startedAt = "started_at"
+      }
+    }
+
+    let response: LocalConversationEnvelope = try await post(
+      "v1/conversations",
+      body: Request(
+        sessionId: sessionId,
+        title: title,
+        overview: overview,
+        startedAt: startedAt.map(Self.isoString)
+      ),
+      requireAuth: false,
+      customBaseURL: target.baseURL
+    )
+    return response.conversation.toServerConversation(transcriptSegments: [])
+  }
+
+  func appendLocalDaemonTranscriptSegment(
+    conversationId: String,
+    segment: TranscriptionSegmentRecord
+  ) async throws {
+    let target = selectedBackendTarget
+    guard target.mode == .localDaemon else {
+      throw APIError.httpError(statusCode: 400)
+    }
+
+    struct Request: Encodable {
+      let id: String?
+      let speakerId: String?
+      let speakerLabel: String?
+      let text: String
+      let startMs: Int64
+      let endMs: Int64
+      let segmentIndex: Int
+      let source: String
+
+      enum CodingKeys: String, CodingKey {
+        case id, text, source
+        case speakerId = "speaker_id"
+        case speakerLabel = "speaker_label"
+        case startMs = "start_ms"
+        case endMs = "end_ms"
+        case segmentIndex = "segment_index"
+      }
+    }
+
+    let _: LocalTranscriptSegmentEnvelope = try await post(
+      "v1/conversations/\(conversationId)/transcript-segments",
+      body: Request(
+        id: segment.segmentId,
+        speakerId: String(segment.speaker),
+        speakerLabel: segment.speakerLabel,
+        text: segment.text,
+        startMs: Int64((segment.startTime * 1000).rounded()),
+        endMs: Int64((segment.endTime * 1000).rounded()),
+        segmentIndex: segment.segmentOrder,
+        source: "desktop"
+      ),
+      requireAuth: false,
+      customBaseURL: target.baseURL
+    )
+  }
+
+  func finalizeLocalDaemonTranscript(conversationId: String) async throws {
+    let target = selectedBackendTarget
+    guard target.mode == .localDaemon else {
+      throw APIError.httpError(statusCode: 400)
+    }
+
+    let _: LocalProcessingJobEnvelope = try await post(
+      "v1/conversations/\(conversationId)/finalize-transcript",
+      requireAuth: false,
+      customBaseURL: target.baseURL
+    )
   }
 
   /// Gets the count of AI chat messages from PostHog
@@ -473,6 +876,17 @@ extension APIClient {
       }
     }
 
+    let target = mvpBackendTarget
+    if target.mode == .localDaemon {
+      let body = MergeRequest(conversationIds: ids, reprocess: reprocess)
+      return try await post(
+        "v1/conversations/merge",
+        body: body,
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+    }
+
     let body = MergeRequest(conversationIds: ids, reprocess: reprocess)
     return try await post("v1/conversations/merge", body: body)
   }
@@ -481,6 +895,19 @@ extension APIClient {
 
   /// Gets all folders for the user
   func getFolders() async throws -> [Folder] {
+    let target = mvpBackendTarget
+    if target.mode == .localDaemon {
+      struct FoldersPayload: Decodable {
+        let folders: [Folder]
+      }
+      let response: FoldersPayload = try await get(
+        "v1/conversation-folders",
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return response.folders
+    }
+
     return try await get("v1/folders")
   }
 
@@ -488,7 +915,21 @@ extension APIClient {
   func createFolder(name: String, description: String? = nil, color: String? = nil) async throws
     -> Folder
   {
+    let target = mvpBackendTarget
     let body = CreateFolderRequest(name: name, description: description, color: color)
+    if target.mode == .localDaemon {
+      struct FolderPayload: Decodable {
+        let folder: Folder
+      }
+      let response: FolderPayload = try await post(
+        "v1/conversation-folders",
+        body: body,
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return response.folder
+    }
+
     return try await post("v1/folders", body: body)
   }
 
@@ -497,21 +938,62 @@ extension APIClient {
     id: String, name: String? = nil, description: String? = nil, color: String? = nil,
     order: Int? = nil
   ) async throws -> Folder {
+    let target = mvpBackendTarget
     let body = UpdateFolderRequest(name: name, description: description, color: color, order: order)
+    if target.mode == .localDaemon {
+      struct FolderPayload: Decodable {
+        let folder: Folder
+      }
+      let response: FolderPayload = try await patch(
+        "v1/conversation-folders/\(id)",
+        body: body,
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return response.folder
+    }
+
     return try await patch("v1/folders/\(id)", body: body)
   }
 
   /// Deletes a folder
   func deleteFolder(id: String, moveToFolderId: String? = nil) async throws {
+    let target = mvpBackendTarget
+    if target.mode == .localDaemon {
+      var endpoint = "v1/conversation-folders/\(id)"
+      if let moveToId = moveToFolderId {
+        endpoint += "?move_to_folder_id=\(Self.queryValue(moveToId))"
+      }
+      try await delete(endpoint, requireAuth: false, customBaseURL: target.baseURL)
+      return
+    }
+
     var endpoint = "v1/folders/\(id)"
     if let moveToId = moveToFolderId {
-      endpoint += "?move_to_folder_id=\(moveToId)"
+      endpoint += "?move_to_folder_id=\(Self.queryValue(moveToId))"
     }
     try await delete(endpoint)
   }
 
   /// Moves a conversation to a folder
   func moveConversationToFolder(conversationId: String, folderId: String?) async throws {
+    let target = mvpBackendTarget
+    if target.mode == .localDaemon {
+      struct FolderIdBody: Encodable {
+        let folderId: String?
+        enum CodingKeys: String, CodingKey {
+          case folderId = "folder_id"
+        }
+      }
+      let _: LocalConversationEnvelope = try await patch(
+        "v1/conversations/\(conversationId)",
+        body: FolderIdBody(folderId: folderId),
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return
+    }
+
     let body = MoveToFolderRequest(folderId: folderId)
     let url = URL(string: baseURL + "v1/conversations/\(conversationId)/folder")!
     var request = URLRequest(url: url)
@@ -961,6 +1443,173 @@ struct ConversationSearchResult: Codable {
   }
 }
 
+private struct LocalConversationsResponse: Decodable {
+  let conversations: [LocalConversation]
+}
+
+private struct LocalConversationEnvelope: Decodable {
+  let conversation: LocalConversation
+}
+
+private struct LocalConversationResponse: Decodable {
+  let conversation: LocalConversation
+  let transcriptSegments: [LocalTranscriptSegment]
+
+  enum CodingKeys: String, CodingKey {
+    case conversation
+    case transcriptSegments = "transcript_segments"
+  }
+}
+
+private struct LocalConversationSearchResponse: Decodable {
+  let results: [LocalConversationSearchResult]
+}
+
+private struct LocalTranscriptSegmentEnvelope: Decodable {
+  let transcriptSegment: LocalTranscriptSegment
+
+  enum CodingKeys: String, CodingKey {
+    case transcriptSegment = "transcript_segment"
+  }
+}
+
+private struct LocalProcessingJobEnvelope: Decodable {
+  let processingJob: LocalProcessingJob
+
+  enum CodingKeys: String, CodingKey {
+    case processingJob = "processing_job"
+  }
+}
+
+private struct LocalProcessingJob: Decodable {
+  let id: String
+}
+
+private struct LocalConversation: Decodable {
+  let id: String
+  let sessionId: String
+  let title: String
+  let overview: String
+  let status: String
+  let startedAt: Date
+  let endedAt: Date?
+  let createdAt: Date
+  let deletedAt: Date?
+  let starred: Bool
+  let folderId: String?
+
+  enum CodingKeys: String, CodingKey {
+    case id, title, overview, status, starred
+    case sessionId = "session_id"
+    case startedAt = "started_at"
+    case endedAt = "ended_at"
+    case createdAt = "created_at"
+    case deletedAt = "deleted_at"
+    case folderId = "folder_id"
+  }
+
+  func toServerConversation(transcriptSegments: [TranscriptSegment]) -> ServerConversation {
+    ServerConversation(
+      id: id,
+      createdAt: createdAt,
+      startedAt: startedAt,
+      finishedAt: endedAt,
+      structured: Structured(
+        title: title,
+        overview: overview,
+        emoji: "",
+        category: "other",
+        actionItems: [],
+        events: []
+      ),
+      transcriptSegments: transcriptSegments,
+      geolocation: nil,
+      photos: [],
+      appsResults: [],
+      source: .desktop,
+      language: nil,
+      status: status == "open" ? .inProgress : (ConversationStatus(rawValue: status) ?? .completed),
+      discarded: false,
+      deleted: deletedAt != nil,
+      isLocked: false,
+      starred: starred,
+      folderId: folderId,
+      inputDeviceName: nil
+    )
+  }
+}
+
+private struct LocalTranscriptSegment: Decodable {
+  let id: String
+  let speakerId: String?
+  let speakerLabel: String?
+  let text: String
+  let startMs: Int64
+  let endMs: Int64
+
+  enum CodingKeys: String, CodingKey {
+    case id, text
+    case speakerId = "speaker_id"
+    case speakerLabel = "speaker_label"
+    case startMs = "start_ms"
+    case endMs = "end_ms"
+  }
+
+  func toTranscriptSegment() -> TranscriptSegment {
+    TranscriptSegment(
+      id: id,
+      backendId: id,
+      text: text,
+      speaker: speakerLabel ?? speakerId,
+      isUser: false,
+      personId: nil,
+      start: Double(startMs) / 1000,
+      end: Double(endMs) / 1000
+    )
+  }
+}
+
+private struct LocalConversationSearchResult: Decodable {
+  let conversationId: String
+  let title: String
+  let overview: String
+
+  enum CodingKeys: String, CodingKey {
+    case title, overview
+    case conversationId = "conversation_id"
+  }
+
+  func toServerConversation() -> ServerConversation {
+    ServerConversation(
+      id: conversationId,
+      createdAt: Date(),
+      startedAt: nil,
+      finishedAt: nil,
+      structured: Structured(
+        title: title,
+        overview: overview,
+        emoji: "",
+        category: "other",
+        actionItems: [],
+        events: []
+      ),
+      transcriptSegments: [],
+      geolocation: nil,
+      photos: [],
+      appsResults: [],
+      source: .desktop,
+      language: nil,
+      status: .completed,
+      discarded: false,
+      deleted: false,
+      isLocked: false,
+      starred: false,
+      folderId: nil,
+      inputDeviceName: nil
+    )
+  }
+}
+
 // MARK: - Merge Response
 
 /// Response from merge conversations API
@@ -1232,6 +1881,17 @@ extension APIClient {
   /// Returns the processed conversation on success, nil on 404 (already processed).
   /// Throws on other errors.
   func forceProcessConversation() async throws -> ServerConversation? {
+    let target = selectedBackendTarget
+    guard target.mode != .localDaemon else {
+      throw APIError.featureUnavailable(
+        feature: "force_process_conversation",
+        reason: DesktopBackendEnvironment.unavailableReason(
+          for: .hostedTranscription,
+          in: target.mode
+        ) ?? "Force-processing is only available for hosted transcription sessions."
+      )
+    }
+
     struct EmptyBody: Encodable {}
 
     do {
@@ -1260,6 +1920,29 @@ extension APIClient {
     tags: [String]? = nil,
     includeDismissed: Bool = false
   ) async throws -> [ServerMemory] {
+    let target = selectedBackendTarget
+    if target.mode == .localDaemon {
+      var queryItems: [String] = [
+        "limit=\(limit)",
+        "offset=\(offset)",
+      ]
+      if let category = category {
+        queryItems.append("category=\(Self.queryValue(category))")
+      }
+      if let tags = tags, !tags.isEmpty {
+        queryItems.append("tags=\(Self.queryValue(tags.joined(separator: ",")))")
+      }
+      if includeDismissed {
+        queryItems.append("include_dismissed=true")
+      }
+      let response: LocalMemoriesResponse = try await get(
+        "v1/memories?\(queryItems.joined(separator: "&"))",
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return response.memories.map { $0.toServerMemory() }
+    }
+
     var endpoint = "v3/memories?limit=\(limit)&offset=\(offset)"
     if let category = category {
       endpoint += "&category=\(category)"
@@ -1288,6 +1971,21 @@ extension APIClient {
     windowTitle: String? = nil,
     headline: String? = nil
   ) async throws -> CreateMemoryResponse {
+    let target = selectedBackendTarget
+    if target.mode == .localDaemon {
+      struct LocalCreateRequest: Encodable {
+        let content: String
+        let category: String?
+      }
+      let response: LocalMemoryEnvelope = try await post(
+        "v1/memories",
+        body: LocalCreateRequest(content: content, category: category?.rawValue),
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return CreateMemoryResponse(id: response.memory.id, message: nil)
+    }
+
     struct CreateRequest: Encodable {
       let content: String
       let visibility: String
@@ -1346,16 +2044,45 @@ extension APIClient {
       let memories: [MemoryBatchItem]
     }
     let body = BatchRequest(memories: memories)
+    let target = selectedBackendTarget
+    if target.mode == .localDaemon {
+      return try await post(
+        "v1/memories/batch",
+        body: body,
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+    }
     return try await post("v3/memories/batch", body: body)
   }
 
   /// Deletes a memory by ID
   func deleteMemory(id: String) async throws {
+    let target = selectedBackendTarget
+    if target.mode == .localDaemon {
+      try await delete("v1/memories/\(id)", requireAuth: false, customBaseURL: target.baseURL)
+      return
+    }
+
     try await delete("v3/memories/\(id)")
   }
 
   /// Edits a memory's content
   func editMemory(id: String, content: String) async throws {
+    let target = selectedBackendTarget
+    if target.mode == .localDaemon {
+      struct LocalEditRequest: Encodable {
+        let content: String
+      }
+      let _: LocalMemoryEnvelope = try await patch(
+        "v1/memories/\(id)",
+        body: LocalEditRequest(content: content),
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return
+    }
+
     struct EditRequest: Encodable {
       let value: String
     }
@@ -1365,6 +2092,13 @@ extension APIClient {
 
   /// Updates a memory's visibility
   func updateMemoryVisibility(id: String, visibility: String) async throws {
+    if selectedBackendTarget.mode == .localDaemon {
+      throw APIError.featureUnavailable(
+        feature: "memory_visibility",
+        reason: "Memory visibility controls are cloud-sharing metadata and are disabled in local daemon mode."
+      )
+    }
+
     struct VisibilityRequest: Encodable {
       let value: String
     }
@@ -1391,11 +2125,25 @@ extension APIClient {
 
   /// Marks all memories as read
   func markAllMemoriesRead() async throws {
+    if selectedBackendTarget.mode == .localDaemon {
+      throw APIError.featureUnavailable(
+        feature: "memory_read_status",
+        reason: "Bulk memory read status is cloud-only metadata and is disabled in local daemon mode."
+      )
+    }
+
     let _: MemoryStatusResponse = try await post("v3/memories/mark-all-read", body: EmptyBody())
   }
 
   /// Updates visibility of all memories
   func updateAllMemoriesVisibility(visibility: String) async throws {
+    if selectedBackendTarget.mode == .localDaemon {
+      throw APIError.featureUnavailable(
+        feature: "memory_visibility",
+        reason: "Memory visibility controls are cloud-sharing metadata and are disabled in local daemon mode."
+      )
+    }
+
     struct VisibilityRequest: Encodable {
       let value: String
     }
@@ -1405,6 +2153,13 @@ extension APIClient {
 
   /// Deletes all memories
   func deleteAllMemories() async throws {
+    if selectedBackendTarget.mode == .localDaemon {
+      throw APIError.featureUnavailable(
+        feature: "memory_bulk_delete",
+        reason: "Bulk memory deletion is not exposed by the local daemon yet. Delete individual local memories instead."
+      )
+    }
+
     try await delete("v3/memories")
   }
 
@@ -1450,6 +2205,56 @@ struct CreateMemoryResponse: Codable {
   let message: String?
 }
 
+private struct LocalMemoriesResponse: Decodable {
+  let memories: [LocalMemory]
+}
+
+private struct LocalMemoryEnvelope: Decodable {
+  let memory: LocalMemory
+}
+
+private struct LocalMemory: Decodable {
+  let id: String
+  let content: String
+  let category: String?
+  let conversationId: String?
+  let createdAt: Date
+  let updatedAt: Date
+
+  enum CodingKeys: String, CodingKey {
+    case id, content, category
+    case conversationId = "conversation_id"
+    case createdAt = "created_at"
+    case updatedAt = "updated_at"
+  }
+
+  func toServerMemory() -> ServerMemory {
+    ServerMemory(
+      id: id,
+      content: content,
+      category: category.flatMap(MemoryCategory.init(rawValue:)) ?? .system,
+      createdAt: createdAt,
+      updatedAt: updatedAt,
+      conversationId: conversationId,
+      reviewed: false,
+      userReview: nil,
+      visibility: "private",
+      manuallyAdded: true,
+      scoring: nil,
+      source: "local_daemon",
+      confidence: nil,
+      sourceApp: nil,
+      contextSummary: nil,
+      isRead: false,
+      isDismissed: false,
+      tags: [],
+      reasoning: nil,
+      currentActivity: nil,
+      inputDeviceName: nil
+    )
+  }
+}
+
 /// One item in a POST /v3/memories/batch payload. Mirrors the `Memory` model
 /// in `backend/models/memories.py` (the server hardcodes category=manual on
 /// batch creation, so we intentionally don't send it).
@@ -1459,8 +2264,9 @@ struct MemoryBatchItem: Encodable {
   let tags: [String]
   let headline: String?
 
-  init(content: String, visibility: String = "private", tags: [String] = [], headline: String? = nil)
-  {
+  init(
+    content: String, visibility: String = "private", tags: [String] = [], headline: String? = nil
+  ) {
     self.content = content
     self.visibility = visibility
     self.tags = tags
@@ -1504,6 +2310,11 @@ struct ActionItemsListResponse: Decodable {
     case hasMore = "has_more"
   }
 
+  init(items: [TaskActionItem], hasMore: Bool = false) {
+    self.items = items
+    self.hasMore = hasMore
+  }
+
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     if let actionItems = try container.decodeIfPresent([TaskActionItem].self, forKey: .actionItems)
@@ -1512,7 +2323,15 @@ struct ActionItemsListResponse: Decodable {
     } else {
       self.items = try container.decode([TaskActionItem].self, forKey: .items)
     }
-    self.hasMore = try container.decode(Bool.self, forKey: .hasMore)
+    self.hasMore = try container.decodeIfPresent(Bool.self, forKey: .hasMore) ?? false
+  }
+}
+
+private struct LocalActionItemEnvelope: Decodable {
+  let actionItem: TaskActionItem
+
+  enum CodingKeys: String, CodingKey {
+    case actionItem = "action_item"
   }
 }
 
@@ -1530,6 +2349,11 @@ extension APIClient {
     sortBy: String? = nil,
     deleted: Bool? = nil
   ) async throws -> ActionItemsListResponse {
+    let target = selectedBackendTarget
+    if target.mode == .localDaemon {
+      return try await get("v1/action-items", requireAuth: false, customBaseURL: target.baseURL)
+    }
+
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
 
@@ -1651,11 +2475,64 @@ extension APIClient {
       recurrenceRule: recurrenceRule
     )
 
+    let target = selectedBackendTarget
+    if target.mode == .localDaemon {
+      struct LocalUpdateRequest: Encodable {
+        let title: String?
+        let description: String?
+        let dueAt: String?
+        let includeDueAt: Bool
+        let clearDueAt: Bool
+        let status: String?
+
+        enum CodingKeys: String, CodingKey {
+          case title, description, status
+          case dueAt = "due_at"
+          case clearDueAt = "clear_due_at"
+        }
+
+        func encode(to encoder: Encoder) throws {
+          var container = encoder.container(keyedBy: CodingKeys.self)
+          try container.encodeIfPresent(title, forKey: .title)
+          try container.encodeIfPresent(description, forKey: .description)
+          if includeDueAt {
+            if clearDueAt {
+              try container.encodeNil(forKey: .dueAt)
+              try container.encode(true, forKey: .clearDueAt)
+            } else {
+              try container.encodeIfPresent(dueAt, forKey: .dueAt)
+            }
+          }
+          try container.encodeIfPresent(status, forKey: .status)
+        }
+      }
+      let response: LocalActionItemEnvelope = try await patch(
+        "v1/action-items/\(id)",
+        body: LocalUpdateRequest(
+          title: description,
+          description: description,
+          dueAt: dueAt.map { formatter.string(from: $0) },
+          includeDueAt: clearDueAt || dueAt != nil,
+          clearDueAt: clearDueAt,
+          status: completed.map { $0 ? "completed" : "open" }
+        ),
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return response.actionItem
+    }
+
     return try await patch("v1/action-items/\(id)", body: request)
   }
 
   /// Deletes an action item
   func deleteActionItem(id: String) async throws {
+    let target = selectedBackendTarget
+    if target.mode == .localDaemon {
+      try await delete("v1/action-items/\(id)", requireAuth: false, customBaseURL: target.baseURL)
+      return
+    }
+
     try await delete("v1/action-items/\(id)")
   }
 
@@ -1716,11 +2593,40 @@ extension APIClient {
       recurrenceParentId: recurrenceParentId
     )
 
+    let target = selectedBackendTarget
+    if target.mode == .localDaemon {
+      struct LocalCreateRequest: Encodable {
+        let title: String
+        let description: String?
+        let dueAt: String?
+
+        enum CodingKeys: String, CodingKey {
+          case title, description
+          case dueAt = "due_at"
+        }
+      }
+      let response: LocalActionItemEnvelope = try await post(
+        "v1/action-items",
+        body: LocalCreateRequest(
+          title: description,
+          description: description,
+          dueAt: dueAt.map { formatter.string(from: $0) }
+        ),
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return response.actionItem
+    }
+
     return try await post("v1/action-items", body: request)
   }
 
   /// Batch update relevance scores for multiple action items
   func batchUpdateScores(_ scores: [(id: String, score: Int)]) async throws {
+    if selectedBackendTarget.mode == .localDaemon {
+      return
+    }
+
     struct ScoreUpdate: Encodable {
       let id: String
       let relevance_score: Int
@@ -1740,6 +2646,10 @@ extension APIClient {
   func batchUpdateSortOrders(_ updates: [(id: String, sortOrder: Int, indentLevel: Int)])
     async throws
   {
+    if selectedBackendTarget.mode == .localDaemon {
+      return
+    }
+
     struct SortUpdate: Encodable {
       let id: String
       let sort_order: Int
@@ -1762,6 +2672,8 @@ extension APIClient {
 
   /// Shares tasks and returns a shareable URL
   func shareTasks(taskIds: [String]) async throws -> ShareTasksResponse {
+    try requireCapability(.publicSharing)
+
     struct ShareRequest: Encodable {
       let taskIds: [String]
       enum CodingKeys: String, CodingKey {
@@ -1831,17 +2743,64 @@ extension APIClient {
       relevanceScore: relevanceScore
     )
 
+    if selectedBackendTarget.mode == .localDaemon {
+      let tagsJson: String?
+      if let tags = metadata?["tags"] as? [String],
+        let data = try? JSONEncoder().encode(tags),
+        let json = String(data: data, encoding: .utf8)
+      {
+        tagsJson = json
+      } else {
+        tagsJson = nil
+      }
+      let record = StagedTaskRecord(
+        backendId: "local_staged_\(UUID().uuidString)",
+        backendSynced: false,
+        description: description,
+        source: source,
+        priority: priority,
+        category: category,
+        tagsJson: tagsJson,
+        dueAt: dueAt,
+        confidence: metadata?["confidence"] as? Double,
+        sourceApp: metadata?["source_app"] as? String,
+        windowTitle: metadata?["window_title"] as? String,
+        contextSummary: metadata?["context_summary"] as? String,
+        currentActivity: metadata?["current_activity"] as? String,
+        metadataJson: metadataString,
+        relevanceScore: relevanceScore,
+        scoredAt: relevanceScore == nil ? nil : Date()
+      )
+      let inserted: StagedTaskRecord
+      if relevanceScore != nil {
+        inserted = try await StagedTaskStorage.shared.insertWithScoreShift(record)
+      } else {
+        inserted = try await StagedTaskStorage.shared.insertLocalStagedTask(record)
+      }
+      return inserted.toTaskActionItem()
+    }
+
     return try await post("v1/staged-tasks", body: request)
   }
 
   /// Fetches staged tasks ordered by relevance score
   func getStagedTasks(limit: Int = 100, offset: Int = 0) async throws -> ActionItemsListResponse {
+    if selectedBackendTarget.mode == .localDaemon {
+      let items = try await StagedTaskStorage.shared.getScoredStagedTasks(limit: limit, offset: offset)
+      return ActionItemsListResponse(items: items, hasMore: items.count == limit)
+    }
+
     let params = "limit=\(limit)&offset=\(offset)"
     return try await get("v1/staged-tasks?\(params)")
   }
 
   /// Hard-deletes a staged task
   func deleteStagedTask(id: String) async throws {
+    if selectedBackendTarget.mode == .localDaemon {
+      try await StagedTaskStorage.shared.deleteByTaskId(id)
+      return
+    }
+
     try await delete("v1/staged-tasks/\(id)")
   }
 
@@ -1859,22 +2818,62 @@ extension APIClient {
     }
     let request = BatchRequest(
       scores: scores.map { ScoreUpdate(id: $0.id, relevance_score: $0.score) })
+    if selectedBackendTarget.mode == .localDaemon {
+      try await StagedTaskStorage.shared.updateScores(scores)
+      return
+    }
+
     let _: StatusResponse = try await patch("v1/staged-tasks/batch-scores", body: request)
   }
 
   /// Promotes the top-ranked staged task to action_items
   func promoteTopStagedTask() async throws -> PromoteResponse {
+    if selectedBackendTarget.mode == .localDaemon {
+      guard let staged = try await StagedTaskStorage.shared.promoteTopLocalStagedTask() else {
+        return PromoteResponse(promoted: false, reason: "no staged tasks", promotedTask: nil)
+      }
+      let promoted = TaskActionItem(
+        id: "local_action_\(UUID().uuidString)",
+        description: staged.description,
+        completed: false,
+        createdAt: staged.createdAt,
+        updatedAt: Date(),
+        dueAt: staged.dueAt,
+        conversationId: staged.conversationId,
+        source: staged.source,
+        priority: staged.priority,
+        metadata: staged.metadata,
+        category: staged.category,
+        deleted: false,
+        fromStaged: true,
+        relevanceScore: staged.relevanceScore,
+        contextSummary: staged.contextSummary,
+        currentActivity: staged.currentActivity
+      )
+      return PromoteResponse(promoted: true, reason: nil, promotedTask: promoted)
+    }
+
     return try await post("v1/staged-tasks/promote")
   }
 
   /// One-time migration of existing AI tasks to staged_tasks
   func migrateStagedTasks() async throws {
+    if selectedBackendTarget.mode == .localDaemon {
+      log("APIClient: staged-task backend migration skipped in local daemon mode")
+      return
+    }
+
     struct StatusResponse: Decodable { let status: String }
     let _: StatusResponse = try await post("v1/staged-tasks/migrate")
   }
 
   /// Migrate conversation-extracted action items (no source field) to staged_tasks
   func migrateConversationItemsToStaged() async throws {
+    if selectedBackendTarget.mode == .localDaemon {
+      log("APIClient: conversation-to-staged backend migration skipped in local daemon mode")
+      return
+    }
+
     struct MigrateResponse: Decodable {
       let status: String
       let migrated: Int
@@ -1902,6 +2901,10 @@ extension APIClient {
 
   /// Fetches all active goals (up to 4). Uses 5-second cache to deduplicate parallel calls.
   func getGoals() async throws -> [Goal] {
+    if selectedBackendTarget.mode == .localDaemon {
+      return try await GoalStorage.shared.getLocalGoals()
+    }
+
     if let cache = goalsCache, let time = goalsCacheTime, Date().timeIntervalSince(time) < 5 {
       return cache
     }
@@ -1956,6 +2959,33 @@ extension APIClient {
       source: source
     )
 
+    if selectedBackendTarget.mode == .localDaemon {
+      let now = Date()
+      let record = GoalRecord(
+        backendId: "local_goal_\(UUID().uuidString)",
+        backendSynced: false,
+        title: title,
+        goalDescription: description,
+        goalType: goalType.rawValue,
+        targetValue: targetValue,
+        currentValue: currentValue,
+        minValue: minValue,
+        maxValue: maxValue,
+        unit: unit,
+        isActive: true,
+        completedAt: nil,
+        deleted: false,
+        createdAt: now,
+        updatedAt: now
+      )
+      let inserted = try await GoalStorage.shared.insertLocalGoal(record)
+      guard let goal = inserted.toGoal() else {
+        throw APIError.invalidResponse
+      }
+      goalsCache = nil
+      return goal
+    }
+
     let goal: Goal = try await post("v1/goals", body: request)
     goalsCache = nil
     return goal
@@ -1963,6 +2993,15 @@ extension APIClient {
 
   /// Updates a goal's progress
   func updateGoalProgress(goalId: String, currentValue: Double) async throws -> Goal {
+    if selectedBackendTarget.mode == .localDaemon {
+      try await GoalStorage.shared.updateProgress(backendId: goalId, currentValue: currentValue)
+      guard let goal = try await GoalStorage.shared.getGoal(backendId: goalId) else {
+        throw APIError.invalidResponse
+      }
+      goalsCache = nil
+      return goal
+    }
+
     let url = URL(string: baseURL + "v1/goals/\(goalId)/progress?current_value=\(currentValue)")!
     var request = URLRequest(url: url)
     request.httpMethod = "PATCH"
@@ -2002,6 +3041,20 @@ extension APIClient {
       targetValue: targetValue
     )
 
+    if selectedBackendTarget.mode == .localDaemon {
+      try await GoalStorage.shared.updateGoal(
+        backendId: goalId,
+        title: title,
+        currentValue: currentValue,
+        targetValue: targetValue
+      )
+      guard let goal = try await GoalStorage.shared.getGoal(backendId: goalId) else {
+        throw APIError.invalidResponse
+      }
+      goalsCache = nil
+      return goal
+    }
+
     let goal: Goal = try await patch("v1/goals/\(goalId)", body: request)
     goalsCache = nil
     return goal
@@ -2009,12 +3062,26 @@ extension APIClient {
 
   /// Gets completed goals for history
   func getCompletedGoals() async throws -> [Goal] {
+    if selectedBackendTarget.mode == .localDaemon {
+      return try await GoalStorage.shared.getLocalGoals(activeOnly: false)
+        .filter { !$0.isActive || $0.completedAt != nil }
+    }
+
     let goals: [Goal] = try await get("v1/goals/completed")
     return goals
   }
 
   /// Completes a goal (marks as inactive with completed_at)
   func completeGoal(id: String) async throws -> Goal {
+    if selectedBackendTarget.mode == .localDaemon {
+      try await GoalStorage.shared.markCompleted(backendId: id)
+      guard let goal = try await GoalStorage.shared.getGoal(backendId: id, activeOnly: false) else {
+        throw APIError.invalidResponse
+      }
+      goalsCache = nil
+      return goal
+    }
+
     struct CompleteGoalRequest: Encodable {
       let is_active: Bool
       let completed_at: String
@@ -2047,12 +3114,22 @@ extension APIClient {
 
   /// Deletes a goal
   func deleteGoal(id: String) async throws {
+    if selectedBackendTarget.mode == .localDaemon {
+      try await GoalStorage.shared.softDelete(backendId: id)
+      goalsCache = nil
+      return
+    }
+
     try await delete("v1/goals/\(id)")
     goalsCache = nil
   }
 
   /// Get all scores (daily, weekly, overall) with default tab selection
   func getScores(date: Date? = nil) async throws -> ScoreResponse {
+    if selectedBackendTarget.mode == .localDaemon {
+      return ScoreResponse.emptyLocal(date: date)
+    }
+
     var endpoint = "v1/scores"
     if let date = date {
       let formatter = DateFormatter()
@@ -2667,6 +3744,21 @@ struct ScoreResponse: Codable {
     case daily, weekly, overall, date
     case defaultTab = "default_tab"
   }
+
+  static func emptyLocal(date: Date? = nil) -> ScoreResponse {
+    let empty = ScoreData(score: 0, completedTasks: 0, totalTasks: 0)
+    let formatter = DateFormatter()
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    formatter.dateFormat = "yyyy-MM-dd"
+    return ScoreResponse(
+      daily: empty,
+      weekly: empty,
+      overall: empty,
+      defaultTab: "daily",
+      date: formatter.string(from: date ?? Date())
+    )
+  }
 }
 
 // MARK: - App Models
@@ -3135,11 +4227,25 @@ extension APIClient {
 
   /// Fetches user's persona (if exists)
   func getPersona() async throws -> Persona? {
+    if selectedBackendTarget.mode == .localDaemon {
+      throw APIError.featureUnavailable(
+        feature: "persona",
+        reason: "AI Persona is an Omi cloud account feature and is disabled in local daemon mode."
+      )
+    }
+
     return try await get("v1/personas")
   }
 
   /// Creates a new persona
   func createPersona(name: String, username: String? = nil) async throws -> Persona {
+    if selectedBackendTarget.mode == .localDaemon {
+      throw APIError.featureUnavailable(
+        feature: "persona",
+        reason: "AI Persona is an Omi cloud account feature and is disabled in local daemon mode."
+      )
+    }
+
     struct CreateRequest: Encodable {
       let name: String
       let username: String?
@@ -3155,6 +4261,13 @@ extension APIClient {
     personaPrompt: String? = nil,
     image: String? = nil
   ) async throws -> Persona {
+    if selectedBackendTarget.mode == .localDaemon {
+      throw APIError.featureUnavailable(
+        feature: "persona",
+        reason: "AI Persona is an Omi cloud account feature and is disabled in local daemon mode."
+      )
+    }
+
     struct UpdateRequest: Encodable {
       let name: String?
       let description: String?
@@ -3173,17 +4286,38 @@ extension APIClient {
 
   /// Deletes user's persona
   func deletePersona() async throws {
+    if selectedBackendTarget.mode == .localDaemon {
+      throw APIError.featureUnavailable(
+        feature: "persona",
+        reason: "AI Persona is an Omi cloud account feature and is disabled in local daemon mode."
+      )
+    }
+
     try await delete("v1/personas")
   }
 
   /// Regenerates persona prompt from current public memories
   func regeneratePersonaPrompt() async throws -> GeneratePromptResponse {
+    if selectedBackendTarget.mode == .localDaemon {
+      throw APIError.featureUnavailable(
+        feature: "persona",
+        reason: "AI Persona is an Omi cloud account feature and is disabled in local daemon mode."
+      )
+    }
+
     struct EmptyRequest: Encodable {}
     return try await post("v1/personas/generate-prompt", body: EmptyRequest())
   }
 
   /// Checks if a username is available
   func checkPersonaUsername(_ username: String) async throws -> UsernameAvailableResponse {
+    if selectedBackendTarget.mode == .localDaemon {
+      throw APIError.featureUnavailable(
+        feature: "persona",
+        reason: "AI Persona is an Omi cloud account feature and is disabled in local daemon mode."
+      )
+    }
+
     return try await get("v1/personas/check-username?username=\(username)")
   }
 }
@@ -3293,6 +4427,10 @@ extension APIClient {
 
   /// Fetches daily summary settings
   func getDailySummarySettings() async throws -> DailySummarySettings {
+    if isUsingLocalDaemon {
+      return DailySummarySettings.localDefault
+    }
+
     return try await get("v1/users/daily-summary-settings")
   }
 
@@ -3300,6 +4438,18 @@ extension APIClient {
   func updateDailySummarySettings(enabled: Bool? = nil, hour: Int? = nil) async throws
     -> DailySummarySettings
   {
+    if isUsingLocalDaemon {
+      var settings = DailySummarySettings.localDefault
+      if let enabled {
+        settings.enabled = enabled
+      }
+      if let hour {
+        settings.hour = hour
+      }
+      settings.saveLocalDefault()
+      return settings
+    }
+
     struct UpdateRequest: Encodable {
       let enabled: Bool?
       let hour: Int?
@@ -3310,6 +4460,10 @@ extension APIClient {
 
   /// Fetches transcription preferences
   func getTranscriptionPreferences() async throws -> TranscriptionPreferences {
+    if isUsingLocalDaemon {
+      return TranscriptionPreferences.localDefault
+    }
+
     return try await get("v1/users/transcription-preferences")
   }
 
@@ -3317,6 +4471,18 @@ extension APIClient {
   func updateTranscriptionPreferences(singleLanguageMode: Bool? = nil, vocabulary: [String]? = nil)
     async throws -> TranscriptionPreferences
   {
+    if isUsingLocalDaemon {
+      var preferences = TranscriptionPreferences.localDefault
+      if let singleLanguageMode {
+        preferences.singleLanguageMode = singleLanguageMode
+      }
+      if let vocabulary {
+        preferences.vocabulary = vocabulary
+      }
+      preferences.saveLocalDefault()
+      return preferences
+    }
+
     struct UpdateRequest: Encodable {
       let singleLanguageMode: Bool?
       let vocabulary: [String]?
@@ -3332,11 +4498,22 @@ extension APIClient {
 
   /// Fetches user language preference
   func getUserLanguage() async throws -> UserLanguageResponse {
+    if isUsingLocalDaemon {
+      return UserLanguageResponse(
+        language: UserDefaults.standard.string(forKey: "transcriptionLanguage") ?? "en"
+      )
+    }
+
     return try await get("v1/users/language")
   }
 
   /// Updates user language preference
   func updateUserLanguage(_ language: String) async throws -> UserLanguageResponse {
+    if isUsingLocalDaemon {
+      UserDefaults.standard.set(language, forKey: "transcriptionLanguage")
+      return UserLanguageResponse(language: language)
+    }
+
     struct UpdateRequest: Encodable {
       let language: String
     }
@@ -3346,11 +4523,20 @@ extension APIClient {
 
   /// Fetches recording permission status
   func getRecordingPermission() async throws -> RecordingPermissionResponse {
+    if isUsingLocalDaemon {
+      return RecordingPermissionResponse.localDefault
+    }
+
     return try await get("v1/users/store-recording-permission")
   }
 
   /// Sets recording permission
   func setRecordingPermission(enabled: Bool) async throws {
+    if isUsingLocalDaemon {
+      UserDefaults.standard.set(enabled, forKey: RecordingPermissionResponse.localDefaultsKey)
+      return
+    }
+
     let url = URL(string: baseURL + "v1/users/store-recording-permission?value=\(enabled)")!
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
@@ -3366,11 +4552,19 @@ extension APIClient {
 
   /// Fetches private cloud sync setting
   func getPrivateCloudSync() async throws -> PrivateCloudSyncResponse {
+    if isUsingLocalDaemon {
+      return PrivateCloudSyncResponse(enabled: false)
+    }
+
+    try requireCapability(.cloudSync)
+
     return try await get("v1/users/private-cloud-sync")
   }
 
   /// Sets private cloud sync
   func setPrivateCloudSync(enabled: Bool) async throws {
+    try requireCapability(.cloudSync)
+
     let url = URL(string: baseURL + "v1/users/private-cloud-sync?value=\(enabled)")!
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
@@ -3386,6 +4580,10 @@ extension APIClient {
 
   /// Fetches notification settings
   func getNotificationSettings() async throws -> NotificationSettingsResponse {
+    if isUsingLocalDaemon {
+      return NotificationSettingsResponse.localDefault
+    }
+
     return try await get("v1/users/notification-settings")
   }
 
@@ -3393,6 +4591,18 @@ extension APIClient {
   func updateNotificationSettings(enabled: Bool? = nil, frequency: Int? = nil) async throws
     -> NotificationSettingsResponse
   {
+    if isUsingLocalDaemon {
+      var settings = NotificationSettingsResponse.localDefault
+      if let enabled {
+        settings.enabled = enabled
+      }
+      if let frequency {
+        settings.frequency = frequency
+      }
+      settings.saveLocalDefault()
+      return settings
+    }
+
     struct UpdateRequest: Encodable {
       let enabled: Bool?
       let frequency: Int?
@@ -3403,6 +4613,13 @@ extension APIClient {
 
   /// Fetches user profile
   func getUserProfile() async throws -> UserProfileResponse {
+    if isUsingLocalDaemon {
+      throw APIError.featureUnavailable(
+        feature: "user_profile",
+        reason: "Cloud profile sync is disabled in local daemon mode."
+      )
+    }
+
     return try await get("v1/users/profile")
   }
 
@@ -3411,6 +4628,10 @@ extension APIClient {
     name: String? = nil, motivation: String? = nil, useCase: String? = nil, job: String? = nil,
     company: String? = nil
   ) async throws {
+    if isUsingLocalDaemon {
+      return
+    }
+
     struct UpdateRequest: Encodable {
       let name: String?
       let motivation: String?
@@ -3432,6 +4653,10 @@ extension APIClient {
 
   /// Fetches assistant settings from the backend
   func getAssistantSettings() async throws -> AssistantSettingsResponse {
+    if isUsingLocalDaemon {
+      return AssistantSettingsResponse()
+    }
+
     return try await get("v1/users/assistant-settings")
   }
 
@@ -3439,6 +4664,10 @@ extension APIClient {
   func updateAssistantSettings(_ settings: AssistantSettingsResponse) async throws
     -> AssistantSettingsResponse
   {
+    if isUsingLocalDaemon {
+      return settings
+    }
+
     return try await patch("v1/users/assistant-settings", body: settings)
   }
 
@@ -3586,18 +4815,38 @@ struct RebuildGraphResponse: Codable {
 
 /// Daily summary notification settings
 struct DailySummarySettings: Codable {
-  let enabled: Bool
-  let hour: Int
+  var enabled: Bool
+  var hour: Int
+
+  static let enabledDefaultsKey = "local_daily_summary_enabled"
+  static let hourDefaultsKey = "local_daily_summary_hour"
+
+  static var localDefault: DailySummarySettings {
+    DailySummarySettings(
+      enabled: UserDefaults.standard.object(forKey: enabledDefaultsKey) as? Bool ?? true,
+      hour: UserDefaults.standard.object(forKey: hourDefaultsKey) as? Int ?? 22
+    )
+  }
+
+  func saveLocalDefault() {
+    UserDefaults.standard.set(enabled, forKey: Self.enabledDefaultsKey)
+    UserDefaults.standard.set(hour, forKey: Self.hourDefaultsKey)
+  }
 }
 
 /// Transcription preferences
 struct TranscriptionPreferences: Codable {
-  let singleLanguageMode: Bool
-  let vocabulary: [String]
+  var singleLanguageMode: Bool
+  var vocabulary: [String]
 
   enum CodingKeys: String, CodingKey {
     case singleLanguageMode = "single_language_mode"
     case vocabulary
+  }
+
+  init(singleLanguageMode: Bool, vocabulary: [String]) {
+    self.singleLanguageMode = singleLanguageMode
+    self.vocabulary = vocabulary
   }
 
   init(from decoder: Decoder) throws {
@@ -3605,6 +4854,20 @@ struct TranscriptionPreferences: Codable {
     singleLanguageMode =
       try container.decodeIfPresent(Bool.self, forKey: .singleLanguageMode) ?? false
     vocabulary = try container.decodeIfPresent([String].self, forKey: .vocabulary) ?? []
+  }
+
+  static var localDefault: TranscriptionPreferences {
+    let autoDetect =
+      UserDefaults.standard.object(forKey: "transcriptionAutoDetect") as? Bool ?? true
+    return TranscriptionPreferences(
+      singleLanguageMode: !autoDetect,
+      vocabulary: UserDefaults.standard.stringArray(forKey: "transcriptionVocabulary") ?? []
+    )
+  }
+
+  func saveLocalDefault() {
+    UserDefaults.standard.set(!singleLanguageMode, forKey: "transcriptionAutoDetect")
+    UserDefaults.standard.set(vocabulary, forKey: "transcriptionVocabulary")
   }
 }
 
@@ -3615,7 +4878,14 @@ struct UserLanguageResponse: Codable {
 
 /// Recording permission response
 struct RecordingPermissionResponse: Codable {
-  let enabled: Bool
+  var enabled: Bool
+  static let localDefaultsKey = "local_store_recording_permission"
+
+  static var localDefault: RecordingPermissionResponse {
+    RecordingPermissionResponse(
+      enabled: UserDefaults.standard.object(forKey: localDefaultsKey) as? Bool ?? false
+    )
+  }
 
   enum CodingKeys: String, CodingKey {
     case enabled = "store_recording_permission"
@@ -3633,8 +4903,23 @@ struct PrivateCloudSyncResponse: Codable {
 
 /// Notification settings response
 struct NotificationSettingsResponse: Codable {
-  let enabled: Bool
-  let frequency: Int
+  var enabled: Bool
+  var frequency: Int
+
+  static let enabledDefaultsKey = "local_notifications_enabled"
+  static let frequencyDefaultsKey = "notification_frequency"
+
+  static var localDefault: NotificationSettingsResponse {
+    NotificationSettingsResponse(
+      enabled: UserDefaults.standard.object(forKey: enabledDefaultsKey) as? Bool ?? true,
+      frequency: UserDefaults.standard.object(forKey: frequencyDefaultsKey) as? Int ?? 3
+    )
+  }
+
+  func saveLocalDefault() {
+    UserDefaults.standard.set(enabled, forKey: Self.enabledDefaultsKey)
+    UserDefaults.standard.set(frequency, forKey: Self.frequencyDefaultsKey)
+  }
 
   /// Frequency level description
   var frequencyDescription: String {
@@ -3651,11 +4936,11 @@ struct NotificationSettingsResponse: Codable {
 }
 
 enum SubscriptionPlanType: String, Codable {
-  case basic      // display "Free"
+  case basic  // display "Free"
   case unlimited  // legacy — display "Unlimited (legacy)"
   case architect  // display "Architect" ($400/mo, cost_usd quota)
-  case pro        // backward compat: old Firestore docs may still say "pro"
-  case `operator` // new — display "Operator"
+  case pro  // backward compat: old Firestore docs may still say "pro"
+  case `operator`  // new — display "Operator"
 }
 
 enum SubscriptionStatusType: String, Codable {
@@ -3720,7 +5005,10 @@ struct SubscriptionPlanOption: Codable, Identifiable {
   let features: [String]
   let prices: [SubscriptionPriceOption]
 
-  init(id: String, title: String, subtitle: String? = nil, description: String? = nil, eyebrow: String? = nil, features: [String] = [], prices: [SubscriptionPriceOption] = []) {
+  init(
+    id: String, title: String, subtitle: String? = nil, description: String? = nil,
+    eyebrow: String? = nil, features: [String] = [], prices: [SubscriptionPriceOption] = []
+  ) {
     self.id = id
     self.title = title
     self.subtitle = subtitle
@@ -3973,13 +5261,13 @@ struct FloatingBarSettingsResponse: Codable {
 }
 
 struct AssistantSettingsResponse: Codable {
-  var shared: SharedAssistantSettingsResponse?
-  var focus: FocusSettingsResponse?
-  var task: TaskSettingsResponse?
-  var insight: InsightSettingsResponse?
-  var memory: MemorySettingsResponse?
-  var floatingBar: FloatingBarSettingsResponse?
-  var updateChannel: String?
+  var shared: SharedAssistantSettingsResponse? = nil
+  var focus: FocusSettingsResponse? = nil
+  var task: TaskSettingsResponse? = nil
+  var insight: InsightSettingsResponse? = nil
+  var memory: MemorySettingsResponse? = nil
+  var floatingBar: FloatingBarSettingsResponse? = nil
+  var updateChannel: String? = nil
 
   enum CodingKeys: String, CodingKey {
     case shared, focus, task
@@ -4018,14 +5306,33 @@ extension APIClient {
     sessionId: String? = nil,
     metadata: String? = nil
   ) async throws -> SaveMessageResponse {
-    struct SaveRequest: Encodable {
+    let target = selectedBackendTarget
+    if target.mode == .localDaemon {
+      struct LocalSaveRequest: Encodable {
+        let text: String
+        let sender: String
+        let app_id: String?
+        let metadata: String?
+      }
+      let sid = sessionId ?? Self.localDaemonDefaultChatSessionId
+      let body = LocalSaveRequest(
+        text: text, sender: sender, app_id: appId, metadata: metadata)
+      return try await post(
+        "v2/chat-sessions/\(sid)/messages",
+        body: body,
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+    }
+
+    struct CloudSaveRequest: Encodable {
       let text: String
       let sender: String
       let app_id: String?
       let session_id: String?
       let metadata: String?
     }
-    let body = SaveRequest(
+    let body = CloudSaveRequest(
       text: text, sender: sender, app_id: appId, session_id: sessionId, metadata: metadata)
     return try await post("v2/desktop/messages", body: body)
   }
@@ -4036,6 +5343,20 @@ extension APIClient {
     limit: Int = 100,
     offset: Int = 0
   ) async throws -> [ChatMessageDB] {
+    let target = selectedBackendTarget
+    if target.mode == .localDaemon {
+      var queryItems: [String] = [
+        "limit=\(limit)",
+        "offset=\(offset)",
+      ]
+      if let appId = appId {
+        queryItems.append("app_id=\(appId)")
+      }
+      let sid = Self.localDaemonDefaultChatSessionId
+      let endpoint = "v2/chat-sessions/\(sid)/messages?\(queryItems.joined(separator: "&"))"
+      return try await get(endpoint, requireAuth: false, customBaseURL: target.baseURL)
+    }
+
     var queryItems: [String] = [
       "limit=\(limit)",
       "offset=\(offset)",
@@ -4084,13 +5405,20 @@ extension APIClient {
     limit: Int = 100,
     offset: Int = 0
   ) async throws -> [ChatMessageDB] {
+    let target = selectedBackendTarget
     let queryItems: [String] = [
-      "session_id=\(sessionId)",
       "limit=\(limit)",
       "offset=\(offset)",
     ]
 
-    let endpoint = "v2/desktop/messages?\(queryItems.joined(separator: "&"))"
+    if target.mode == .localDaemon {
+      let endpoint =
+        "v2/chat-sessions/\(sessionId)/messages?\(queryItems.joined(separator: "&"))"
+      return try await get(endpoint, requireAuth: false, customBaseURL: target.baseURL)
+    }
+
+    let endpoint =
+      "v2/desktop/messages?session_id=\(sessionId)&\(queryItems.joined(separator: "&"))"
     return try await get(endpoint)
   }
 
@@ -4111,6 +5439,8 @@ extension APIClient {
 
   /// Share chat messages and get a shareable URL
   func shareChatMessages(messageIds: [String]) async throws -> ShareChatResponse {
+    try requireCapability(.publicSharing)
+
     struct ShareRequest: Encodable {
       let message_ids: [String]
     }
@@ -4135,7 +5465,8 @@ extension APIClient {
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
     request.allHTTPHeaderFields = try await buildHeaders(requireAuth: true)
-    request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+    request.setValue(
+      "multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
     var body = Data()
     let lineBreak = "\r\n"
@@ -4206,6 +5537,15 @@ extension APIClient {
       let app_id: String?
     }
     let body = CreateRequest(title: title, app_id: appId)
+    let target = selectedBackendTarget
+    if target.mode == .localDaemon {
+      return try await post(
+        "v2/chat-sessions",
+        body: body,
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+    }
     return try await post("v2/chat-sessions", body: body)
   }
 
@@ -4229,6 +5569,10 @@ extension APIClient {
     }
 
     let endpoint = "v2/chat-sessions?\(queryItems.joined(separator: "&"))"
+    let target = selectedBackendTarget
+    if target.mode == .localDaemon {
+      return try await get(endpoint, requireAuth: false, customBaseURL: target.baseURL)
+    }
     return try await get(endpoint)
   }
 
@@ -4243,11 +5587,29 @@ extension APIClient {
       let starred: Bool?
     }
     let body = UpdateRequest(title: title, starred: starred)
+    let target = selectedBackendTarget
+    if target.mode == .localDaemon {
+      return try await patch(
+        "v2/chat-sessions/\(sessionId)",
+        body: body,
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+    }
     return try await patch("v2/chat-sessions/\(sessionId)", body: body)
   }
 
   /// Delete a chat session and its messages
   func deleteChatSession(sessionId: String) async throws {
+    let target = selectedBackendTarget
+    if target.mode == .localDaemon {
+      try await delete(
+        "v2/chat-sessions/\(sessionId)",
+        requireAuth: false,
+        customBaseURL: target.baseURL
+      )
+      return
+    }
     try await delete("v2/chat-sessions/\(sessionId)")
   }
 
@@ -4395,6 +5757,13 @@ extension APIClient {
   /// Sync AI-generated user profile to backend
   func syncAIUserProfile(profileText: String, generatedAt: Date, dataSourcesUsed: Int) async throws
   {
+    if selectedBackendTarget.mode == .localDaemon {
+      throw APIError.featureUnavailable(
+        feature: DesktopBackendEnvironment.Capability.cloudSync.rawValue,
+        reason: "AI user profile cloud sync is disabled in local daemon mode."
+      )
+    }
+
     struct SyncRequest: Encodable {
       let profile_text: String
       let generated_at: String
@@ -4425,6 +5794,8 @@ extension APIClient {
 
   /// Provision a cloud agent VM for the current user (fire-and-forget)
   func provisionAgentVM() async throws -> AgentProvisionResponse {
+    try requireCapability(.managedAgentVM)
+
     return try await post("v2/agent/provision", customBaseURL: rustBackendURL)
   }
 
@@ -4440,6 +5811,8 @@ extension APIClient {
 
   /// Get current agent VM status
   func getAgentStatus() async throws -> AgentStatusResponse? {
+    try requireCapability(.managedAgentVM)
+
     return try await get("v2/agent/status", customBaseURL: rustBackendURL)
   }
 }
@@ -4464,18 +5837,26 @@ struct Person: Codable, Identifiable {
 extension APIClient {
 
   func getUserSubscription() async throws -> UserSubscriptionResponse {
+    try requireCapability(.payments)
+
     return try await get("v1/users/me/subscription")
   }
 
   func getAvailablePlans() async throws -> AvailablePlansResponse {
+    try requireCapability(.payments)
+
     return try await get("v1/payments/available-plans")
   }
 
   func getOverageInfo() async throws -> OverageInfoResponse {
+    try requireCapability(.payments)
+
     return try await get("v1/payments/overage-info")
   }
 
   func createCheckoutSession(priceId: String) async throws -> CheckoutSessionResponse {
+    try requireCapability(.payments)
+
     struct Request: Encodable {
       let priceId: String
 
@@ -4488,6 +5869,8 @@ extension APIClient {
   }
 
   func upgradeSubscription(priceId: String) async throws -> UpgradeSubscriptionResponse {
+    try requireCapability(.payments)
+
     struct Request: Encodable {
       let priceId: String
 
@@ -4500,6 +5883,8 @@ extension APIClient {
   }
 
   func createCustomerPortalSession() async throws -> CustomerPortalResponse {
+    try requireCapability(.payments)
+
     return try await post("v1/payments/customer-portal")
   }
 
@@ -4630,14 +6015,14 @@ extension APIClient {
   /// Current-month chat usage + the plan's cap. Backed by Python backend
   /// endpoint `/v1/users/me/usage-quota` which reads `users/{uid}/llm_usage/*`.
   struct ChatUsageQuota: Decodable {
-    let plan: String       // display name: "Free" | "Plus" | "Pro"
-    let planType: String   // internal id: "basic" | "unlimited" | "architect"
-    let unit: String       // "questions" | "cost_usd"
+    let plan: String  // display name: "Free" | "Plus" | "Pro"
+    let planType: String  // internal id: "basic" | "unlimited" | "architect"
+    let unit: String  // "questions" | "cost_usd"
     let used: Double
-    let limit: Double?     // nil means unlimited
+    let limit: Double?  // nil means unlimited
     let percent: Double
     let allowed: Bool
-    let resetAt: Int?      // unix seconds — start of next UTC month
+    let resetAt: Int?  // unix seconds — start of next UTC month
 
     enum CodingKeys: String, CodingKey {
       case plan
@@ -4652,6 +6037,12 @@ extension APIClient {
   }
 
   func fetchChatUsageQuota() async -> ChatUsageQuota? {
+    guard DesktopBackendEnvironment.isCapability(.payments, availableIn: selectedBackendTarget.mode)
+    else {
+      log("APIClient: Chat quota disabled in local daemon mode")
+      return nil
+    }
+
     do {
       let res: ChatUsageQuota = try await get("v1/users/me/usage-quota")
       log(
@@ -4681,6 +6072,8 @@ extension APIClient {
   }
 
   func fetchApiKeys() async throws -> ApiKeysResponse {
+    try requireCapability(.omiBackendProviderProxy)
+
     return try await get("v1/config/api-keys", customBaseURL: rustBackendURL)
   }
 
@@ -4697,6 +6090,8 @@ extension APIClient {
   }
 
   func synthesizeSpeech(request body: TtsSynthesizeRequest) async throws -> Data {
+    try requireCapability(.omiBackendProviderProxy)
+
     let base = rustBackendURL
     guard !base.isEmpty, let url = URL(string: base + "v1/tts/synthesize") else {
       throw APIError.invalidResponse
@@ -4704,7 +6099,7 @@ extension APIClient {
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
     request.timeoutInterval = 60
-    request.allHTTPHeaderFields = try await buildHeaders()
+    request.allHTTPHeaderFields = try await buildHeaders(includeBYOK: true)
     request.httpBody = try JSONEncoder().encode(body)
 
     let (data, response) = try await session.data(for: request)

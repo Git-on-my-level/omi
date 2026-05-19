@@ -224,6 +224,22 @@ struct SettingsContentView: View {
 
   // Loading states
   @State private var isLoadingSettings: Bool = false
+  @State private var backendHealth: LocalDaemonHealth?
+  @State private var backendSettings: [LocalDaemonSetting] = []
+  @State private var backendStatusError: String?
+  @State private var isLoadingBackendStatus: Bool = false
+  @State private var hybridAiBaseURL: String = HybridProviderReadiness.defaultBaseURL()
+  @State private var hybridAiModel: String = HybridProviderReadiness.defaultModel()
+  @State private var hybridAiApiKey: String = ""
+  @State private var hybridChatBaseURL: String = HybridProviderReadiness.defaultBaseURL()
+  @State private var hybridChatModel: String = HybridProviderReadiness.defaultModel()
+  @State private var hybridChatApiKey: String = ""
+  @State private var hybridEmbedBaseURL: String = HybridProviderReadiness.defaultBaseURL()
+  @State private var hybridEmbedModel: String = HybridProviderReadiness.defaultModel()
+  @State private var hybridEmbedApiKey: String = ""
+  @State private var hybridProviderStatus: String?
+  @State private var isSavingHybridProvider: Bool = false
+  @State private var isTestingHybridProvider: Bool = false
   @State private var userSubscription: UserSubscriptionResponse?
   @State private var isLoadingSubscription: Bool = false
   @State private var subscriptionError: String?
@@ -479,7 +495,12 @@ struct SettingsContentView: View {
         selectedSection = .advanced
       }
       loadBackendSettings()
-      loadSubscriptionInfo()
+      refreshSelectedBackendStatus()
+      if DesktopBackendEnvironment.selectedBackendTarget.mode == .localDaemon {
+        loadLocalHybridPlanUsage()
+      } else {
+        loadSubscriptionInfo()
+      }
       // Sync transcription state with appState
       isTranscribing = appState.isTranscribing
       // Sync floating bar state with persisted preference (not transient visibility)
@@ -505,7 +526,11 @@ struct SettingsContentView: View {
         return
       }
       if newValue == .planUsage {
-        loadSubscriptionInfo()
+        if DesktopBackendEnvironment.selectedBackendTarget.mode == .localDaemon {
+          loadLocalHybridPlanUsage()
+        } else {
+          loadSubscriptionInfo()
+        }
       }
     }
     .onReceive(NotificationCenter.default.publisher(for: .navigateToTaskSettings)) { _ in
@@ -1735,6 +1760,188 @@ struct SettingsContentView: View {
   // MARK: - Plan and Usage Section
 
   private var planUsageSection: some View {
+    Group {
+      if DesktopBackendEnvironment.selectedBackendTarget.mode == .localDaemon {
+        localHybridPlanUsageSection
+      } else {
+        cloudPlanUsageSection
+      }
+    }
+  }
+
+  private var localHybridPlanUsageSection: some View {
+    VStack(spacing: 20) {
+      settingsCard(settingId: "planusage.local") {
+        VStack(alignment: .leading, spacing: 14) {
+          HStack(spacing: 16) {
+            Image(systemName: "desktopcomputer")
+              .scaledFont(size: 28)
+              .foregroundColor(OmiColors.purplePrimary)
+
+            VStack(alignment: .leading, spacing: 4) {
+              Text("Local")
+                .scaledFont(size: 16, weight: .semibold)
+                .foregroundColor(OmiColors.textPrimary)
+
+              Text(
+                "Data and transcripts stay on this Mac via the local daemon. No Omi subscription or usage metering."
+              )
+              .scaledFont(size: 13)
+              .foregroundColor(OmiColors.textTertiary)
+              .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer()
+
+            if isLoadingBackendStatus {
+              ProgressView()
+                .controlSize(.small)
+            } else {
+              Button("Refresh") {
+                loadLocalHybridPlanUsage()
+              }
+              .buttonStyle(.bordered)
+            }
+          }
+
+          if let health = backendHealth {
+            Divider()
+              .overlay(OmiColors.backgroundQuaternary)
+            Text("\(health.service) \(health.version) · \(health.dataDir ?? "local data")")
+              .scaledFont(size: 12)
+              .foregroundColor(OmiColors.textSecondary)
+              .textSelection(.enabled)
+          } else if let err = backendStatusError {
+            Text(err)
+              .scaledFont(size: 12)
+              .foregroundColor(OmiColors.warning)
+          }
+        }
+      }
+
+      settingsCard(settingId: "planusage.local.checklist") {
+        VStack(alignment: .leading, spacing: 12) {
+          Text("Hybrid provider setup")
+            .scaledFont(size: 15, weight: .semibold)
+            .foregroundColor(OmiColors.textPrimary)
+
+          Text(
+            "Bring your own AI endpoints. Keys are stored in the local daemon SQLite database on this Mac and sent only to URLs you configure—not Omi cloud proxies."
+          )
+          .scaledFont(size: 12)
+          .foregroundColor(OmiColors.textSecondary)
+          .fixedSize(horizontal: false, vertical: true)
+
+          ForEach(HybridProviderReadiness.rows(from: backendSettings)) { row in
+            HStack(alignment: .top, spacing: 10) {
+              Image(
+                systemName: row.status == .configured || row.status == .optionalFallback
+                  ? "checkmark.circle.fill" : "circle"
+              )
+              .foregroundColor(
+                row.status == .configured
+                  ? OmiColors.success
+                  : (row.status == .optionalFallback
+                    ? OmiColors.textTertiary : OmiColors.warning))
+              VStack(alignment: .leading, spacing: 2) {
+                Text(row.label)
+                  .scaledFont(size: 13, weight: .medium)
+                  .foregroundColor(OmiColors.textPrimary)
+                Text(row.detail)
+                  .scaledFont(size: 11)
+                  .foregroundColor(OmiColors.textTertiary)
+              }
+              Spacer()
+            }
+          }
+
+          Button(action: applyLocalHybridProviderDefaults) {
+            Text("Apply local defaults")
+              .scaledFont(size: 13, weight: .semibold)
+          }
+          .buttonStyle(.borderedProminent)
+          .disabled(isSavingHybridProvider)
+        }
+      }
+
+      localHybridProvidersEditorCard
+    }
+  }
+
+  private var localHybridProvidersEditorCard: some View {
+    settingsCard(settingId: "planusage.local.providers") {
+      VStack(alignment: .leading, spacing: 18) {
+        hybridProviderEditorBlock(
+          title: "Processing (ai_provider)",
+          baseURL: $hybridAiBaseURL,
+          model: $hybridAiModel,
+          apiKey: $hybridAiApiKey,
+          settingKey: "ai_provider"
+        )
+
+        Divider().background(OmiColors.backgroundQuaternary)
+
+        hybridProviderEditorBlock(
+          title: "Chat (chat_provider)",
+          baseURL: $hybridChatBaseURL,
+          model: $hybridChatModel,
+          apiKey: $hybridChatApiKey,
+          settingKey: "chat_provider"
+        )
+
+        Divider().background(OmiColors.backgroundQuaternary)
+
+        hybridProviderEditorBlock(
+          title: "Embeddings (embedding_provider)",
+          baseURL: $hybridEmbedBaseURL,
+          model: $hybridEmbedModel,
+          apiKey: $hybridEmbedApiKey,
+          settingKey: "embedding_provider"
+        )
+
+        if let hybridProviderStatus {
+          Text(hybridProviderStatus)
+            .scaledFont(size: 12)
+            .foregroundColor(OmiColors.textSecondary)
+            .textSelection(.enabled)
+        }
+      }
+    }
+  }
+
+  private func hybridProviderEditorBlock(
+    title: String,
+    baseURL: Binding<String>,
+    model: Binding<String>,
+    apiKey: Binding<String>,
+    settingKey: String
+  ) -> some View {
+    VStack(alignment: .leading, spacing: 8) {
+      Text(title)
+        .scaledFont(size: 12, weight: .medium)
+        .foregroundColor(OmiColors.textTertiary)
+      TextField("Base URL", text: baseURL)
+        .textFieldStyle(.roundedBorder)
+      TextField("Model", text: model)
+        .textFieldStyle(.roundedBorder)
+      SecureField("API key (optional on loopback)", text: apiKey)
+        .textFieldStyle(.roundedBorder)
+      HStack(spacing: 10) {
+        Button("Save") {
+          saveHybridProvider(key: settingKey, baseURL: baseURL.wrappedValue, model: model.wrappedValue, apiKey: apiKey.wrappedValue)
+        }
+        .buttonStyle(.bordered)
+        .disabled(isSavingHybridProvider)
+        Button("Test") {
+          testHybridProvider(key: settingKey, baseURL: baseURL.wrappedValue, model: model.wrappedValue, apiKey: apiKey.wrappedValue)
+        }
+        .buttonStyle(.bordered)
+        .disabled(isTestingHybridProvider)
+      }
+    }
+  }
+
+  private var cloudPlanUsageSection: some View {
     VStack(spacing: 20) {
       settingsCard(settingId: "planusage.current") {
         VStack(alignment: .leading, spacing: 14) {
@@ -1874,18 +2081,23 @@ struct SettingsContentView: View {
       settingsCard(settingId: "planusage.overage") {
         VStack(alignment: .leading, spacing: 10) {
           HStack(spacing: 10) {
-            Image(systemName: info.excessQuestions > 0
-              ? "dollarsign.circle.fill"
-              : "checkmark.circle.fill")
-              .scaledFont(size: 18)
-              .foregroundColor(info.excessQuestions > 0
+            Image(
+              systemName: info.excessQuestions > 0
+                ? "dollarsign.circle.fill"
+                : "checkmark.circle.fill"
+            )
+            .scaledFont(size: 18)
+            .foregroundColor(
+              info.excessQuestions > 0
                 ? OmiColors.warning
                 : OmiColors.success)
-            Text(info.excessQuestions > 0
-              ? "Usage-based overage"
-              : "No overage yet this cycle")
-              .scaledFont(size: 14, weight: .semibold)
-              .foregroundColor(OmiColors.textPrimary)
+            Text(
+              info.excessQuestions > 0
+                ? "Usage-based overage"
+                : "No overage yet this cycle"
+            )
+            .scaledFont(size: 14, weight: .semibold)
+            .foregroundColor(OmiColors.textPrimary)
             Spacer()
             if info.excessQuestions > 0 {
               Text(String(format: "$%.2f", info.overageUsd))
@@ -1980,7 +2192,9 @@ struct SettingsContentView: View {
     .frame(minWidth: 440, minHeight: 360)
   }
 
-  private func overageExplainerRow(_ label: String, value: String, emphasized: Bool = false) -> some View {
+  private func overageExplainerRow(_ label: String, value: String, emphasized: Bool = false)
+    -> some View
+  {
     HStack {
       Text(label)
         .scaledFont(size: 12)
@@ -2072,13 +2286,17 @@ struct SettingsContentView: View {
             // only show the hard "upgrade" copy on Free and other hard-capped
             // plans.
             if let info = overageInfo, info.isOveragePlan {
-              Text("You're past your included limit — extra usage is billed as overage at end of cycle.")
-                .scaledFont(size: 12)
-                .foregroundColor(OmiColors.warning)
+              Text(
+                "You're past your included limit — extra usage is billed as overage at end of cycle."
+              )
+              .scaledFont(size: 12)
+              .foregroundColor(OmiColors.warning)
             } else {
-              Text("You've reached this month's limit. Upgrade your plan or wait until the next reset.")
-                .scaledFont(size: 12)
-                .foregroundColor(OmiColors.warning)
+              Text(
+                "You've reached this month's limit. Upgrade your plan or wait until the next reset."
+              )
+              .scaledFont(size: 12)
+              .foregroundColor(OmiColors.warning)
             }
           } else if quota.percent >= 80.0 {
             Text("You're close to your monthly limit.")
@@ -3095,9 +3313,11 @@ struct SettingsContentView: View {
             Text("Chat Prompt Lab")
               .scaledFont(size: 15, weight: .semibold)
               .foregroundColor(OmiColors.textPrimary)
-            Text("Iterate on chat system prompts with real questions, AI grading, and production ratings")
-              .scaledFont(size: 12)
-              .foregroundColor(OmiColors.textTertiary)
+            Text(
+              "Iterate on chat system prompts with real questions, AI grading, and production ratings"
+            )
+            .scaledFont(size: 12)
+            .foregroundColor(OmiColors.textTertiary)
           }
           Spacer()
           Button("Open") {
@@ -5751,6 +5971,9 @@ struct SettingsContentView: View {
 
   private var aboutSection: some View {
     VStack(spacing: 20) {
+      backendStatusCard
+      hybridProvidersCard
+
       settingsCard(settingId: "about.version") {
         VStack(spacing: 16) {
           // App info
@@ -5957,6 +6180,234 @@ struct SettingsContentView: View {
     }
   }
 
+  private var backendStatusCard: some View {
+    let target = DesktopBackendEnvironment.selectedBackendTarget
+    return settingsCard(settingId: "about.backend") {
+      VStack(alignment: .leading, spacing: 14) {
+        HStack(spacing: 10) {
+          Circle()
+            .fill(backendStatusColor(for: target.mode))
+            .frame(width: 10, height: 10)
+
+          VStack(alignment: .leading, spacing: 2) {
+            Text(backendModeTitle(for: target.mode))
+              .scaledFont(size: 15, weight: .semibold)
+              .foregroundColor(OmiColors.textPrimary)
+
+            Text(target.baseURL)
+              .scaledFont(size: 12)
+              .foregroundColor(OmiColors.textTertiary)
+              .textSelection(.enabled)
+          }
+
+          Spacer()
+
+          if isLoadingBackendStatus {
+            ProgressView()
+              .controlSize(.small)
+          } else {
+            Button("Refresh") {
+              refreshSelectedBackendStatus()
+            }
+            .buttonStyle(.bordered)
+          }
+        }
+
+        Divider()
+          .background(OmiColors.backgroundQuaternary)
+
+        VStack(spacing: 8) {
+          backendStatusRow(
+            title: "Authentication",
+            value: target.requiresAuth ? "Firebase token required" : "No auth for loopback MVP"
+          )
+
+          if target.mode == .localDaemon {
+            backendStatusRow(
+              title: "Health",
+              value: backendHealth.map { "\($0.service) \($0.version)" }
+                ?? backendStatusError
+                ?? "Not checked"
+            )
+
+            backendStatusRow(
+              title: "Data Directory",
+              value: backendHealth?.dataDir ?? "Unavailable until /health responds"
+            )
+
+            backendStatusRow(
+              title: "Processing Provider",
+              value: localProcessingProviderStatus
+            )
+          } else {
+            backendStatusRow(title: "Mode", value: "Omi-hosted backend services enabled")
+          }
+        }
+      }
+    }
+  }
+
+  private var hybridProvidersCard: some View {
+    let target = DesktopBackendEnvironment.selectedBackendTarget
+    return Group {
+      if target.mode == .localDaemon {
+        settingsCard(settingId: "about.hybrid_providers") {
+          VStack(alignment: .leading, spacing: 14) {
+            Text("Hybrid providers")
+              .scaledFont(size: 15, weight: .semibold)
+              .foregroundColor(OmiColors.textPrimary)
+
+            Text(
+              "API keys are stored in the local daemon SQLite database on this Mac and sent only to the endpoints you configure—not to Omi cloud proxies."
+            )
+            .scaledFont(size: 12)
+            .foregroundColor(OmiColors.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 8) {
+              Text("Processing (ai_provider)")
+                .scaledFont(size: 12, weight: .medium)
+                .foregroundColor(OmiColors.textTertiary)
+              TextField("Base URL", text: $hybridAiBaseURL)
+                .textFieldStyle(.roundedBorder)
+              TextField("Model", text: $hybridAiModel)
+                .textFieldStyle(.roundedBorder)
+              SecureField("API key (optional on loopback)", text: $hybridAiApiKey)
+                .textFieldStyle(.roundedBorder)
+            }
+
+            HStack(spacing: 10) {
+              Button("Save") {
+                saveHybridAiProvider()
+              }
+              .buttonStyle(.borderedProminent)
+              .disabled(isSavingHybridProvider)
+
+              Button("Test connection") {
+                testHybridAiProvider()
+              }
+              .buttonStyle(.bordered)
+              .disabled(isTestingHybridProvider)
+
+              if isSavingHybridProvider || isTestingHybridProvider {
+                ProgressView().controlSize(.small)
+              }
+            }
+
+            if let hybridProviderStatus {
+              Text(hybridProviderStatus)
+                .scaledFont(size: 12)
+                .foregroundColor(OmiColors.textSecondary)
+                .textSelection(.enabled)
+            }
+
+            Divider().background(OmiColors.backgroundQuaternary)
+
+            Text("Capabilities")
+              .scaledFont(size: 12, weight: .medium)
+              .foregroundColor(OmiColors.textTertiary)
+
+            ForEach(DesktopBackendEnvironment.capabilities(for: .localDaemon), id: \.capability) {
+              state in
+              HStack(alignment: .top, spacing: 8) {
+                Image(systemName: state.available ? "checkmark.circle.fill" : "xmark.circle")
+                  .foregroundColor(state.available ? OmiColors.success : OmiColors.textTertiary)
+                VStack(alignment: .leading, spacing: 2) {
+                  Text(state.capability.rawValue)
+                    .scaledFont(size: 11, weight: .medium)
+                    .foregroundColor(OmiColors.textSecondary)
+                  if let reason = state.reason {
+                    Text(reason)
+                      .scaledFont(size: 10)
+                      .foregroundColor(OmiColors.textTertiary)
+                  }
+                }
+                Spacer()
+              }
+            }
+          }
+        }
+        .onAppear {
+          syncAllHybridProviderFieldsFromBackendSettings()
+        }
+        .onChange(of: backendSettings) { _, _ in
+          syncAllHybridProviderFieldsFromBackendSettings()
+        }
+      }
+    }
+  }
+
+  private func syncHybridProviderFieldsFromBackendSettings() {
+    syncHybridProviderFields(
+      forKey: "ai_provider", alsoKeys: ["provider"],
+      intoBaseURL: &hybridAiBaseURL, model: &hybridAiModel, apiKey: &hybridAiApiKey)
+  }
+
+  private func saveHybridAiProvider() {
+    saveHybridProvider(
+      key: "ai_provider",
+      baseURL: hybridAiBaseURL,
+      model: hybridAiModel,
+      apiKey: hybridAiApiKey
+    )
+  }
+
+  private func testHybridAiProvider() {
+    testHybridProvider(
+      key: "ai_provider",
+      baseURL: hybridAiBaseURL,
+      model: hybridAiModel,
+      apiKey: hybridAiApiKey
+    )
+  }
+
+  private var localProcessingProviderStatus: String {
+    let providerSetting = backendSettings.first { $0.key == "ai_provider" || $0.key == "provider" }
+    guard let providerSetting else {
+      return "Deterministic fallback"
+    }
+    if providerSetting.valueJson.contains("\"api_key\"")
+      || providerSetting.valueJson.contains("\"key\"")
+    {
+      return "OpenAI-compatible provider configured"
+    }
+    return "Deterministic fallback"
+  }
+
+  private func backendStatusRow(title: String, value: String) -> some View {
+    HStack(alignment: .top, spacing: 12) {
+      Text(title)
+        .scaledFont(size: 12, weight: .medium)
+        .foregroundColor(OmiColors.textTertiary)
+        .frame(width: 130, alignment: .leading)
+      Text(value)
+        .scaledFont(size: 12)
+        .foregroundColor(OmiColors.textSecondary)
+        .textSelection(.enabled)
+      Spacer()
+    }
+  }
+
+  private func backendModeTitle(for mode: DesktopBackendEnvironment.BackendMode) -> String {
+    switch mode {
+    case .cloud:
+      return "Backend Mode: Cloud"
+    case .localDaemon:
+      return "Backend Mode: Local Daemon"
+    case .customRemote:
+      return "Backend Mode: Custom Remote"
+    }
+  }
+
+  private func backendStatusColor(for mode: DesktopBackendEnvironment.BackendMode) -> Color {
+    switch mode {
+    case .localDaemon:
+      return backendHealth == nil ? OmiColors.warning : OmiColors.success
+    case .cloud, .customRemote:
+      return OmiColors.purplePrimary
+    }
+  }
+
   // MARK: - Helper Views
 
   private func fontShortcutRow(label: String, keys: String) -> some View {
@@ -6125,7 +6576,8 @@ struct SettingsContentView: View {
     // on the right. Hide the user's current plan — they already see it above.
     // Neo ($20) | Operator ($49) | Architect ($200) — cheapest to premium
     let order = ["unlimited": 0, "operator": 1, "architect": 2]
-    return mergedPlanCatalog
+    return
+      mergedPlanCatalog
       .filter { !isCurrentSubscriptionPlan($0) }
       .sorted { lhs, rhs in
         let lhsOrder = order[lhs.id, default: Int.max]
@@ -6171,7 +6623,7 @@ struct SettingsContentView: View {
   /// Operator→Unlimited remapping in `/v1/users/me/subscription`.
   private func isCurrentSubscriptionOperator() -> Bool {
     guard let subscription = userSubscription?.subscription,
-          let currentPriceId = subscription.currentPriceId
+      let currentPriceId = subscription.currentPriceId
     else { return false }
     for plan in subscriptionPlansForDisplay {
       guard plan.title == "Operator" else { continue }
@@ -6805,7 +7257,8 @@ struct SettingsContentView: View {
           notificationsEnabled = notifications.enabled
           notificationFrequency = notifications.frequency
           // Mirror to UserDefaults so NotificationService can throttle without a backend roundtrip.
-          UserDefaults.standard.set(notifications.frequency, forKey: NotificationService.frequencyDefaultsKey)
+          UserDefaults.standard.set(
+            notifications.frequency, forKey: NotificationService.frequencyDefaultsKey)
           userLanguage = language.language
           recordingPermissionEnabled = recording.enabled
           privateCloudSyncEnabled = cloudSync.enabled
@@ -6840,7 +7293,196 @@ struct SettingsContentView: View {
     }
   }
 
+  private func refreshSelectedBackendStatus() {
+    guard !isLoadingBackendStatus else { return }
+    isLoadingBackendStatus = true
+    backendStatusError = nil
+
+    Task {
+      let target = DesktopBackendEnvironment.selectedBackendTarget
+      guard target.mode == .localDaemon else {
+        await MainActor.run {
+          backendHealth = nil
+          backendSettings = []
+          isLoadingBackendStatus = false
+        }
+        return
+      }
+
+      do {
+        async let health = APIClient.shared.checkSelectedBackendHealth()
+        async let settings = APIClient.shared.getSelectedBackendSettings()
+        let (resolvedHealth, resolvedSettings) = try await (health, settings)
+        await MainActor.run {
+          backendHealth = resolvedHealth
+          backendSettings = resolvedSettings
+          backendStatusError = nil
+          isLoadingBackendStatus = false
+        }
+      } catch {
+        await MainActor.run {
+          backendHealth = nil
+          backendSettings = []
+          backendStatusError = error.localizedDescription
+          isLoadingBackendStatus = false
+        }
+      }
+    }
+  }
+
+  private func loadLocalHybridPlanUsage() {
+    refreshSelectedBackendStatus()
+    Task {
+      await HybridProviderBootstrap.ensureDefaultsIfNeeded()
+      await MainActor.run {
+        syncAllHybridProviderFieldsFromBackendSettings()
+      }
+    }
+  }
+
+  private func syncAllHybridProviderFieldsFromBackendSettings() {
+    syncHybridProviderFields(forKey: "ai_provider", alsoKeys: ["provider"], intoBaseURL: &hybridAiBaseURL, model: &hybridAiModel, apiKey: &hybridAiApiKey)
+    syncHybridProviderFields(forKey: "chat_provider", alsoKeys: [], intoBaseURL: &hybridChatBaseURL, model: &hybridChatModel, apiKey: &hybridChatApiKey)
+    syncHybridProviderFields(forKey: "embedding_provider", alsoKeys: [], intoBaseURL: &hybridEmbedBaseURL, model: &hybridEmbedModel, apiKey: &hybridEmbedApiKey)
+  }
+
+  private func syncHybridProviderFields(
+    forKey key: String,
+    alsoKeys: [String],
+    intoBaseURL baseURL: inout String,
+    model: inout String,
+    apiKey: inout String
+  ) {
+    let keys = [key] + alsoKeys
+    guard let raw = backendSettings.first(where: { keys.contains($0.key) })?.valueJson,
+      let data = raw.data(using: .utf8),
+      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return }
+    if let base = json["base_url"] as? String, !base.isEmpty {
+      baseURL = base
+    }
+    if let m = json["model"] as? String {
+      model = m
+    }
+    if let k = json["api_key"] as? String ?? json["key"] as? String {
+      apiKey = k
+    }
+  }
+
+  private func applyLocalHybridProviderDefaults() {
+    applyLocalHybridProviderDefaultsToUI()
+    guard !isSavingHybridProvider else { return }
+    isSavingHybridProvider = true
+    hybridProviderStatus = nil
+    let provider = HybridProviderBootstrap.defaultProviderObject()
+    Task {
+      do {
+        backendSettings = try await APIClient.shared.updateSelectedBackendSettings([
+          "ai_provider": .object(provider),
+          "chat_provider": .object(provider),
+        ])
+        await MainActor.run {
+          applyLocalHybridProviderDefaultsToUI()
+          syncAllHybridProviderFieldsFromBackendSettings()
+          hybridProviderStatus = "Applied local defaults (ai_provider + chat_provider)."
+          isSavingHybridProvider = false
+        }
+        do {
+          let test = try await APIClient.shared.testHybridProvider(key: "chat_provider")
+          await MainActor.run {
+            hybridProviderStatus = test.message
+          }
+        } catch {
+          await MainActor.run {
+            hybridProviderStatus =
+              "Saved defaults. Test connection failed: \(error.localizedDescription)"
+          }
+        }
+      } catch {
+        await MainActor.run {
+          hybridProviderStatus = error.localizedDescription
+          isSavingHybridProvider = false
+        }
+      }
+    }
+  }
+
+  private func applyLocalHybridProviderDefaultsToUI() {
+    hybridAiBaseURL = HybridProviderReadiness.defaultBaseURL()
+    hybridAiModel = HybridProviderReadiness.defaultModel()
+    hybridChatBaseURL = hybridAiBaseURL
+    hybridChatModel = hybridAiModel
+    hybridEmbedBaseURL = hybridAiBaseURL
+    hybridEmbedModel = hybridAiModel
+  }
+
+  private func saveHybridProvider(key: String, baseURL: String, model: String, apiKey: String) {
+    guard !isSavingHybridProvider else { return }
+    isSavingHybridProvider = true
+    hybridProviderStatus = nil
+    Task {
+      do {
+        var provider: [String: LocalDaemonSettingUpdateValue] = [
+          "kind": "openai_compatible",
+          "base_url": .string(baseURL.trimmingCharacters(in: .whitespacesAndNewlines)),
+        ]
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedModel.isEmpty {
+          provider["model"] = .string(trimmedModel)
+        }
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedKey.isEmpty {
+          provider["api_key"] = .string(trimmedKey)
+        }
+        backendSettings = try await APIClient.shared.updateSelectedBackendSettings([
+          key: .object(provider)
+        ])
+        await MainActor.run {
+          hybridProviderStatus = "Saved \(key) to the local daemon."
+          isSavingHybridProvider = false
+          syncAllHybridProviderFieldsFromBackendSettings()
+        }
+      } catch {
+        await MainActor.run {
+          hybridProviderStatus = error.localizedDescription
+          isSavingHybridProvider = false
+        }
+      }
+    }
+  }
+
+  private func testHybridProvider(key: String, baseURL: String, model: String, apiKey: String) {
+    guard !isTestingHybridProvider else { return }
+    isTestingHybridProvider = true
+    hybridProviderStatus = nil
+    Task {
+      do {
+        var provider: [String: LocalDaemonSettingUpdateValue] = [
+          "kind": "openai_compatible",
+          "base_url": .string(baseURL.trimmingCharacters(in: .whitespacesAndNewlines)),
+          "model": .string(model.trimmingCharacters(in: .whitespacesAndNewlines)),
+        ]
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedKey.isEmpty {
+          provider["api_key"] = .string(trimmedKey)
+        }
+        _ = try await APIClient.shared.updateSelectedBackendSettings([key: .object(provider)])
+        let result = try await APIClient.shared.testHybridProvider(key: key)
+        await MainActor.run {
+          hybridProviderStatus = result.message
+          isTestingHybridProvider = false
+        }
+      } catch {
+        await MainActor.run {
+          hybridProviderStatus = error.localizedDescription
+          isTestingHybridProvider = false
+        }
+      }
+    }
+  }
+
   private func loadSubscriptionInfo() {
+    guard DesktopBackendEnvironment.selectedBackendTarget.mode != .localDaemon else { return }
     guard !isLoadingSubscription else { return }
     isLoadingSubscription = true
     subscriptionError = nil
@@ -6864,10 +7506,13 @@ struct SettingsContentView: View {
           // the trial cache) — without this they'd stay paywalled until the
           // next app restart even after their Operator/Architect plan is active.
           if subscription.subscription.plan != .basic,
-             subscription.subscription.status == .active,
-             AppState.current?.isPaywalled == true {
+            subscription.subscription.status == .active,
+            AppState.current?.isPaywalled == true
+          {
             AppState.current?.isPaywalled = false
-            log("Paywall: cleared sticky flag — subscription \(subscription.subscription.plan.rawValue) is active")
+            log(
+              "Paywall: cleared sticky flag — subscription \(subscription.subscription.plan.rawValue) is active"
+            )
           }
           isLoadingSubscription = false
         }
@@ -6896,6 +7541,7 @@ struct SettingsContentView: View {
   }
 
   private func loadOverageInfo() {
+    guard DesktopBackendEnvironment.selectedBackendTarget.mode != .localDaemon else { return }
     guard !isLoadingOverage else { return }
     isLoadingOverage = true
     Task {
@@ -6923,8 +7569,8 @@ struct SettingsContentView: View {
     // If user already has an active paid subscription (not canceled), use upgrade endpoint
     // to schedule the plan change at end of billing period (no double-charging)
     if hasPaidSubscription,
-       let subscription = userSubscription?.subscription,
-       !subscription.cancelAtPeriodEnd
+      let subscription = userSubscription?.subscription,
+      !subscription.cancelAtPeriodEnd
     {
       Task {
         do {

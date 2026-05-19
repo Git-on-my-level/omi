@@ -178,6 +178,13 @@ class MemoriesViewModel: ObservableObject {
   private var currentOffset = 0
   private let pageSize = 100  // Reduced from 500 for better performance
 
+  private func appendUniqueMemories(_ newMemories: [ServerMemory]) -> Int {
+    let existingIds = Set(memories.map(\.id))
+    let uniqueMemories = newMemories.filter { !existingIds.contains($0.id) }
+    memories.append(contentsOf: uniqueMemories)
+    return uniqueMemories.count
+  }
+
   // Bulk operations state
   @Published var showingDeleteAllConfirmation = false
   @Published var isBulkOperationInProgress = false
@@ -658,11 +665,11 @@ class MemoriesViewModel: ObservableObject {
       )
 
       if !moreFromCache.isEmpty {
-        memories.append(contentsOf: moreFromCache)
+        let appendedCount = appendUniqueMemories(moreFromCache)
         currentOffset += moreFromCache.count
         hasMoreMemories = moreFromCache.count >= pageSize
         log(
-          "MemoriesViewModel: Loaded \(moreFromCache.count) more from local cache (total: \(memories.count))"
+          "MemoriesViewModel: Loaded \(appendedCount) unique memories from local cache (total: \(memories.count))"
         )
         isLoadingMore = false
         return
@@ -680,10 +687,10 @@ class MemoriesViewModel: ObservableObject {
       try await MemoryStorage.shared.syncServerMemories(newMemories)
 
       // Then append to display
-      memories.append(contentsOf: newMemories)
+      let appendedCount = appendUniqueMemories(newMemories)
       currentOffset += newMemories.count
       hasMoreMemories = newMemories.count >= pageSize
-      log("MemoriesViewModel: Loaded \(newMemories.count) more from API (total: \(memories.count))")
+      log("MemoriesViewModel: Loaded \(appendedCount) unique memories from API (total: \(memories.count))")
     } catch {
       logError("Failed to load more memories", error: error)
     }
@@ -939,6 +946,10 @@ struct MemoriesPage: View {
   @State private var pendingSelectedTags: Set<MemoryTag> = []
   @State private var showManagementMenu = false
 
+  private var isLocalDaemonMode: Bool {
+    DesktopBackendEnvironment.selectedBackendTarget.mode == .localDaemon
+  }
+
   var body: some View {
     Group {
       if let conversation = viewModel.linkedConversation {
@@ -1147,20 +1158,22 @@ struct MemoriesPage: View {
       .buttonStyle(.plain)
       .help("Add Memory")
 
-      // Management menu
-      Button {
-        showManagementMenu = true
-      } label: {
-        Image(systemName: "chevron.down")
-          .scaledFont(size: 12, weight: .medium)
-          .foregroundColor(.black)
-          .frame(width: 42, height: 42)
-          .background(OmiColors.textPrimary)
-          .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-      }
-      .buttonStyle(.plain)
-      .popover(isPresented: $showManagementMenu, arrowEdge: .bottom) {
-        managementMenuPopover
+      if !isLocalDaemonMode {
+        // Management menu
+        Button {
+          showManagementMenu = true
+        } label: {
+          Image(systemName: "chevron.down")
+            .scaledFont(size: 12, weight: .medium)
+            .foregroundColor(.black)
+            .frame(width: 42, height: 42)
+            .background(OmiColors.textPrimary)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $showManagementMenu, arrowEdge: .bottom) {
+          managementMenuPopover
+        }
       }
     }
     .padding(.horizontal, 28)
@@ -1952,6 +1965,10 @@ struct MemoryDetailSheet: View {
   @State private var isEditingContent = false
   @State private var editContentText = ""
 
+  private var isLocalDaemonMode: Bool {
+    DesktopBackendEnvironment.selectedBackendTarget.mode == .localDaemon
+  }
+
   private func dismissSheet() {
     if let onDismiss = onDismiss {
       onDismiss()
@@ -1978,26 +1995,28 @@ struct MemoryDetailSheet: View {
 
           Spacer()
 
-          // Public toggle
-          HStack(spacing: 6) {
-            Text("Public")
-              .scaledFont(size: 13)
-              .foregroundColor(OmiColors.textSecondary)
-            if viewModel.isTogglingVisibility {
-              ProgressView()
-                .scaleEffect(0.7)
-            } else {
-              Toggle(
-                "",
-                isOn: Binding(
-                  get: { memory.isPublic },
-                  set: { _ in
-                    Task { await viewModel.toggleVisibility(memory) }
-                  }
+          if !isLocalDaemonMode {
+            // Public toggle
+            HStack(spacing: 6) {
+              Text("Public")
+                .scaledFont(size: 13)
+                .foregroundColor(OmiColors.textSecondary)
+              if viewModel.isTogglingVisibility {
+                ProgressView()
+                  .scaleEffect(0.7)
+              } else {
+                Toggle(
+                  "",
+                  isOn: Binding(
+                    get: { memory.isPublic },
+                    set: { _ in
+                      Task { await viewModel.toggleVisibility(memory) }
+                    }
+                  )
                 )
-              )
-              .toggleStyle(.switch)
-              .labelsHidden()
+                .toggleStyle(.switch)
+                .labelsHidden()
+              }
             }
           }
 

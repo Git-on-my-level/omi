@@ -61,6 +61,10 @@ struct ConversationsPage: View {
   @State private var isMerging: Bool = false
   @State private var mergeError: String? = nil
 
+  private var isLocalDaemonMode: Bool {
+    DesktopBackendEnvironment.selectedBackendTarget.mode == .localDaemon
+  }
+
   var body: some View {
     Group {
       if let selected = selectedConversation {
@@ -127,7 +131,9 @@ struct ConversationsPage: View {
         }
       }
     }
-    .onReceive(NotificationCenter.default.publisher(for: .desktopAutomationOpenConversationRequested)) {
+    .onReceive(
+      NotificationCenter.default.publisher(for: .desktopAutomationOpenConversationRequested)
+    ) {
       notification in
       handleAutomationOpenConversation(notification)
     }
@@ -177,7 +183,8 @@ struct ConversationsPage: View {
     Task {
       await appState.refreshConversations()
       await MainActor.run {
-        guard let conversation = appState.conversations.first(where: { $0.id == conversationId }) else {
+        guard let conversation = appState.conversations.first(where: { $0.id == conversationId })
+        else {
           log("Desktop automation: conversation \(conversationId) not found")
           return
         }
@@ -194,6 +201,24 @@ struct ConversationsPage: View {
         Text("Conversations")
           .scaledFont(size: 18, weight: .semibold)
           .foregroundColor(OmiColors.textPrimary)
+
+        if isLocalDaemonMode {
+          HStack(spacing: 5) {
+            Circle()
+              .fill(OmiColors.success)
+              .frame(width: 6, height: 6)
+            Text("Local")
+              .scaledFont(size: 11, weight: .semibold)
+          }
+          .foregroundColor(OmiColors.success)
+          .padding(.horizontal, 8)
+          .padding(.vertical, 4)
+          .background(
+            Capsule()
+              .fill(OmiColors.success.opacity(0.12))
+          )
+          .help("Using local daemon mode")
+        }
 
         Spacer()
 
@@ -502,6 +527,37 @@ struct ConversationsPage: View {
       }
       .buttonStyle(.plain)
       .disabled(isFilteringStarred)
+
+      // Multi-select to merge conversations (local daemon + cloud)
+      Button(action: {
+        withAnimation(.easeInOut(duration: 0.2)) {
+          if isMultiSelectMode {
+            isMultiSelectMode = false
+            selectedConversationIds.removeAll()
+          } else {
+            isMultiSelectMode = true
+          }
+        }
+      }) {
+        HStack(spacing: 6) {
+          Image(systemName: isMultiSelectMode ? "xmark.circle" : "checkmark.circle")
+            .scaledFont(size: 12)
+          Text(isMultiSelectMode ? "Cancel" : "Select")
+            .scaledFont(size: 12, weight: .medium)
+        }
+        .foregroundColor(isMultiSelectMode ? OmiColors.purplePrimary : OmiColors.textSecondary)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .omiControlSurface(
+          fill: isMultiSelectMode
+            ? OmiColors.purplePrimary.opacity(0.12)
+            : OmiColors.backgroundSecondary,
+          radius: 16,
+          stroke: isMultiSelectMode
+            ? OmiColors.purplePrimary.opacity(0.28)
+            : OmiColors.border.opacity(0.14))
+      }
+      .buttonStyle(.plain)
 
       // Date filter button
       Button(action: {

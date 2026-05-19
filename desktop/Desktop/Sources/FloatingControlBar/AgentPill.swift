@@ -115,6 +115,10 @@ final class AgentPillsManager: ObservableObject {
     }
 
     private static func runRouterCall(for query: String) async -> RouterDecision? {
+        guard DesktopBackendEnvironment.selectedBackendTarget.mode != .localDaemon else {
+            log("AgentPill: router skipped in local daemon mode")
+            return nil
+        }
         let baseURL = await APIClient.shared.rustBackendURL
         guard !baseURL.isEmpty else {
             log("AgentPill: router skipped — rustBackendURL empty, defaulting to chat")
@@ -127,7 +131,7 @@ final class AgentPillsManager: ObservableObject {
         request.httpMethod = "POST"
         request.timeoutInterval = 4
         do {
-            let headers = try await APIClient.shared.buildHeaders(requireAuth: true)
+            let headers = try await APIClient.shared.buildHeaders(requireAuth: true, includeBYOK: true)
             for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
         } catch {
             log("AgentPill: router skipped — auth header unavailable (\(error.localizedDescription))")
@@ -522,6 +526,10 @@ final class AgentPillsManager: ObservableObject {
     }
 
     fileprivate static func generateTitleAndAck(for query: String) async -> (title: String, ack: String)? {
+        guard DesktopBackendEnvironment.selectedBackendTarget.mode != .localDaemon else {
+            log("AgentPill: title gen skipped in local daemon mode")
+            return nil
+        }
         // Route through the desktop-backend's OpenAI-compatible proxy at
         // /v2/chat/completions instead of hitting api.anthropic.com directly.
         // This way we don't need a BYOK key (no partial-BYOK 403 risk), and
@@ -541,7 +549,7 @@ final class AgentPillsManager: ObservableObject {
         request.httpMethod = "POST"
         request.timeoutInterval = 8
         do {
-            let headers = try await APIClient.shared.buildHeaders(requireAuth: true)
+            let headers = try await APIClient.shared.buildHeaders(requireAuth: true, includeBYOK: true)
             for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
         } catch {
             log("AgentPill: title gen skipped — auth header unavailable (\(error.localizedDescription))")
