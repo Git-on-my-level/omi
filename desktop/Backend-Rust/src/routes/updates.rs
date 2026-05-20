@@ -41,6 +41,35 @@ pub struct ReleaseInfo {
     pub channel: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct LocalAsrAddonManifest {
+    version: u32,
+    runtime: LocalAsrRuntimeArtifact,
+    models: Vec<LocalAsrModelArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalAsrRuntimeArtifact {
+    version: String,
+    platform: String,
+    arch: String,
+    url: String,
+    sha256: String,
+    size_bytes: i64,
+    minimum_app_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalAsrModelArtifact {
+    model: String,
+    version: String,
+    url: String,
+    sha256: String,
+    size_bytes: i64,
+}
+
+const LOCAL_ASR_MODELS: &[&str] = &["tiny", "base", "small", "medium", "large_v3_turbo"];
+
 /// Generate Sparkle 2.0 appcast XML
 ///
 /// Picks the latest live release per channel (stable, beta, staging).
@@ -222,6 +251,101 @@ async fn download_redirect(State(state): State<AppState>) -> impl IntoResponse {
                 .into_response()
         }
     }
+}
+
+/// GET /v1/local-asr/manifest - Local Whisper add-on artifact manifest.
+///
+/// This runs on the existing desktop Rust cloud backend so the desktop app can
+/// discover signed runtime/model artifacts without depending on a local daemon.
+async fn get_local_asr_manifest() -> Response {
+    match build_local_asr_manifest_from_env() {
+        Ok(manifest) => (
+            [
+                (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+                (header::CACHE_CONTROL, "max-age=300"),
+            ],
+            Json(manifest),
+        )
+            .into_response(),
+        Err(message) => (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+    }
+}
+
+fn build_local_asr_manifest_from_env() -> Result<LocalAsrAddonManifest, String> {
+    let base_url = std::env::var("LOCAL_ASR_ADDON_BASE_URL").unwrap_or_else(|_| {
+        "https://storage.googleapis.com/omi_macos_updates/local-asr".to_string()
+    });
+    let runtime_version = required_env("LOCAL_ASR_RUNTIME_VERSION")?;
+    let runtime_sha256 = required_env("LOCAL_ASR_RUNTIME_SHA256")?;
+    let runtime_size = required_env_i64("LOCAL_ASR_RUNTIME_SIZE_BYTES")?;
+    let runtime_url = std::env::var("LOCAL_ASR_RUNTIME_URL").unwrap_or_else(|_| {
+        format!(
+            "{}/runtime-macos-arm64-{}.zip",
+            base_url.trim_end_matches('/'),
+            runtime_version
+        )
+    });
+
+    let mut models = Vec::new();
+    for model in LOCAL_ASR_MODELS {
+        let key_model = model.to_ascii_uppercase();
+        let version_key = format!("LOCAL_ASR_MODEL_{}_VERSION", key_model);
+        let sha_key = format!("LOCAL_ASR_MODEL_{}_SHA256", key_model);
+        let size_key = format!("LOCAL_ASR_MODEL_{}_SIZE_BYTES", key_model);
+
+        let Ok(version) = std::env::var(&version_key) else {
+            continue;
+        };
+        let sha256 = required_env(&sha_key)?;
+        let size_bytes = required_env_i64(&size_key)?;
+        let url = std::env::var(format!("LOCAL_ASR_MODEL_{}_URL", key_model)).unwrap_or_else(|_| {
+            format!(
+                "{}/model-{}-{}.zip",
+                base_url.trim_end_matches('/'),
+                model.replace('_', "-"),
+                version
+            )
+        });
+        models.push(LocalAsrModelArtifact {
+            model: (*model).to_string(),
+            version,
+            url,
+            sha256,
+            size_bytes,
+        });
+    }
+
+    if models.is_empty() {
+        return Err("Local ASR add-on manifest is not configured: no model artifacts".to_string());
+    }
+
+    Ok(LocalAsrAddonManifest {
+        version: 1,
+        runtime: LocalAsrRuntimeArtifact {
+            version: runtime_version,
+            platform: "macos".to_string(),
+            arch: "arm64".to_string(),
+            url: runtime_url,
+            sha256: runtime_sha256,
+            size_bytes: runtime_size,
+            minimum_app_version: std::env::var("LOCAL_ASR_MINIMUM_APP_VERSION").ok(),
+        },
+        models,
+    })
+}
+
+fn required_env(key: &str) -> Result<String, String> {
+    std::env::var(key)
+        .map(|value| value.trim().to_string())
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("Local ASR add-on manifest is not configured: missing {key}"))
+}
+
+fn required_env_i64(key: &str) -> Result<i64, String> {
+    required_env(key)?
+        .parse::<i64>()
+        .map_err(|_| format!("Local ASR add-on manifest is not configured: invalid {key}"))
 }
 
 /// Request body for creating a release
@@ -409,6 +533,25 @@ mod tests {
         }
     }
 
+    fn clear_local_asr_manifest_env() {
+        for key in [
+            "LOCAL_ASR_ADDON_BASE_URL",
+            "LOCAL_ASR_RUNTIME_VERSION",
+            "LOCAL_ASR_RUNTIME_SHA256",
+            "LOCAL_ASR_RUNTIME_SIZE_BYTES",
+            "LOCAL_ASR_RUNTIME_URL",
+            "LOCAL_ASR_MINIMUM_APP_VERSION",
+        ] {
+            std::env::remove_var(key);
+        }
+        for model in LOCAL_ASR_MODELS {
+            let key_model = model.to_ascii_uppercase();
+            for suffix in ["VERSION", "SHA256", "SIZE_BYTES", "URL"] {
+                std::env::remove_var(format!("LOCAL_ASR_MODEL_{key_model}_{suffix}"));
+            }
+        }
+    }
+
     #[test]
     fn test_null_channel_gets_staging_tag() {
         let releases = vec![make_release("0.1.0", 100, None, true)];
@@ -471,11 +614,47 @@ mod tests {
         let xml = generate_appcast_xml(&releases, "macos");
         assert!(!xml.contains("0.1.0"), "non-live release should not appear");
     }
+
+    #[test]
+    fn test_local_asr_manifest_uses_configured_artifacts() {
+        clear_local_asr_manifest_env();
+        std::env::set_var(
+            "LOCAL_ASR_ADDON_BASE_URL",
+            "https://downloads.example.com/local-asr",
+        );
+        std::env::set_var("LOCAL_ASR_RUNTIME_VERSION", "2026.05.20");
+        std::env::set_var("LOCAL_ASR_RUNTIME_SHA256", "runtime-sha");
+        std::env::set_var("LOCAL_ASR_RUNTIME_SIZE_BYTES", "123");
+        std::env::set_var("LOCAL_ASR_MINIMUM_APP_VERSION", "0.2.0");
+        std::env::set_var("LOCAL_ASR_MODEL_SMALL_VERSION", "mlx-2026.05.20");
+        std::env::set_var("LOCAL_ASR_MODEL_SMALL_SHA256", "model-sha");
+        std::env::set_var("LOCAL_ASR_MODEL_SMALL_SIZE_BYTES", "456");
+
+        let manifest = build_local_asr_manifest_from_env().expect("manifest should build");
+
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.runtime.version, "2026.05.20");
+        assert_eq!(
+            manifest.runtime.url,
+            "https://downloads.example.com/local-asr/runtime-macos-arm64-2026.05.20.zip"
+        );
+        assert_eq!(manifest.runtime.size_bytes, 123);
+        assert_eq!(manifest.runtime.minimum_app_version.as_deref(), Some("0.2.0"));
+        assert_eq!(manifest.models.len(), 1);
+        assert_eq!(manifest.models[0].model, "small");
+        assert_eq!(
+            manifest.models[0].url,
+            "https://downloads.example.com/local-asr/model-small-mlx-2026.05.20.zip"
+        );
+        assert_eq!(manifest.models[0].size_bytes, 456);
+        clear_local_asr_manifest_env();
+    }
 }
 
 pub fn updates_routes() -> Router<AppState> {
     Router::new()
         .route("/appcast.xml", get(get_appcast))
+        .route("/v1/local-asr/manifest", get(get_local_asr_manifest))
         .route("/updates/latest", get(get_latest_version))
         .route("/updates/releases", post(create_release))
         .route("/updates/releases/promote", patch(promote_release))

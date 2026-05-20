@@ -149,7 +149,7 @@ struct DesktopHomeView: View {
               // Auto-start transcription if enabled in settings.
               // If API keys aren't loaded yet, onChange below retries.
               if settings.transcriptionEnabled && !appState.isTranscribing {
-                if APIKeyService.keysAvailable {
+                if APIKeyService.keysAvailable || !backgroundTranscriptionNeedsAPIKeys(settings: settings) {
                   log("DesktopHomeView: Auto-starting transcription")
                   appState.startTranscription()
                 } else {
@@ -409,6 +409,16 @@ struct DesktopHomeView: View {
       notification in
       handleAutomationNavigation(notification)
     }
+  }
+
+  private func backgroundTranscriptionNeedsAPIKeys(settings: AssistantSettings) -> Bool {
+    let routing = BackgroundTranscriptionRoutingGuard().decide(
+      selection: settings.transcriptionProviderSelection,
+      capabilities: LocalTranscriptionCapabilityDetector(
+        availableEngines: { LocalASRHelperLocator.detectedEngines() }
+      ).detect()
+    )
+    return routing.requiresCloudEntitlement
   }
 
   /// Recursively find all NSHostingViews in a window and set sizingOptions to [],
@@ -723,6 +733,16 @@ struct DesktopHomeView: View {
     }
     .onReceive(NotificationCenter.default.publisher(for: .navigateToAIChatSettings)) { _ in
       selectedSettingsSection = .advanced
+      withAnimation(.easeInOut(duration: 0.2)) {
+        selectedIndex = SidebarNavItem.settings.rawValue
+      }
+    }
+    .onReceive(NotificationCenter.default.publisher(for: .navigateToTranscriptionSettings)) {
+      notification in
+      selectedSettingsSection = .transcription
+      if let settingId = notification.userInfo?["highlightedSettingId"] as? String {
+        highlightedSettingId = settingId
+      }
       withAnimation(.easeInOut(duration: 0.2)) {
         selectedIndex = SidebarNavItem.settings.rawValue
       }

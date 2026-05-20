@@ -21,6 +21,7 @@ Options (via environment variables):
   OMI_PYTHON_API_URL="..."  Python backend URL (subscriptions, payments, etc; default: https://api.omi.me)
   OMI_SIGN_IDENTITY="..."  Code signing identity (auto-detected if not set)
   OMI_ENABLE_LOCAL_AUTOMATION=1  Enable agent-swift automation bridge
+  OMI_SKIP_STALE_BUNDLE_SCAN=1   Skip scanning $HOME for stale dev app bundles
 
 Required files:
   Backend-Rust/.env         Environment variables (copy from ../.env.example)
@@ -202,10 +203,14 @@ done
 find "$(dirname "$0")/../app/build" -name "$APP_NAME.app" -type d -exec rm -rf {} + 2>/dev/null || true
 # Kill stale app bundles from other repo clones (e.g. ~/omi-desktop/)
 # These confuse LaunchServices and get launched instead of the /Applications copy.
-find "$HOME" -maxdepth 4 -name "$APP_NAME.app" -type d -not -path "$APP_BUNDLE" -not -path "$APP_PATH" 2>/dev/null | while read stale; do
-    substep "Removing stale clone: $stale"
-    rm -rf "$stale"
-done
+if [ "${OMI_SKIP_STALE_BUNDLE_SCAN:-0}" != "1" ]; then
+    find "$HOME" -maxdepth 4 -name "$APP_NAME.app" -type d -not -path "$APP_BUNDLE" -not -path "$APP_PATH" 2>/dev/null | while read stale; do
+        substep "Removing stale clone: $stale"
+        rm -rf "$stale"
+    done
+else
+    substep "Skipping stale bundle scan (OMI_SKIP_STALE_BUNDLE_SCAN=1)"
+fi
 
 if [ "${OMI_SKIP_TUNNEL:-0}" != "1" ]; then
     step "Starting Cloudflare quick tunnel..."
@@ -377,6 +382,9 @@ fi
 step "Building Swift app (swift build -c debug)..."
 xcrun swift build -c debug --package-path Desktop
 
+step "Building local ASR helper (cargo build)..."
+cargo build --manifest-path local-asr-helper/Cargo.toml
+
 auth_debug "AFTER swift build: auth_isSignedIn=$(defaults read "$BUNDLE_ID" auth_isSignedIn 2>&1 || true)"
 
 step "Creating app bundle..."
@@ -524,6 +532,9 @@ fi
 substep "Copying app icon"
 cp -f omi_icon.icns "$APP_BUNDLE/Contents/Resources/OmiIcon.icns" 2>/dev/null || true
 
+substep "Copying local ASR helper"
+cp -f "local-asr-helper/target/debug/local-asr-helper" "$APP_BUNDLE/Contents/Resources/local-asr-helper"
+
 substep "Creating PkgInfo"
 echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
 
@@ -591,6 +602,10 @@ if [ -n "$SIGN_IDENTITY" ]; then
     if [ -f "$NODE_BIN" ]; then
         substep "Signing bundled node binary"
         codesign --force --options runtime --entitlements Desktop/Node.entitlements --sign "$SIGN_IDENTITY" "$NODE_BIN"
+    fi
+    if [ -f "$APP_BUNDLE/Contents/Resources/local-asr-helper" ]; then
+        substep "Signing local ASR helper"
+        codesign --force --options runtime --sign "$SIGN_IDENTITY" "$APP_BUNDLE/Contents/Resources/local-asr-helper"
     fi
 
     # If local signing identity doesn't match embedded profile team, macOS rejects
