@@ -15,6 +15,7 @@ validated against enrolled fingerprints so that:
 
 import hashlib
 import logging
+import re
 import threading
 import time
 from contextvars import ContextVar
@@ -70,9 +71,13 @@ BYOK_HEADERS = {
     'deepgram': 'x-byok-deepgram',
 }
 
+CHATGPT_FINGERPRINT_HEADER = 'x-chatgpt-fingerprint'
+_SHA256_HEX_RE = re.compile(r'^[a-f0-9]{64}$')
+
 # Keys for the current request, if the client supplied them.
 # Default is None (not {}) to avoid sharing a mutable object across contexts.
 _byok_ctx: ContextVar[Optional[Dict[str, str]]] = ContextVar('byok_keys', default=None)
+_chatgpt_fp_ctx: ContextVar[Optional[str]] = ContextVar('chatgpt_fingerprint', default=None)
 
 
 def get_byok_keys() -> Dict[str, str]:
@@ -91,6 +96,25 @@ def has_byok_keys() -> bool:
     """True if the current request carries at least one BYOK header."""
     keys = _byok_ctx.get()
     return bool(keys)
+
+
+def get_chatgpt_fingerprint() -> Optional[str]:
+    """ChatGPT/Codex enrollment fingerprint from the current request, if any."""
+    return _chatgpt_fp_ctx.get()
+
+
+def request_chatgpt_fingerprint_matches(uid: str) -> bool:
+    """True when the request carries a fingerprint matching enrolled ChatGPT state."""
+    fp = get_chatgpt_fingerprint()
+    if not fp or not _SHA256_HEX_RE.match(fp):
+        return False
+
+    import database.users as users_db
+
+    state = users_db.get_chatgpt_state(uid)
+    if not state.get('active'):
+        return False
+    return fp == state.get('fingerprint', '')
 
 
 def set_byok_keys(keys: Dict[str, str]):
@@ -127,10 +151,13 @@ class BYOKMiddleware(BaseHTTPMiddleware):
             if value:
                 keys[provider] = value
         token = _byok_ctx.set(keys)
+        fp = request.headers.get(CHATGPT_FINGERPRINT_HEADER)
+        fp_token = _chatgpt_fp_ctx.set(fp if fp else None)
         try:
             return await call_next(request)
         finally:
             _byok_ctx.reset(token)
+            _chatgpt_fp_ctx.reset(fp_token)
 
 
 # ---------------------------------------------------------------------------

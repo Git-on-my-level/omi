@@ -111,6 +111,10 @@ actor APIClient {
       headers.merge(APIKeyService.byokHeaders()) { _, new in new }
     }
 
+    if let chatgptFingerprint = CodexAuthService.enrollmentFingerprintIfActive() {
+      headers["X-ChatGPT-Fingerprint"] = chatgptFingerprint
+    }
+
     return headers
   }
 
@@ -119,13 +123,15 @@ actor APIClient {
   func get<T: Decodable>(
     _ endpoint: String,
     requireAuth: Bool = true,
+    includeBYOK: Bool = false,
     customBaseURL: String? = nil
   ) async throws -> T {
     let base = customBaseURL ?? baseURL
     let url = URL(string: base + endpoint)!
     var request = URLRequest(url: url)
     request.httpMethod = "GET"
-    request.allHTTPHeaderFields = try await buildHeaders(requireAuth: requireAuth)
+    request.allHTTPHeaderFields = try await buildHeaders(
+      requireAuth: requireAuth, includeBYOK: includeBYOK)
 
     return try await performRequest(request, retryOnUnauthorized: requireAuth)
   }
@@ -5930,7 +5936,7 @@ extension APIClient {
   func getUserSubscription() async throws -> UserSubscriptionResponse {
     try requireCapability(.payments)
 
-    return try await get("v1/users/me/subscription")
+    return try await get("v1/users/me/subscription", includeBYOK: true)
   }
 
   func getAvailablePlans() async throws -> AvailablePlansResponse {
@@ -6152,7 +6158,7 @@ extension APIClient {
     }
 
     do {
-      let res: ChatUsageQuota = try await get("v1/users/me/usage-quota")
+      let res: ChatUsageQuota = try await get("v1/users/me/usage-quota", includeBYOK: true)
       log(
         "APIClient: Quota plan=\(res.plan) unit=\(res.unit) used=\(res.used) limit=\(res.limit ?? -1) allowed=\(res.allowed)"
       )

@@ -97,7 +97,7 @@ from utils.other.storage import (
 )
 from utils.webhooks import webhook_first_time_setup
 from database.action_items import get_action_items as get_standalone_action_items
-from utils.byok import has_byok_keys, invalidate_byok_state_cache
+from utils.byok import has_byok_keys, invalidate_byok_state_cache, request_chatgpt_fingerprint_matches
 import logging
 
 logger = logging.getLogger(__name__)
@@ -885,7 +885,7 @@ def get_user_subscription_endpoint(
     # these users aren't surprised by a disabled phone-call feature.
     unlimited_phone_quota = PhoneCallQuota(has_access=True, is_paid=True)
 
-    if users_db.is_chatgpt_active(uid):
+    if users_db.is_chatgpt_active(uid) and request_chatgpt_fingerprint_matches(uid):
         return UserSubscriptionResponse(
             subscription=_chatgpt_unlimited_subscription(),
             transcription_seconds_used=0,
@@ -1110,7 +1110,7 @@ def get_user_chat_usage_quota(
     # BYOK free plan: user brings their own keys, so there's no Omi-side cost
     # to meter. Only return unlimited when BYOK headers are on the request (desktop).
     # Mobile (no headers) should see real quota.
-    if users_db.is_chatgpt_active(uid):
+    if users_db.is_chatgpt_active(uid) and request_chatgpt_fingerprint_matches(uid):
         return ChatUsageQuota(
             plan='Free (ChatGPT)',
             plan_type=PlanType.unlimited.value,

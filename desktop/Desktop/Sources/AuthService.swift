@@ -236,6 +236,13 @@ class AuthService {
         authStateHandle = Auth.auth().addStateDidChangeListener { [weak self] _, user in
             Task { @MainActor in
                 if user != nil {
+                    if self?.isLocalDaemonMode == true,
+                       UserDefaults.standard.string(forKey: self?.kAuthUserId ?? "")
+                           == Self.localGuestUserId
+                    {
+                        log("AUTH_LISTENER: local daemon guest session — ignoring stale Firebase user")
+                        return
+                    }
                     // Firebase has a user - trust it
                     log("AUTH_LISTENER: Firebase user present (uid=\(user?.uid ?? "nil")), setting isSignedIn=true")
                     self?.isSignedIn = true

@@ -360,6 +360,38 @@ class TestChatQuotaBYOKBypass:
             enforce_chat_quota('non-byok-uid')
         assert exc_info.value.status_code == 402
 
+    @patch('utils.subscription.request_chatgpt_fingerprint_matches', return_value=True)
+    @patch('utils.subscription.users_db')
+    def test_enforce_chat_quota_bypasses_for_chatgpt_with_fingerprint(self, mock_users_db, _mock_fp):
+        mock_users_db.is_chatgpt_active.return_value = True
+        from utils.subscription import enforce_chat_quota
+
+        enforce_chat_quota('chatgpt-user-uid')
+
+    @patch('utils.subscription.request_chatgpt_fingerprint_matches', return_value=False)
+    @patch('utils.subscription.users_db')
+    @patch('utils.subscription.get_chat_quota_snapshot')
+    def test_enforce_chat_quota_enforces_when_chatgpt_active_but_no_fingerprint(
+        self, mock_snapshot, mock_users_db, _mock_fp
+    ):
+        from models.users import PlanType
+
+        mock_users_db.is_chatgpt_active.return_value = True
+        mock_snapshot.return_value = {
+            'plan': PlanType.basic,
+            'unit': 'questions',
+            'used': 31,
+            'limit': 30,
+            'allowed': False,
+            'reset_at': '2026-05-01',
+        }
+        from fastapi import HTTPException
+        from utils.subscription import enforce_chat_quota
+
+        with pytest.raises(HTTPException) as exc_info:
+            enforce_chat_quota('fake-chatgpt-uid')
+        assert exc_info.value.status_code == 402
+
 
 # ---------------------------------------------------------------------------
 # 7. Transcription credit BYOK bypass

@@ -12,7 +12,7 @@ import database.user_usage as user_usage_db
 from database import redis_db
 from database.announcements import compare_versions
 from models.users import PlanType, SubscriptionStatus, Subscription, PlanLimits, TrialMetadata
-from utils.byok import get_byok_key, get_byok_keys
+from utils.byok import get_byok_key, get_byok_keys, request_chatgpt_fingerprint_matches
 from utils.log_sanitizer import sanitize
 import logging
 
@@ -541,8 +541,9 @@ def enforce_chat_quota(uid: str, platform: Optional[str] = None) -> None:
         )
 
     # BYOK users pay their own LLM provider — no Omi-side cost to cap.
-    # ChatGPT/Codex tier: user pays OpenAI via subscription; LLM quota bypass only.
-    if users_db.is_chatgpt_active(uid):
+    # ChatGPT/Codex tier: require matching enrollment fingerprint on this request
+    # (same pattern as BYOK) so Firestore enrollment alone cannot bypass quota.
+    if users_db.is_chatgpt_active(uid) and request_chatgpt_fingerprint_matches(uid):
         return
 
     # Require an LLM provider key on this request (not just any BYOK header)

@@ -55,7 +55,7 @@ final class CodexProxyService: ObservableObject {
     if await healthCheck() {
       isRunning = true
       lastError = nil
-      startHealthMonitor()
+      startHealthMonitorIfNeeded()
       return
     }
     if isRunning {
@@ -91,7 +91,7 @@ final class CodexProxyService: ObservableObject {
         if await healthCheck() {
           isRunning = true
           lastError = nil
-          startHealthMonitor()
+          startHealthMonitorIfNeeded()
           log("CodexProxyService: proxy running at \(Self.defaultBaseURL)")
           return
         }
@@ -120,6 +120,13 @@ final class CodexProxyService: ObservableObject {
     }
     process = nil
     isRunning = false
+  }
+
+  private func startHealthMonitorIfNeeded() {
+    if let healthTask, !healthTask.isCancelled {
+      return
+    }
+    startHealthMonitor()
   }
 
   private func startHealthMonitor() {
