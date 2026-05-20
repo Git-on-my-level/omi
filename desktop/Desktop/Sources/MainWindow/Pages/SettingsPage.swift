@@ -266,6 +266,9 @@ struct SettingsContentView: View {
   @State private var vadGateEnabled: Bool = false
   @State private var transcriptionProviderSelection: TranscriptionProviderSelection
   @State private var localTranscriptionCapabilities: LocalTranscriptionCapabilities
+  @State private var localASRAddonStatus: LocalASRAddonStatus
+  @State private var isInstallingLocalASRAddon = false
+  @State private var localASRAddonMessage: String?
 
   // Multi-chat mode setting
   @AppStorage("multiChatEnabled") private var multiChatEnabled = false
@@ -434,6 +437,7 @@ struct SettingsContentView: View {
     _transcriptionProviderSelection = State(initialValue: settings.transcriptionProviderSelection)
     _localTranscriptionCapabilities = State(
       initialValue: SettingsContentView.detectLocalTranscriptionCapabilities())
+    _localASRAddonStatus = State(initialValue: LocalASRAddonManager.status())
   }
 
   /// Computed status text for notifications
@@ -1103,6 +1107,8 @@ struct SettingsContentView: View {
                 .fill(OmiColors.warning.opacity(0.1))
             )
           }
+
+          localASRAddonControls
         }
       }
 
@@ -1451,6 +1457,93 @@ struct SettingsContentView: View {
     resolvedTranscriptionProvider.usesLocal ? OmiColors.success : OmiColors.textTertiary
   }
 
+  private var localASRAddonControls: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Divider()
+        .background(OmiColors.backgroundQuaternary)
+
+      HStack(alignment: .top, spacing: 12) {
+        Image(
+          systemName: localASRAddonStatus.isInstalled
+            ? "checkmark.circle.fill" : "square.and.arrow.down"
+        )
+          .scaledFont(size: 18)
+          .foregroundColor(
+            localASRAddonStatus.isInstalled ? OmiColors.success : OmiColors.textSecondary
+          )
+          .frame(width: 22)
+
+        VStack(alignment: .leading, spacing: 6) {
+          Text("Local Whisper Add-on")
+            .scaledFont(size: 14, weight: .medium)
+            .foregroundColor(OmiColors.textPrimary)
+
+          Text(localASRAddonStatus.pythonPath ?? localASRAddonStatus.detail)
+            .scaledFont(size: 12)
+            .foregroundColor(OmiColors.textTertiary)
+            .lineLimit(3)
+            .truncationMode(.middle)
+
+          if let localASRAddonMessage {
+            Text(localASRAddonMessage)
+              .scaledFont(size: 12)
+              .foregroundColor(
+                localASRAddonMessage.hasPrefix("Installed") ? OmiColors.success : OmiColors.warning)
+              .fixedSize(horizontal: false, vertical: true)
+          }
+        }
+
+        Spacer(minLength: 12)
+
+        HStack(spacing: 8) {
+          if localASRAddonStatus.isInstalled {
+            Button("Remove") {
+              removeLocalASRAddon()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(isInstallingLocalASRAddon)
+          }
+
+          Button(localASRAddonPrimaryActionTitle) {
+            installLocalASRAddon()
+          }
+          .buttonStyle(.borderedProminent)
+          .controlSize(.small)
+          .disabled(isInstallingLocalASRAddon || !localASRAddonStatus.isActionableInstall)
+        }
+      }
+    }
+    .id("transcription.localWhisperAddon")
+    .task {
+      let status = await LocalASRAddonManager.refreshStatusAgainstRemote()
+      await MainActor.run {
+        localASRAddonStatus = status
+      }
+    }
+  }
+
+  private var localASRAddonPrimaryActionTitle: String {
+    switch localASRAddonStatus.state {
+    case .installed:
+      let required = LocalASRAddonManager.initialModel(for: transcriptionProviderSelection.quality)
+      if case .installed(_, let models) = localASRAddonStatus.state, !models.contains(required) {
+        return "Install \(required.rawValue)"
+      }
+      return "Repair"
+    case .updateAvailable:
+      return "Update"
+    case .repairRequired:
+      return "Repair"
+    case .installing:
+      return "Installing..."
+    case .notInstalled:
+      return "Install"
+    case .unsupported:
+      return "Unavailable"
+    }
+  }
+
   private func transcriptionProviderOption(
     mode: TranscriptionProviderKind,
     title: String,
@@ -1507,6 +1600,61 @@ struct SettingsContentView: View {
     transcriptionProviderSelection = selection
     AssistantSettings.shared.transcriptionProviderSelection = selection
     restartTranscriptionIfNeeded()
+  }
+
+  private func installLocalASRAddon() {
+    guard !isInstallingLocalASRAddon else { return }
+    isInstallingLocalASRAddon = true
+    localASRAddonMessage = "Installing local Whisper runtime..."
+
+    Task {
+      do {
+        let status = try await LocalASRAddonManager.installModel(
+          for: transcriptionProviderSelection.quality,
+          progress: { progress in
+            localASRAddonStatus = LocalASRAddonStatus(
+              state: .installing(progress),
+              pythonPath: localASRAddonStatus.pythonPath,
+              detail: progress.label
+            )
+            if let fraction = progress.fraction {
+              localASRAddonMessage = "\(progress.label) \(Int(fraction * 100))%"
+            } else {
+              localASRAddonMessage = progress.label
+            }
+          }
+        )
+        let engines = await LocalASRHelperLocator.refreshDetectedEngines()
+        await MainActor.run {
+          localASRAddonStatus = LocalASRAddonManager.status(afterCapabilityProbe: engines)
+          if case .repairRequired(let reason) = localASRAddonStatus.state {
+            localASRAddonMessage = reason
+          } else {
+            localASRAddonStatus = status
+            localASRAddonMessage = "Installed local Whisper add-on."
+            localTranscriptionCapabilities =
+              SettingsContentView.detectLocalTranscriptionCapabilities()
+          }
+          isInstallingLocalASRAddon = false
+        }
+      } catch {
+        await MainActor.run {
+          localASRAddonStatus = LocalASRAddonManager.status()
+          localASRAddonMessage = error.localizedDescription
+          isInstallingLocalASRAddon = false
+        }
+      }
+    }
+  }
+
+  private func removeLocalASRAddon() {
+    do {
+      localASRAddonStatus = try LocalASRAddonManager.remove()
+      localASRAddonMessage = "Removed local Whisper add-on."
+      localTranscriptionCapabilities = SettingsContentView.detectLocalTranscriptionCapabilities()
+    } catch {
+      localASRAddonMessage = error.localizedDescription
+    }
   }
 
   // MARK: - Notifications Section
