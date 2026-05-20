@@ -15,13 +15,13 @@ struct SegmentTranslation: Identifiable {
 struct SpeakerSegment: Identifiable {
   /// Stable identity — uses backend segment ID when available, otherwise speaker + start time
   var id: String { segmentId ?? "\(speaker)-\(start)" }
-  var segmentId: String?   // Backend-assigned UUID
+  var segmentId: String?  // Backend-assigned UUID
   var speaker: Int
   var text: String
   var start: Double
   var end: Double
   var isUser: Bool = false
-  var personId: String?    // Backend-assigned person ID from speaker identification
+  var personId: String?  // Backend-assigned person ID from speaker identification
   var translations: [SegmentTranslation] = []
 }
 
@@ -169,10 +169,10 @@ class AppState: ObservableObject {
 
   func fetchTrialMetadata() {
     #if DEBUG
-    if let debugMode = UserDefaults.standard.string(forKey: "debug_trial_mode") {
-      applyDebugTrialMode(debugMode)
-      return
-    }
+      if let debugMode = UserDefaults.standard.string(forKey: "debug_trial_mode") {
+        applyDebugTrialMode(debugMode)
+        return
+      }
     #endif
 
     Task { @MainActor in
@@ -191,58 +191,63 @@ class AppState: ObservableObject {
   }
 
   #if DEBUG
-  private func applyDebugTrialMode(_ mode: String) {
-    let now = Int(Date().timeIntervalSince1970)
-    let features = ["unlimited_listening", "unlimited_transcription", "unlimited_memories", "unlimited_insights", "30_chat_questions_per_month"]
-    let dur = 3 * 24 * 3600
+    private func applyDebugTrialMode(_ mode: String) {
+      let now = Int(Date().timeIntervalSince1970)
+      let features = [
+        "unlimited_listening", "unlimited_transcription", "unlimited_memories",
+        "unlimited_insights", "30_chat_questions_per_month",
+      ]
+      let dur = 3 * 24 * 3600
 
-    func mock(remaining: Int, expired: Bool) -> TrialMetadataResponse {
-      TrialMetadataResponse(
-        trialStartedAt: now - (dur - remaining), trialEndsAt: now + remaining,
-        trialRemainingSeconds: remaining, trialExpired: expired,
-        trialDurationSeconds: dur, trialFeatures: features, planAfterTrial: "Free"
-      )
-    }
-
-    switch mode {
-    case "active":
-      self.trialMetadata = mock(remaining: 2 * 24 * 3600 + 3600, expired: false)
-    case "warning":
-      self.trialMetadata = mock(remaining: 12 * 3600, expired: false)
-    case "expiring":
-      self.trialMetadata = mock(remaining: 1800, expired: false)
-    case "expired":
-      self.trialMetadata = mock(remaining: 0, expired: true)
-    case "realtime":
-      let endKey = "debug_trial_end_time"
-      let rtDur = 120
-      var endTime = UserDefaults.standard.integer(forKey: endKey)
-      if endTime == 0 {
-        endTime = now + rtDur
-        UserDefaults.standard.set(endTime, forKey: endKey)
+      func mock(remaining: Int, expired: Bool) -> TrialMetadataResponse {
+        TrialMetadataResponse(
+          trialStartedAt: now - (dur - remaining), trialEndsAt: now + remaining,
+          trialRemainingSeconds: remaining, trialExpired: expired,
+          trialDurationSeconds: dur, trialFeatures: features, planAfterTrial: "Free"
+        )
       }
-      let remaining = max(0, endTime - now)
-      self.trialMetadata = TrialMetadataResponse(
-        trialStartedAt: endTime - rtDur, trialEndsAt: endTime,
-        trialRemainingSeconds: remaining, trialExpired: remaining == 0,
-        trialDurationSeconds: rtDur, trialFeatures: features, planAfterTrial: "Free"
-      )
-      if remaining == 0 && !self.isPaywalled { self.isPaywalled = true }
-    default:
-      break
+
+      switch mode {
+      case "active":
+        self.trialMetadata = mock(remaining: 2 * 24 * 3600 + 3600, expired: false)
+      case "warning":
+        self.trialMetadata = mock(remaining: 12 * 3600, expired: false)
+      case "expiring":
+        self.trialMetadata = mock(remaining: 1800, expired: false)
+      case "expired":
+        self.trialMetadata = mock(remaining: 0, expired: true)
+      case "realtime":
+        let endKey = "debug_trial_end_time"
+        let rtDur = 120
+        var endTime = UserDefaults.standard.integer(forKey: endKey)
+        if endTime == 0 {
+          endTime = now + rtDur
+          UserDefaults.standard.set(endTime, forKey: endKey)
+        }
+        let remaining = max(0, endTime - now)
+        self.trialMetadata = TrialMetadataResponse(
+          trialStartedAt: endTime - rtDur, trialEndsAt: endTime,
+          trialRemainingSeconds: remaining, trialExpired: remaining == 0,
+          trialDurationSeconds: rtDur, trialFeatures: features, planAfterTrial: "Free"
+        )
+        if remaining == 0 && !self.isPaywalled { self.isPaywalled = true }
+      default:
+        break
+      }
     }
-  }
   #endif
 
   func startTrialMetadataRefresh() {
     trialRefreshTimer?.invalidate()
     fetchTrialMetadata()
     #if DEBUG
-    let interval: TimeInterval = UserDefaults.standard.string(forKey: "debug_trial_mode") == "realtime" ? 10 : 60
+      let interval: TimeInterval =
+        UserDefaults.standard.string(forKey: "debug_trial_mode") == "realtime" ? 10 : 60
     #else
-    let interval: TimeInterval = 60
+      let interval: TimeInterval = 60
     #endif
-    trialRefreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+    trialRefreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) {
+      [weak self] _ in
       Task { @MainActor in
         self?.fetchTrialMetadata()
       }
@@ -310,6 +315,7 @@ class AppState: ObservableObject {
   private let maxInMemorySegments = 200
   private var totalSegmentCount = 0  // Total segments created this session (including trimmed)
   private var totalWordCount = 0  // Running word count for analytics
+  private var speakerSegmentReducer = SpeakerSegmentReducer(maxInMemorySegments: 200)
 
   // Conversation tracking for auto-save
   private var recordingStartTime: Date?
@@ -906,73 +912,73 @@ class AppState: ObservableObject {
     DispatchQueue.main.async { [weak self] in
       guard let self else { return }
       UNUserNotificationCenter.current().getNotificationSettings { settings in
-      DispatchQueue.main.async {
-        let isNowGranted = settings.authorizationStatus == .authorized
-        self.hasNotificationPermission = isNowGranted
-        self.notificationAlertStyle = settings.alertStyle
+        DispatchQueue.main.async {
+          let isNowGranted = settings.authorizationStatus == .authorized
+          self.hasNotificationPermission = isNowGranted
+          self.notificationAlertStyle = settings.alertStyle
 
-        // Log the current notification settings
-        let authStatus =
-          switch settings.authorizationStatus {
-          case .notDetermined: "notDetermined"
-          case .denied: "denied"
-          case .authorized: "authorized"
-          case .provisional: "provisional"
-          case .ephemeral: "ephemeral"
-          @unknown default: "unknown"
-          }
-        let alertStyleName =
-          switch settings.alertStyle {
-          case .none: "NONE (no banners)"
-          case .banner: "BANNER"
-          case .alert: "ALERT"
-          @unknown default: "unknown"
-          }
-        log(
-          "Notification settings: auth=\(authStatus), alertStyle=\(alertStyleName), sound=\(settings.soundSetting.rawValue), badge=\(settings.badgeSetting.rawValue)"
-        )
-
-        // Track notification settings in analytics only when they change
-        let soundEnabled = settings.soundSetting == .enabled
-        let badgeEnabled = settings.badgeSetting == .enabled
-        let settingsChanged =
-          authStatus != self.lastNotificationAuthStatus
-          || alertStyleName != self.lastNotificationAlertStyle
-          || soundEnabled != self.lastNotificationSoundEnabled
-          || badgeEnabled != self.lastNotificationBadgeEnabled
-
-        if settingsChanged {
-          AnalyticsManager.shared.notificationSettingsChecked(
-            authStatus: authStatus,
-            alertStyle: alertStyleName,
-            soundEnabled: soundEnabled,
-            badgeEnabled: badgeEnabled,
-            bannersDisabled: settings.alertStyle == .none
+          // Log the current notification settings
+          let authStatus =
+            switch settings.authorizationStatus {
+            case .notDetermined: "notDetermined"
+            case .denied: "denied"
+            case .authorized: "authorized"
+            case .provisional: "provisional"
+            case .ephemeral: "ephemeral"
+            @unknown default: "unknown"
+            }
+          let alertStyleName =
+            switch settings.alertStyle {
+            case .none: "NONE (no banners)"
+            case .banner: "BANNER"
+            case .alert: "ALERT"
+            @unknown default: "unknown"
+            }
+          log(
+            "Notification settings: auth=\(authStatus), alertStyle=\(alertStyleName), sound=\(settings.soundSetting.rawValue), badge=\(settings.badgeSetting.rawValue)"
           )
 
-          // Detect regression: was authorized, now reverted to notDetermined
-          // This happens on macOS 26+ where the OS silently revokes notification permission
-          if self.lastNotificationAuthStatus == "authorized" && authStatus == "notDetermined" {
-            log(
-              "Notification permission REGRESSED from authorized to notDetermined — triggering auto-repair"
+          // Track notification settings in analytics only when they change
+          let soundEnabled = settings.soundSetting == .enabled
+          let badgeEnabled = settings.badgeSetting == .enabled
+          let settingsChanged =
+            authStatus != self.lastNotificationAuthStatus
+            || alertStyleName != self.lastNotificationAlertStyle
+            || soundEnabled != self.lastNotificationSoundEnabled
+            || badgeEnabled != self.lastNotificationBadgeEnabled
+
+          if settingsChanged {
+            AnalyticsManager.shared.notificationSettingsChecked(
+              authStatus: authStatus,
+              alertStyle: alertStyleName,
+              soundEnabled: soundEnabled,
+              badgeEnabled: badgeEnabled,
+              bannersDisabled: settings.alertStyle == .none
             )
-            AnalyticsManager.shared.notificationRepairTriggered(
-              reason: "auth_regression",
-              previousStatus: "authorized",
-              currentStatus: "notDetermined"
-            )
-            self.repairNotificationRegistrationAndRetry()
+
+            // Detect regression: was authorized, now reverted to notDetermined
+            // This happens on macOS 26+ where the OS silently revokes notification permission
+            if self.lastNotificationAuthStatus == "authorized" && authStatus == "notDetermined" {
+              log(
+                "Notification permission REGRESSED from authorized to notDetermined — triggering auto-repair"
+              )
+              AnalyticsManager.shared.notificationRepairTriggered(
+                reason: "auth_regression",
+                previousStatus: "authorized",
+                currentStatus: "notDetermined"
+              )
+              self.repairNotificationRegistrationAndRetry()
+            }
+
+            // Update last known state
+            self.lastNotificationAuthStatus = authStatus
+            self.lastNotificationAlertStyle = alertStyleName
+            self.lastNotificationSoundEnabled = soundEnabled
+            self.lastNotificationBadgeEnabled = badgeEnabled
           }
 
-          // Update last known state
-          self.lastNotificationAuthStatus = authStatus
-          self.lastNotificationAlertStyle = alertStyleName
-          self.lastNotificationSoundEnabled = soundEnabled
-          self.lastNotificationBadgeEnabled = badgeEnabled
         }
-
       }
-    }
     }  // end DispatchQueue.main.async
   }
 
@@ -1469,6 +1475,7 @@ class AppState: ObservableObject {
       speakerSegments = []
       totalSegmentCount = 0
       totalWordCount = 0
+      speakerSegmentReducer.reset()
       liveSpeakerPersonMap = [:]
       LiveTranscriptMonitor.shared.clear()
       recordingStartTime = Date()
@@ -1612,7 +1619,9 @@ class AppState: ObservableObject {
     silentMicFallbackInProgress = true
 
     guard let builtInID = AudioCaptureService.findBuiltInMicDeviceID() else {
-      log("Transcription: silent-mic detected but no built-in microphone available — leaving capture as-is")
+      log(
+        "Transcription: silent-mic detected but no built-in microphone available — leaving capture as-is"
+      )
       silentMicFallbackInProgress = false
       return
     }
@@ -1738,7 +1747,9 @@ class AppState: ObservableObject {
       // finalize the NEW conversation instead of the one we just stopped.
       // The retry service will reconcile the old session by timestamp matching.
       guard self.recordingGeneration == generationAtStop else {
-        log("Transcription: New recording started during delay, skipping force-process for session \(capturedSessionId.map(String.init) ?? "nil")")
+        log(
+          "Transcription: New recording started during delay, skipping force-process for session \(capturedSessionId.map(String.init) ?? "nil")"
+        )
         return
       }
 
@@ -1746,15 +1757,20 @@ class AppState: ObservableObject {
         if let conversation = try await APIClient.shared.forceProcessConversation() {
           // Validate the returned conversation matches the session we just stopped
           if let sessionId = capturedSessionId, let startTime = capturedStartTime,
-             let convStarted = conversation.startedAt,
-             abs(convStarted.timeIntervalSince(startTime)) < 10,
-             conversation.source == .desktop {
+            let convStarted = conversation.startedAt,
+            abs(convStarted.timeIntervalSince(startTime)) < 10,
+            conversation.source == .desktop
+          {
             try? await TranscriptionStorage.shared.markSessionCompleted(
               id: sessionId, backendId: conversation.id)
-            log("Transcription: Force-processed conversation \(conversation.id), session \(sessionId) completed")
+            log(
+              "Transcription: Force-processed conversation \(conversation.id), session \(sessionId) completed"
+            )
           } else if let sessionId = capturedSessionId, let startTime = capturedStartTime {
             // Force-process returned a different conversation — fall back to reconciliation
-            log("Transcription: Force-processed conversation \(conversation.id) does not match session \(sessionId), reconciling by timestamp")
+            log(
+              "Transcription: Force-processed conversation \(conversation.id) does not match session \(sessionId), reconciling by timestamp"
+            )
             await reconcileSession(sessionId: sessionId, startTime: startTime)
           }
         } else {
@@ -1793,7 +1809,9 @@ class AppState: ObservableObject {
           id: sessionId, backendId: match.id)
         log("Transcription: Reconciled session \(sessionId) → backend conversation \(match.id)")
       } else {
-        log("Transcription: No matching backend conversation found for session \(sessionId), leaving for retry")
+        log(
+          "Transcription: No matching backend conversation found for session \(sessionId), leaving for retry"
+        )
       }
     } catch {
       logError("Transcription: Reconciliation failed for session \(sessionId)", error: error)
@@ -1808,7 +1826,9 @@ class AppState: ObservableObject {
       return .discarded
     }
 
-    log("Transcription: Finishing conversation — disconnecting WebSocket to trigger backend processing")
+    log(
+      "Transcription: Finishing conversation — disconnecting WebSocket to trigger backend processing"
+    )
 
     // Capture state before rotation — memory_created event for this conversation
     // may arrive on the new WebSocket after currentSessionId and recordingStartTime have changed.
@@ -1839,6 +1859,7 @@ class AppState: ObservableObject {
     speakerSegments = []
     totalSegmentCount = 0
     totalWordCount = 0
+    speakerSegmentReducer.reset()
     liveSpeakerPersonMap = [:]
     LiveTranscriptMonitor.shared.clear()
     LiveNotesMonitor.shared.endSession()
@@ -1996,6 +2017,7 @@ class AppState: ObservableObject {
     AnalyticsManager.shared.transcriptionStopped(wordCount: totalWordCount)
     totalSegmentCount = 0
     totalWordCount = 0
+    speakerSegmentReducer.reset()
     currentTranscript = ""
 
     log("Transcription: Stopped")
@@ -2423,7 +2445,7 @@ class AppState: ObservableObject {
       let idSet = Set(segmentIds)
       if let idx = conversations.firstIndex(where: { $0.id == conversationId }) {
         for segIdx in conversations[idx].transcriptSegments.indices
-          where idSet.contains(conversations[idx].transcriptSegments[segIdx].id) {
+        where idSet.contains(conversations[idx].transcriptSegments[segIdx].id) {
           let old = conversations[idx].transcriptSegments[segIdx]
           conversations[idx].transcriptSegments[segIdx] = TranscriptSegment(
             id: old.id,
@@ -2457,57 +2479,30 @@ class AppState: ObservableObject {
   /// Handle incoming transcript segments from Python backend `/v4/listen`.
   /// Backend sends pre-merged segments with speaker attribution — no client-side word merging needed.
   private func handleBackendSegments(_ segments: [TranscriptionService.BackendSegment]) {
-    for segment in segments {
-      guard !segment.text.isEmpty else { continue }
-
-      // Extract speaker_id from backend (e.g. "SPEAKER_00" → 0)
-      let speakerId = segment.speaker_id ?? 0
-
-      // Convert backend segment to local SpeakerSegment
-      let translations = (segment.translations ?? []).map {
-        SegmentTranslation(lang: $0.lang, text: $0.text)
-      }
-      let newSeg = SpeakerSegment(
-        segmentId: segment.id,
-        speaker: speakerId,
+    let normalizedSegments = segments.map { $0.normalized }
+    let incomingSegments = normalizedSegments.compactMap { segment -> SpeakerSegment? in
+      guard !segment.text.isEmpty else { return nil }
+      return SpeakerSegment(
+        segmentId: segment.segmentId,
+        speaker: segment.speaker,
         text: segment.text,
         start: segment.start,
         end: segment.end,
-        isUser: segment.is_user,
-        personId: segment.person_id,
-        translations: translations
-      )
-
-      // Upsert: if we already have a segment with this ID, update it; otherwise append
-      if let segId = segment.id,
-        let existingIdx = speakerSegments.firstIndex(where: { $0.segmentId == segId })
-      {
-        // Adjust word count: subtract old words, add new words
-        let oldWords = speakerSegments[existingIdx].text.split(separator: " ").count
-        totalWordCount += newSeg.text.split(separator: " ").count - oldWords
-        // Preserve existing translations if the backend didn't send new ones
-        var updatedSeg = newSeg
-        if translations.isEmpty && !speakerSegments[existingIdx].translations.isEmpty {
-          updatedSeg.translations = speakerSegments[existingIdx].translations
+        isUser: segment.isUser,
+        personId: segment.personId,
+        translations: segment.translations.map {
+          SegmentTranslation(lang: $0.lang, text: $0.text)
         }
-        speakerSegments[existingIdx] = updatedSeg
-        log(
-          "Transcript [UPDATE] Speaker \(speakerId) [\(String(format: "%.1f", segment.start))s-\(String(format: "%.1f", segment.end))s]: \(segment.text.prefix(80))"
-        )
-      } else {
-        totalWordCount += newSeg.text.split(separator: " ").count
-        speakerSegments.append(newSeg)
-        totalSegmentCount += 1
-        log(
-          "Transcript [ADD] Speaker \(speakerId) [\(String(format: "%.1f", segment.start))s-\(String(format: "%.1f", segment.end))s]: \(segment.text.prefix(80))"
-        )
-      }
+      )
     }
 
-    // Sliding window: trim old segments from memory (they're already persisted in SQLite)
-    if speakerSegments.count > maxInMemorySegments {
-      let excess = speakerSegments.count - maxInMemorySegments
-      speakerSegments.removeFirst(excess)
+    let applyResult = speakerSegmentReducer.apply(incomingSegments)
+    speakerSegments = speakerSegmentReducer.segments
+    totalSegmentCount = speakerSegmentReducer.totalSegmentCount
+    totalWordCount = speakerSegmentReducer.totalWordCount
+
+    if applyResult.added > 0 || applyResult.updated > 0 {
+      log("Transcript [UPSERT] Added: \(applyResult.added), updated: \(applyResult.updated)")
     }
 
     log(
@@ -2625,19 +2620,10 @@ class AppState: ObservableObject {
     case "segments_deleted":
       if let segmentIds = event.raw["segment_ids"] as? [String] {
         log("Transcription: Backend deleted \(segmentIds.count) segments")
-        // Decrement counters for deleted segments
-        let deletedSegments = speakerSegments.filter { seg in
-          guard let segId = seg.segmentId else { return false }
-          return segmentIds.contains(segId)
-        }
-        let deletedWords = deletedSegments.reduce(0) { $0 + $1.text.split(separator: " ").count }
-        totalWordCount = max(0, totalWordCount - deletedWords)
-        totalSegmentCount = max(0, totalSegmentCount - deletedSegments.count)
-
-        speakerSegments.removeAll { seg in
-          guard let segId = seg.segmentId else { return false }
-          return segmentIds.contains(segId)
-        }
+        _ = speakerSegmentReducer.deleteSegmentIds(segmentIds)
+        speakerSegments = speakerSegmentReducer.segments
+        totalSegmentCount = speakerSegmentReducer.totalSegmentCount
+        totalWordCount = speakerSegmentReducer.totalWordCount
         LiveTranscriptMonitor.shared.updateSegments(speakerSegments)
 
         // Also remove from DB
@@ -2688,15 +2674,17 @@ class AppState: ObservableObject {
             // Update in-memory if the segment is still loaded
             if let idx = speakerSegments.firstIndex(where: { $0.segmentId == segId }) {
               speakerSegments[idx].translations = newTranslations
+              speakerSegmentReducer.replaceSegments(speakerSegments)
             }
 
             // Always persist to SQLite — even if the segment was trimmed from
             // the in-memory window, the event payload has all fields needed
             if let sessionId = currentSessionId {
-              let mapped = newTranslations.map { TranscriptTranslation(lang: $0.lang, text: $0.text) }
-              var translationsJson: String?
-              if let jsonData = try? JSONEncoder().encode(mapped) {
-                translationsJson = String(data: jsonData, encoding: .utf8)
+              let mapped = newTranslations.map {
+                TranscriptTranslation(lang: $0.lang, text: $0.text)
+              }
+              let translationsJson = (try? JSONEncoder().encode(mapped)).flatMap {
+                String(data: $0, encoding: .utf8)
               }
               Task {
                 try? await TranscriptionStorage.shared.upsertSegment(
