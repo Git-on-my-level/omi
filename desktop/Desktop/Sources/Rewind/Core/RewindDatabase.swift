@@ -2156,6 +2156,19 @@ actor RewindDatabase {
             }
         }
 
+        migrator.registerMigration("addCanonicalSpeakerMetadata") { db in
+            try db.alter(table: "transcription_segments") { t in
+                t.add(column: "sttProvider", .text)
+                t.add(column: "sttModel", .text)
+                t.add(column: "providerClusterId", .text)
+                t.add(column: "providerSpeakerLabel", .text)
+                t.add(column: "speakerIdentityState", .text)
+                t.add(column: "speakerIdentityConfidence", .double)
+                t.add(column: "speakerIdentitySource", .text)
+                t.add(column: "speakerIdentityVersion", .text)
+            }
+        }
+
         try migrator.migrate(queue)
     }
 
@@ -2306,7 +2319,11 @@ actor RewindDatabase {
         }
 
         return try dbQueue.write { db -> Screenshot in
-            let record = screenshot
+            var record = screenshot
+            // The `imagePath` column is NOT NULL in the schema, but the model field is
+            // optional (nil for video-based screenshots). Coalesce nil → "" so a video
+            // screenshot never trips a NOT NULL constraint violation on insert.
+            if record.imagePath == nil { record.imagePath = "" }
             try record.insert(db)
             return record
         }
