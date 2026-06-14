@@ -219,7 +219,20 @@ fn translate_request(
         model: upstream_model.to_string(),
         max_tokens,
         messages: anthropic_messages,
-        system: system_prompt,
+        system: system_prompt.and_then(|text| {
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                None
+            } else {
+                Some(vec![AnthropicSystemContentBlock {
+                    block_type: "text".to_string(),
+                    text,
+                    cache_control: AnthropicCacheControl {
+                        cache_type: "ephemeral".to_string(),
+                    },
+                }])
+            }
+        }),
         temperature: req.temperature,
         stream: req.stream,
         tools: if is_tool_choice_none { None } else { anthropic_tools },
@@ -1175,7 +1188,16 @@ mod tests {
 
         let result = translate_request(&req, "claude-sonnet-4-6").unwrap();
         assert_eq!(result.model, "claude-sonnet-4-6");
-        assert_eq!(result.system, Some("You are helpful.".to_string()));
+        assert_eq!(
+            result.system,
+            Some(vec![AnthropicSystemContentBlock {
+                block_type: "text".to_string(),
+                text: "You are helpful.".to_string(),
+                cache_control: AnthropicCacheControl {
+                    cache_type: "ephemeral".to_string(),
+                },
+            }])
+        );
         assert_eq!(result.messages.len(), 1); // only user message, system extracted
         assert_eq!(result.messages[0].role, "user");
         assert_eq!(result.max_tokens, 1024);
@@ -1263,9 +1285,126 @@ mod tests {
         };
 
         let result = translate_request(&req, "claude-sonnet-4-6").unwrap();
-        assert_eq!(result.system, Some("You are terse.".to_string()));
-        assert_eq!(result.messages.len(), 1, "developer msg must be extracted, not forwarded");
+        assert_eq!(
+            result.system,
+            Some(vec![AnthropicSystemContentBlock {
+                block_type: "text".to_string(),
+                text: "You are terse.".to_string(),
+                cache_control: AnthropicCacheControl {
+                    cache_type: "ephemeral".to_string(),
+                },
+            }])
+        );
+        assert_eq!(
+            result.messages.len(),
+            1,
+            "developer msg must be extracted, not forwarded"
+        );
         assert_eq!(result.messages[0].role, "user");
+    }
+
+    #[test]
+    fn test_translate_request_system_prompt_uses_cache_control_blocks() {
+        let req = ChatCompletionRequest {
+            model: "omi-sonnet".to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(json!("You are helpful.")),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(json!("Hello")),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let result = translate_request(&req, "claude-sonnet-4-6").unwrap();
+        let json = serde_json::to_value(&result).unwrap();
+
+        assert_eq!(
+            json["system"],
+            json!([{
+                "type": "text",
+                "text": "You are helpful.",
+                "cache_control": {"type": "ephemeral"}
+            }])
+        );
+    }
+
+    #[test]
+    fn test_translate_request_without_system_prompt_omits_system() {
+        let req = ChatCompletionRequest {
+            model: "omi-sonnet".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(json!("Hello")),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let result = translate_request(&req, "claude-sonnet-4-6").unwrap();
+        let json = serde_json::to_value(&result).unwrap();
+
+        assert!(result.system.is_none());
+        assert!(json.get("system").is_none());
+    }
+
+    #[test]
+    fn test_translate_request_empty_system_prompt_omits_system() {
+        // Empty or whitespace-only system prompts must NOT be sent as cached blocks
+        // (Anthropic rejects empty cached text blocks with 400).
+        for content in [Some(json!("")), Some(json!("   ")), None] {
+            let req = ChatCompletionRequest {
+                model: "omi-sonnet".to_string(),
+                messages: vec![ChatMessage {
+                    role: "system".to_string(),
+                    content: content.clone(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                }, ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(json!("Hello")),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                stream: false,
+                temperature: None,
+                max_tokens: None,
+                max_completion_tokens: None,
+                tools: None,
+                tool_choice: None,
+            };
+
+            let result = translate_request(&req, "claude-sonnet-4-6").unwrap();
+            assert!(
+                result.system.is_none(),
+                "empty/whitespace system prompt must omit system field, got: {:?}",
+                result.system
+            );
+        }
     }
 
     #[test]

@@ -164,7 +164,7 @@ pub struct AnthropicRequest {
     pub max_tokens: u64,
     pub messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
+    pub system: Option<Vec<AnthropicSystemContentBlock>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     pub stream: bool,
@@ -178,6 +178,20 @@ pub struct AnthropicRequest {
 pub struct AnthropicMessage {
     pub role: String,
     pub content: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AnthropicSystemContentBlock {
+    #[serde(rename = "type")]
+    pub block_type: String,
+    pub text: String,
+    pub cache_control: AnthropicCacheControl,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AnthropicCacheControl {
+    #[serde(rename = "type")]
+    pub cache_type: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
