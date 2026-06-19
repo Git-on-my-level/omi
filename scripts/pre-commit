@@ -110,21 +110,40 @@ if [ -n "$STAGED_DESKTOP_RUST_INPUTS" ]; then
     exit 1
   fi
   if [ -n "$STAGED_DESKTOP_RUST_FILES" ]; then
-    while IFS= read -r file; do
+    printf '%s\n' "$STAGED_DESKTOP_RUST_FILES" | while IFS= read -r file; do
       [ -n "$file" ] || continue
-      if ! rustfmt --edition 2021 "$file"; then
+      if ! rustfmt --edition 2024 "$file"; then
         echo "rustfmt failed for $file" >&2
         exit 1
       fi
       git add "$file"
-    done <<EOF
-$STAGED_DESKTOP_RUST_FILES
-EOF
+    done
+    # Propagate exit code from subshell
+    [ $? -ne 0 ] && exit 1
   fi
   if ! (
     cd desktop/macos/Backend-Rust && \
       cargo check --locked
   ); then
+    exit 1
+  fi
+fi
+
+# Re-scan for conflict markers AFTER formatters have re-staged files
+# (formatters may have modified files, potentially introducing markers in edge cases)
+if [ -n "$STAGED_FILES" ]; then
+  conflict_found=0
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    if git grep --cached -n -I -E '^(<<<<<<<|>>>>>>>)' -- "$file"; then
+      conflict_found=1
+    fi
+  done <<EOF
+$STAGED_FILES
+EOF
+
+  if [ "$conflict_found" -eq 1 ]; then
+    echo "Unresolved merge conflict markers found in staged files (post-format check)" >&2
     exit 1
   fi
 fi
