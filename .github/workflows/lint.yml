@@ -141,7 +141,17 @@ jobs:
           FILES=$(grep -E '^desktop/macos/Backend-Rust/.*\.rs$' /tmp/changed-files.txt || true)
           if [ -n "$FILES" ]; then
             cd desktop/macos/Backend-Rust
-            cargo fmt --check
+            # Format in-place first, then check if anything changed.
+            # This avoids a chicken-and-egg problem where the PR that adds
+            # this guard triggers the check on a crate that isn't formatted yet.
+            BEFORE=$(git diff --stat 2>/dev/null | tail -1 || true)
+            cargo fmt --all 2>&1
+            AFTER=$(git diff --stat 2>/dev/null | tail -1 || true)
+            if [ "$BEFORE" != "$AFTER" ]; then
+              echo "::error::cargo fmt made changes — Rust files are not formatted. Run 'cargo fmt --all' locally and commit."
+              git diff --name-only
+              exit 1
+            fi
             cd -
           fi
           cd desktop/macos/Backend-Rust

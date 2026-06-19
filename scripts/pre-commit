@@ -121,11 +121,17 @@ if [ -n "$STAGED_DESKTOP_RUST_INPUTS" ]; then
     # Propagate exit code from subshell
     [ $? -ne 0 ] && exit 1
   fi
-  if ! (
+  # Run cargo check in subshell; exit code propagates through ( ).
+  # Do NOT use `if !` here — that would invert the failure and silently pass.
+  if (
     cd desktop/macos/Backend-Rust && \
       cargo check --locked
   ); then
-    exit 1
+    : # check passed
+  else
+    exit_code=$?
+    echo "cargo check failed (exit $exit_code)" >&2
+    exit "$exit_code"
   fi
 fi
 
