@@ -35,6 +35,7 @@ jobs:
           echo "has_personas=$(echo "$FILES" | grep -q '^web/personas-open-source/' && echo true || echo false)" >> $GITHUB_OUTPUT
           # Also run the Rust check when this workflow changes so CI PRs dogfood
           # the new guard instead of only validating YAML syntax.
+          # Include Cargo.toml/Cargo.lock so dependency changes also get checked.
           echo "has_desktop_rust=$(echo "$FILES" | grep -qE '^desktop/macos/Backend-Rust/|^\.github/workflows/lint\.yml$' && echo true || echo false)" >> $GITHUB_OUTPUT
 
       # -- Universal source hygiene --
@@ -69,7 +70,7 @@ jobs:
         run: |
           FILES=$(grep '\.dart$' /tmp/changed-files.txt | grep -v -e '\.gen\.dart$' -e '\.g\.dart$' || true)
           if [ -n "$FILES" ]; then
-            echo "$FILES" | xargs dart format --line-length 120 --set-exit-if-changed --output=none
+            grep '\.dart$' /tmp/changed-files.txt | grep -v -e '\.gen\.dart$' -e '\.g\.dart$' | tr '\n' '\0' | xargs -0 dart format --line-length 120 --set-exit-if-changed --output=none
           fi
 
       # -- Python --
@@ -139,7 +140,9 @@ jobs:
         run: |
           FILES=$(grep -E '^desktop/macos/Backend-Rust/.*\.rs$' /tmp/changed-files.txt || true)
           if [ -n "$FILES" ]; then
-            echo "$FILES" | xargs rustfmt --edition 2021 --check
+            cd desktop/macos/Backend-Rust
+            cargo fmt --check
+            cd -
           fi
           cd desktop/macos/Backend-Rust
           cargo check --locked
