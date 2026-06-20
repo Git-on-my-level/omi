@@ -136,8 +136,11 @@ if [ -n "$STAGED_DESKTOP_RUST_INPUTS" ]; then
 fi
 
 # Re-scan for conflict markers AFTER formatters have re-staged files
-# (formatters may have modified files, potentially introducing markers in edge cases)
-if [ -n "$STAGED_FILES" ]; then
+# (formatters run git add which can stage new/modified content).
+# Re-capture the staged file list — the original $STAGED_FILES was
+# captured before any formatter ran and may be stale now.
+STAGED_FILES_POST=$(git diff --cached --name-only --diff-filter=ACM)
+if [ -n "$STAGED_FILES_POST" ]; then
   conflict_found=0
   while IFS= read -r file; do
     [ -n "$file" ] || continue
@@ -145,7 +148,7 @@ if [ -n "$STAGED_FILES" ]; then
       conflict_found=1
     fi
   done <<EOF
-$STAGED_FILES
+$STAGED_FILES_POST
 EOF
 
   if [ "$conflict_found" -eq 1 ]; then
