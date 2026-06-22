@@ -318,6 +318,7 @@ enum APIError: LocalizedError {
   case unauthorized
   case httpError(statusCode: Int, detail: String? = nil)
   case decodingError(Error)
+  case unsupportedTierScopedBulkMutation(String)
 
   var detail: String? {
     if case .httpError(_, let detail) = self { return detail }
@@ -335,6 +336,8 @@ enum APIError: LocalizedError {
       return "HTTP error: \(statusCode)"
     case .decodingError(let error):
       return "Failed to decode response: \(error.localizedDescription)"
+    case .unsupportedTierScopedBulkMutation(let operation):
+      return "\(operation) is disabled until the backend supports tier-scoped memory bulk mutations."
     }
   }
 }
@@ -1156,12 +1159,98 @@ enum MemoryCategory: String, Codable, CaseIterable {
   }
 }
 
-struct ServerMemory: Codable, Identifiable {
+enum MemoryTier: String, Codable, CaseIterable, Identifiable {
+  case shortTerm = "short_term"
+  case longTerm = "long_term"
+  case archive
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.singleValueContainer()
+    let rawValue = try container.decode(String.self)
+    guard let tier = MemoryTier(rawValue: rawValue) else {
+      throw DecodingError.dataCorruptedError(
+        in: container,
+        debugDescription: "Unknown ServerMemory tier '\(rawValue)'"
+      )
+    }
+    self = tier
+  }
+
+  func encode(to encoder: Encoder) throws {
+    var container = encoder.singleValueContainer()
+    try container.encode(rawValue)
+  }
+
+  var id: String { rawValue }
+
+  var displayName: String {
+    switch self {
+    case .shortTerm: return "Short-term"
+    case .longTerm: return "Long-term"
+    case .archive: return "Archive"
+    }
+  }
+
+  var icon: String {
+    switch self {
+    case .shortTerm: return "clock"
+    case .longTerm: return "brain.head.profile"
+    case .archive: return "archivebox"
+    }
+  }
+
+  var isDefaultAccessible: Bool {
+    self == .shortTerm || self == .longTerm
+  }
+}
+
+struct MemoryTierScope: Equatable {
+  let tiers: [MemoryTier]
+  let requiresArchiveAcknowledgement: Bool
+
+  static let defaultAccess = MemoryTierScope(
+    tiers: [.shortTerm, .longTerm],
+    requiresArchiveAcknowledgement: false
+  )
+  static let archiveOnly = MemoryTierScope(
+    tiers: [.archive],
+    requiresArchiveAcknowledgement: true
+  )
+  static let allIncludingArchive = MemoryTierScope(
+    tiers: [.shortTerm, .longTerm, .archive],
+    requiresArchiveAcknowledgement: true
+  )
+
+  var includesArchive: Bool { tiers.contains(.archive) }
+  var sqlTierRawValues: [String] { tiers.map { $0.rawValue } }
+}
+
+private enum ServerMemoryAliasDecodeError {
+  static func conflict(
+    _ firstField: String,
+    _ firstValue: String,
+    _ secondField: String,
+    _ secondValue: String,
+    codingPath: [CodingKey]
+  ) -> DecodingError {
+    DecodingError.dataCorrupted(
+      DecodingError.Context(
+        codingPath: codingPath,
+        debugDescription: "Conflicting ServerMemory aliases: \(firstField)=\(firstValue) differs from \(secondField)=\(secondValue)"
+      )
+    )
+  }
+}
+
+struct ServerMemory: Decodable, Identifiable {
   let id: String
   let content: String
   let category: MemoryCategory
   let createdAt: Date
   let updatedAt: Date
+  let capturedAt: Date?
+  let expiresAt: Date?
+  let tier: MemoryTier
   let conversationId: String?
   let reviewed: Bool
   let userReview: Bool?
@@ -1190,9 +1279,13 @@ struct ServerMemory: Codable, Identifiable {
 
   enum CodingKeys: String, CodingKey {
     case id, content, category, reviewed, visibility, scoring, source, confidence, tags, reasoning,
-      headline
+      headline, tier
+    case memoryId = "memory_id"
+    case memoryTier = "memory_tier"
     case createdAt = "created_at"
     case updatedAt = "updated_at"
+    case capturedAt = "captured_at"
+    case expiresAt = "expires_at"
     case conversationId = "conversation_id"
     case userReview = "user_review"
     case manuallyAdded = "manually_added"
@@ -1207,11 +1300,47 @@ struct ServerMemory: Codable, Identifiable {
 
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
-    id = try container.decode(String.self, forKey: .id)
+    let idValue = try container.decodeIfPresent(String.self, forKey: .id)
+    let memoryIdValue = try container.decodeIfPresent(String.self, forKey: .memoryId)
+    switch (idValue, memoryIdValue) {
+    case let (.some(id), .some(memoryId)) where id != memoryId:
+      throw ServerMemoryAliasDecodeError.conflict(
+        "id", id, "memory_id", memoryId, codingPath: container.codingPath)
+    case let (.some(id), _):
+      self.id = id
+    case let (_, .some(memoryId)):
+      self.id = memoryId
+    case (.none, .none):
+      throw DecodingError.keyNotFound(
+        CodingKeys.id,
+        DecodingError.Context(
+          codingPath: container.codingPath,
+          debugDescription: "ServerMemory requires either id or memory_id"
+        )
+      )
+    }
+
     content = try container.decode(String.self, forKey: .content)
     category = try container.decodeIfPresent(MemoryCategory.self, forKey: .category) ?? .system
-    createdAt = try container.decode(Date.self, forKey: .createdAt)
-    updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+    capturedAt = try container.decodeIfPresent(Date.self, forKey: .capturedAt)
+    createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? capturedAt ?? Date()
+    updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
+    expiresAt = try container.decodeIfPresent(Date.self, forKey: .expiresAt)
+
+    let tierValue = try container.decodeIfPresent(MemoryTier.self, forKey: .tier)
+    let memoryTierValue = try container.decodeIfPresent(MemoryTier.self, forKey: .memoryTier)
+    switch (tierValue, memoryTierValue) {
+    case let (.some(tier), .some(memoryTier)) where tier != memoryTier:
+      throw ServerMemoryAliasDecodeError.conflict(
+        "tier", tier.rawValue, "memory_tier", memoryTier.rawValue, codingPath: container.codingPath)
+    case let (.some(tier), _):
+      self.tier = tier
+    case let (_, .some(memoryTier)):
+      self.tier = memoryTier
+    case (.none, .none):
+      // Legacy records before V17 tiering default to Long-term only when no tier alias is present.
+      self.tier = .longTerm
+    }
     conversationId = try container.decodeIfPresent(String.self, forKey: .conversationId)
     reviewed = try container.decodeIfPresent(Bool.self, forKey: .reviewed) ?? false
     userReview = try container.decodeIfPresent(Bool.self, forKey: .userReview)
@@ -1521,23 +1650,34 @@ extension APIClient {
     return try await patch("v3/memories/\(id)/read", body: body)
   }
 
-  /// Marks all memories as read
+  /// Marks memories as read for a tier scope. Disabled until backend exposes tier-scoped semantics.
+  func markAllMemoriesRead(scope: MemoryTierScope) async throws {
+    throw APIError.unsupportedTierScopedBulkMutation("markAllMemoriesRead")
+  }
+
+  @available(*, unavailable, message: "Use markAllMemoriesRead(scope:) once backend supports tier-scoped bulk mutation semantics.")
   func markAllMemoriesRead() async throws {
-    let _: MemoryStatusResponse = try await post("v3/memories/mark-all-read", body: EmptyBody())
+    throw APIError.unsupportedTierScopedBulkMutation("markAllMemoriesRead")
   }
 
-  /// Updates visibility of all memories
+  /// Updates visibility for a tier scope. Disabled until backend exposes tier-scoped semantics.
+  func updateAllMemoriesVisibility(scope: MemoryTierScope, visibility: String) async throws {
+    throw APIError.unsupportedTierScopedBulkMutation("updateAllMemoriesVisibility")
+  }
+
+  @available(*, unavailable, message: "Use updateAllMemoriesVisibility(scope:visibility:) once backend supports tier-scoped bulk mutation semantics.")
   func updateAllMemoriesVisibility(visibility: String) async throws {
-    struct VisibilityRequest: Encodable {
-      let value: String
-    }
-    let body = VisibilityRequest(value: visibility)
-    let _: MemoryStatusResponse = try await patch("v3/memories/visibility", body: body)
+    throw APIError.unsupportedTierScopedBulkMutation("updateAllMemoriesVisibility")
   }
 
-  /// Deletes all memories
+  /// Deletes memories for a tier scope. Disabled until backend exposes tier-scoped semantics.
+  func deleteAllMemories(scope: MemoryTierScope) async throws {
+    throw APIError.unsupportedTierScopedBulkMutation("deleteAllMemories")
+  }
+
+  @available(*, unavailable, message: "Use deleteAllMemories(scope:) once backend supports tier-scoped bulk mutation semantics.")
   func deleteAllMemories() async throws {
-    try await delete("v3/memories")
+    throw APIError.unsupportedTierScopedBulkMutation("deleteAllMemories")
   }
 
   // MARK: - PATCH helper

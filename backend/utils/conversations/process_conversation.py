@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from database import redis_db
 from database.auth import get_user_name
 import database.memories as memories_db
+import database.short_term_memories as short_term_db
 import database.conversations as conversations_db
 import database.notifications as notification_db
 import database.users as users_db
@@ -34,7 +35,7 @@ from database.apps import record_app_usage, get_omi_personas_by_uid_db, get_app_
 from database.vector_db import upsert_vector2, update_vector_metadata, upsert_transcript_chunk_vectors
 from utils.conversations.transcript_chunks import build_transcript_chunks
 from models.app import App, UsageHistoryType
-from models.memories import MemoryDB, Memory
+from models.memories import MemoryDB, Memory, ShortTermMemory, render_memory
 from models.calendar_context import CalendarMeetingContext
 from models.conversation import (
     AppResult,
@@ -44,6 +45,7 @@ from models.conversation import (
 )
 from models.conversation_enums import ConversationSource, ConversationStatus, ExternalIntegrationConversationSource
 from utils.conversations.factory import deserialize_conversation
+from utils.conversations.subjects import infer_subject_from_segments
 from utils.subscription import is_trial_paywalled
 from models.other import Person
 from models.structured import Structured
@@ -453,13 +455,13 @@ def _extract_memories(uid: str, conversation: Conversation):
 def _extract_memories_inner(uid: str, conversation: Conversation):
     # Delete old memories for this conversation (if reprocessing)
     # Also get the IDs to delete from Pinecone
-    existing_memory_ids = memories_db.get_memory_ids_for_conversation(uid, conversation.id)
-    for memory_id in existing_memory_ids:
+    deletion_result = memories_db.delete_memories_for_conversation(uid, conversation.id)
+    for memory_id in deletion_result.get('vector_delete_ids', []):
         delete_memory_vector(uid, memory_id)
-    memories_db.delete_memories_for_conversation(uid, conversation.id)
 
     language = users_db.get_user_language_preference(uid)
     new_memories: List[Memory] = []
+    short_term_memories_to_save: List[Memory] = []
 
     # Extract memories based on conversation source
     if conversation.source == ConversationSource.external_integration:
@@ -467,9 +469,17 @@ def _extract_memories_inner(uid: str, conversation: Conversation):
         if text_content and len(text_content) > 0:
             text_source = conversation.external_data.get('text_source', 'other')
             new_memories = extract_memories_from_text(uid, text_content, text_source, language=language)
+            short_term_memories_to_save = new_memories
     else:
         # For regular conversations with transcript segments
         new_memories = new_memories_extractor(uid, conversation.transcript_segments, language=language)
+        if _short_term_shadow_enabled():
+            short_term_memories_to_save = new_memories_extractor(
+                uid,
+                conversation.transcript_segments,
+                language=language,
+                high_recall=True,
+            )
 
     is_locked = conversation.is_locked
     parsed_memories = []
@@ -477,6 +487,25 @@ def _extract_memories_inner(uid: str, conversation: Conversation):
     invalidations = []
     # Cheap exact-duplicate guard within this batch (avoids redundant conflict LLM calls).
     seen_norm = set()
+    subject_entity_id, subject_attribution = infer_subject_from_segments(conversation.transcript_segments)
+    if _short_term_shadow_enabled():
+        short_term_db.save_short_term_memories(
+            uid,
+            [
+                ShortTermMemory.from_memory(
+                    memory,
+                    uid,
+                    source_id=conversation.id,
+                    source_type="conversation",
+                    source_signal="transcription",
+                    artifact_ref=_transcript_artifact_ref(conversation),
+                    extractor_id="new_memories_extractor",
+                    subject_entity_id=subject_entity_id,
+                    subject_attribution=subject_attribution,
+                ).model_dump()
+                for memory in short_term_memories_to_save
+            ],
+        )
 
     for memory in new_memories:
         norm = ' '.join((memory.content or '').lower().split())
@@ -487,13 +516,18 @@ def _extract_memories_inner(uid: str, conversation: Conversation):
         # Wider net (lower threshold, more candidates) than before so cross-phrasing
         # contradictions are caught — "loves ice cream" vs "hates ice cream",
         # "lives in NYC" vs "lives in LA" — then let the LLM decide what's outdated.
-        similar_matches = find_similar_memories(uid, memory.content, threshold=0.6, limit=8)
+        similar_matches = find_similar_memories(
+            uid, memory.content, threshold=0.6, limit=8, subject_entity_id=subject_entity_id
+        )
 
         # Only compare against currently-active memories (never resurface superseded ones).
         similar_memories = []
         for match in similar_matches:
             memory_data = memories_db.get_memory(uid, match['memory_id'])
             if memory_data and memory_data.get('invalid_at') is None:
+                existing_subject = memory_data.get('subject_entity_id')
+                if subject_entity_id and existing_subject and subject_entity_id != existing_subject:
+                    continue
                 similar_memories.append(
                     {
                         'memory_id': match['memory_id'],
@@ -510,15 +544,36 @@ def _extract_memories_inner(uid: str, conversation: Conversation):
             if resolution.action == 'skip':
                 continue
 
-            if resolution.action == 'merge' and resolution.merged_content:
-                memory.content = resolution.merged_content
+            if resolution.action == 'merge':
+                if resolution.merged_predicate:
+                    memory.predicate = resolution.merged_predicate
+                if resolution.merged_arguments:
+                    memory.arguments = resolution.merged_arguments
+                if resolution.merged_qualifiers:
+                    memory.qualifiers = {**memory.qualifiers, **resolution.merged_qualifiers}
+                if resolution.merged_content:
+                    memory.content = resolution.merged_content
+                elif resolution.merged_predicate or resolution.merged_arguments:
+                    memory.content = render_memory(memory)
 
             if resolution.action in ('update', 'merge'):
                 for idx in resolution.supersedes or []:
                     if isinstance(idx, int) and 1 <= idx <= len(similar_memories):
                         supersede_ids.append(similar_memories[idx - 1]['memory_id'])
 
-        memory_db_obj = MemoryDB.from_memory(memory, uid, conversation.id, False)
+        memory_db_obj = MemoryDB.from_memory(
+            memory,
+            uid,
+            conversation.id,
+            False,
+            source_id=conversation.id,
+            source_type="conversation",
+            source_signal="transcription",
+            artifact_ref=_transcript_artifact_ref(conversation),
+            extractor_id="new_memories_extractor",
+            subject_entity_id=subject_entity_id,
+            subject_attribution=subject_attribution,
+        )
         memory_db_obj.is_locked = is_locked
         parsed_memories.append(memory_db_obj)
 
@@ -536,7 +591,13 @@ def _extract_memories_inner(uid: str, conversation: Conversation):
     memories_db.save_memories(uid, [fact.dict() for fact in parsed_memories])
 
     for memory_db_obj in parsed_memories:
-        upsert_memory_vector(uid, memory_db_obj.id, memory_db_obj.content, memory_db_obj.category.value)
+        upsert_memory_vector(
+            uid,
+            memory_db_obj.id,
+            memory_db_obj.content,
+            memory_db_obj.category.value,
+            subject_entity_id=memory_db_obj.subject_entity_id,
+        )
 
     # Invalidate (not delete) superseded memories: keep them as history but drop them from
     # every retrieval path. Removing the vector also pulls them out of semantic search.
@@ -569,6 +630,21 @@ def _extract_memories_inner(uid: str, conversation: Conversation):
                     logging.exception(f"Error extracting knowledge graph from memory_id: {memory_db_obj.id}")
         except Exception:
             logging.exception("Error extracting knowledge graph from memory.")
+
+
+def _transcript_artifact_ref(conversation: Conversation) -> dict:
+    segments = conversation.transcript_segments or []
+    return {
+        "kind": "transcript_segments",
+        "conversation_id": conversation.id,
+        "segment_ids": [segment.id for segment in segments if segment.id],
+        "start": min((segment.start for segment in segments), default=None),
+        "end": max((segment.end for segment in segments), default=None),
+    }
+
+
+def _short_term_shadow_enabled() -> bool:
+    return os.getenv('OMI_MEMORY_SHORT_TERM_SHADOW_ENABLED', '').lower() in ('1', 'true', 'yes')
 
 
 def send_new_memories_notification(user_id: str, memories: [MemoryDB]):

@@ -14,6 +14,7 @@ import database.goals as goals_db
 import database.chat as chat_db
 import database.screen_activity as screen_activity_db
 import database.daily_summaries as daily_summaries_db
+from database._client import db
 
 # from database.redis_db import get_filter_category_items
 # from database.vector_db import query_vectors_by_metadata
@@ -25,16 +26,28 @@ from utils.conversations.render import populate_speaker_names, redact_conversati
 from utils.apps import update_personas_async
 from utils.llm.memories import identify_category_for_memory
 from utils.retrieval.hybrid import rrf_rerank
-from dependencies import get_uid_from_mcp_api_key, get_current_user_id
+from dependencies import get_uid_from_mcp_api_key, get_current_user_id, get_mcp_v17_default_memory_read_context
 from utils.other.endpoints import with_rate_limit
 from utils.log_sanitizer import sanitize_pii
+from utils.memory.v17_default_read_rollout import (
+    V17ReadDecision,
+    assert_legacy_memory_write_allowed_for_default_read_decision,
+    read_v17_write_convergence_gate,
+)
+from utils.memory.v17_product_authorization import (
+    V17ProductAuthorizationContext,
+    authorize_v17_external_default_memory_read,
+)
 from utils.mcp_data import clean_action_item, clean_chat_message, clean_person, clean_screen_activity_row
 from utils.mcp_memories import (
     collect_filtered_memories,
+    list_v17_default_mcp_memories,
     parse_mcp_bool,
     parse_mcp_datetime,
     parse_mcp_int,
     parse_optional_mcp_bool,
+    read_v17_mcp_default_memory_rollout,
+    search_v17_default_mcp_memories_vector,
 )
 import database.mcp_api_key as mcp_api_key_db
 from models.mcp_api_key import McpApiKey, McpApiKeyCreate, McpApiKeyCreated
@@ -67,12 +80,27 @@ def delete_key(key_id: str, uid: str = Depends(get_current_user_id)):
 
 @router.post("/v1/mcp/memories", tags=["mcp"], response_model=Memory)
 def create_memory(memory: Memory, uid: str = Depends(with_rate_limit(get_uid_from_mcp_api_key, "memories:create"))):
+    v17_rollout = read_v17_mcp_default_memory_rollout(uid=uid, db_client=db)
+    v17_write_guard = assert_legacy_memory_write_allowed_for_default_read_decision(
+        v17_rollout,
+        operation="mcp_memory_create",
+        write_convergence_policy=read_v17_write_convergence_gate(db_client=db),
+    )
+    if not v17_write_guard.allowed:
+        raise HTTPException(status_code=v17_write_guard.status_code, detail=v17_write_guard.detail)
+
     # Auto-categorize memories from external sources
     memory.category = identify_category_for_memory(memory.content)
     memory_db = MemoryDB.from_memory(memory, uid, None, True)
     memories_db.create_memory(uid, memory_db.model_dump())
     try:
-        upsert_memory_vector(uid, memory_db.id, memory_db.content, memory_db.category.value)
+        upsert_memory_vector(
+            uid,
+            memory_db.id,
+            memory_db.content,
+            memory_db.category.value,
+            subject_entity_id=memory_db.subject_entity_id,
+        )
     except Exception:
         logger.exception("Vector upsert failed uid=%s memory_id=%s (memory saved, vector missing)", uid, memory_db.id)
     postprocess_executor.submit(update_personas_async, uid)
@@ -90,6 +118,15 @@ def _validate_mcp_memory(uid: str, memory_id: str) -> dict:
 
 @router.delete("/v1/mcp/memories/{memory_id}", tags=["mcp"])
 def delete_memory(memory_id: str, uid: str = Depends(get_uid_from_mcp_api_key)):
+    v17_rollout = read_v17_mcp_default_memory_rollout(uid=uid, db_client=db)
+    v17_write_guard = assert_legacy_memory_write_allowed_for_default_read_decision(
+        v17_rollout,
+        operation="mcp_memory_delete",
+        write_convergence_policy=read_v17_write_convergence_gate(db_client=db),
+    )
+    if not v17_write_guard.allowed:
+        raise HTTPException(status_code=v17_write_guard.status_code, detail=v17_write_guard.detail)
+
     _validate_mcp_memory(uid, memory_id)
     memories_db.delete_memory(uid, memory_id)
     try:
@@ -101,10 +138,21 @@ def delete_memory(memory_id: str, uid: str = Depends(get_uid_from_mcp_api_key)):
 
 @router.patch("/v1/mcp/memories/{memory_id}", tags=["mcp"])
 def edit_memory(memory_id: str, value: str, uid: str = Depends(get_uid_from_mcp_api_key)):
+    v17_rollout = read_v17_mcp_default_memory_rollout(uid=uid, db_client=db)
+    v17_write_guard = assert_legacy_memory_write_allowed_for_default_read_decision(
+        v17_rollout,
+        operation="mcp_memory_edit",
+        write_convergence_policy=read_v17_write_convergence_gate(db_client=db),
+    )
+    if not v17_write_guard.allowed:
+        raise HTTPException(status_code=v17_write_guard.status_code, detail=v17_write_guard.detail)
+
     memory = _validate_mcp_memory(uid, memory_id)
     memories_db.edit_memory(uid, memory_id, value)
     try:
-        upsert_memory_vector(uid, memory_id, value, memory.get('category', 'other'))
+        upsert_memory_vector(
+            uid, memory_id, value, memory.get('category', 'other'), subject_entity_id=memory.get('subject_entity_id')
+        )
     except Exception:
         logger.exception("Vector upsert failed uid=%s memory_id=%s (memory edited, vector stale)", uid, memory_id)
     return {"status": "ok"}
@@ -132,6 +180,14 @@ class CleanerMemory(BaseModel):
     id: str
     content: str
     category: MemoryCategory
+    category_source: Optional[str] = None
+    reviewed: Optional[bool] = None
+    reviewed_source: Optional[str] = None
+    manually_added: Optional[bool] = None
+    manually_added_source: Optional[str] = None
+    v17_default_memory: Optional[bool] = None
+    archive_default_visible: Optional[bool] = None
+    policy: Optional[dict] = None
 
 
 class SearchedMemory(CleanerMemory):
@@ -142,10 +198,31 @@ class SearchedMemory(CleanerMemory):
 def search_memories(
     query: str,
     limit: int = 10,
-    uid: str = Depends(get_uid_from_mcp_api_key),
+    auth_context: V17ProductAuthorizationContext = Depends(get_mcp_v17_default_memory_read_context),
 ):
+    v17_app_key_grant = authorize_v17_external_default_memory_read(auth_context, db_client=db)
+    if not v17_app_key_grant.allowed:
+        raise HTTPException(
+            status_code=v17_app_key_grant.status_code,
+            detail=v17_app_key_grant.observability,
+        )
+
+    uid = auth_context.uid
     logger.info(f"search_memories {uid} query={sanitize_pii(query)} limit={limit}")
     limit = max(1, min(limit, 20))
+    v17_rollout = read_v17_mcp_default_memory_rollout(uid=uid, db_client=db)
+    v17_vector_results = search_v17_default_mcp_memories_vector(
+        uid=uid,
+        query=query,
+        limit=limit,
+        db_client=db,
+        rollout_decision=v17_rollout,
+    )
+    if v17_vector_results.read_decision == V17ReadDecision.USE_V17:
+        return v17_vector_results.memories
+    if v17_vector_results.read_decision != V17ReadDecision.USE_LEGACY_SAFE:
+        return []
+
     fetch_limit = min(limit * 3, 60)
     matches = vector_db.find_similar_memories(uid, query, threshold=0.0, limit=fetch_limit)
     if not matches:
@@ -224,6 +301,23 @@ def get_memories(
             category_list = [MemoryCategory(c.strip()) for c in categories.split(",") if c.strip()]
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"Invalid category {str(e)}")
+
+    v17_rollout = read_v17_mcp_default_memory_rollout(uid=uid, db_client=db)
+    v17_list_results = list_v17_default_mcp_memories(
+        uid=uid,
+        limit=limit,
+        offset=offset,
+        db_client=db,
+        rollout_decision=v17_rollout,
+        categories=[category.value for category in category_list],
+        reviewed=reviewed,
+        manually_added=manually_added,
+    )
+    if v17_list_results.read_decision == V17ReadDecision.USE_V17:
+        return v17_list_results.memories
+    if v17_list_results.read_decision != V17ReadDecision.USE_LEGACY_SAFE:
+        return []
+
     result = collect_filtered_memories(
         lambda batch_offset, batch_limit: memories_db.get_memories(
             uid, batch_limit, batch_offset, [c.value for c in category_list], sort=sort

@@ -11,7 +11,13 @@ from langchain_core.runnables import RunnableConfig
 
 import database.memories as memory_db
 import database.vector_db as vector_db
+from database._client import db as firestore_db
 from models.memories import MemoryDB
+from utils.memory.v17_chat_memory_adapter import (
+    list_v17_default_chat_memories_decision_text,
+    search_v17_default_chat_memories_vector_decision_text,
+)
+from utils.memory.v17_default_read_rollout import V17ReadDecision
 from utils.retrieval.hybrid import rrf_rerank
 import logging
 
@@ -149,6 +155,22 @@ def get_memories_tool(
         except ValueError as e:
             return f"Error: Invalid end_date format. Expected YYYY-MM-DDTHH:MM:SS+HH:MM in user's timezone: {end_date} - {str(e)}"
 
+    v17_default_memories = list_v17_default_chat_memories_decision_text(
+        uid=uid,
+        limit=limit,
+        offset=offset,
+        db_client=firestore_db,
+    )
+    if v17_default_memories.read_decision == V17ReadDecision.USE_V17:
+        logger.info("✅ get_memories_tool - using V17 default chat memory list results")
+        return v17_default_memories.text or "No V17 default memories found."
+    if v17_default_memories.read_decision != V17ReadDecision.USE_LEGACY_SAFE:
+        logger.info(
+            "🛑 get_memories_tool - V17 chat memory list denied without legacy fallback: "
+            f"{v17_default_memories.fallback_reason}"
+        )
+        return v17_default_memories.text or "No memories available for this request."
+
     # Get memories
     memories = []
     try:
@@ -262,6 +284,22 @@ def search_memories_tool(
 
     # Cap limit at 20
     limit = min(limit, 20)
+
+    v17_default_memories = search_v17_default_chat_memories_vector_decision_text(
+        uid=uid,
+        query=query,
+        limit=limit,
+        db_client=firestore_db,
+    )
+    if v17_default_memories.read_decision == V17ReadDecision.USE_V17:
+        logger.info("✅ search_memories_tool - using V17 default chat memory results")
+        return v17_default_memories.text or f"No V17 vector memories found matching '{query}'."
+    if v17_default_memories.read_decision != V17ReadDecision.USE_LEGACY_SAFE:
+        logger.info(
+            "🛑 search_memories_tool - V17 chat memory denied without legacy fallback: "
+            f"{v17_default_memories.fallback_reason}"
+        )
+        return v17_default_memories.text or "No memories available for this request."
 
     try:
         # Over-fetch then rerank: pull more vector candidates than we need so the

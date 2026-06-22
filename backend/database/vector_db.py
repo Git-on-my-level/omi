@@ -1,19 +1,29 @@
 import json
 import os
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import List
 
 from pinecone import Pinecone
 
+from database import projection_repair
+from database.v17_vector_metadata import (
+    build_v17_archive_memory_vector_filter,
+    build_v17_default_memory_vector_filter,
+    parse_v17_search_vector_hit,
+)
+from models.v17_memory_search_gateway import SearchMode, SearchVectorHit
 from utils.llm.clients import embeddings
 import logging
 
 logger = logging.getLogger(__name__)
 
-if os.getenv('PINECONE_API_KEY') is not None:
-    pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY', ''))
-    index = pc.Index(os.getenv('PINECONE_INDEX_NAME', ''))
+_pinecone_api_key = os.getenv('PINECONE_API_KEY')
+_pinecone_index_name = os.getenv('PINECONE_INDEX_NAME')
+if _pinecone_api_key and _pinecone_index_name:
+    pc = Pinecone(api_key=_pinecone_api_key)
+    index = pc.Index(_pinecone_index_name)
 else:
     index = None
 
@@ -155,7 +165,40 @@ def delete_vector(uid: str, conversation_id: str):
 MEMORIES_NAMESPACE = "ns2"
 
 
-def upsert_memory_vector(uid: str, memory_id: str, content: str, category: str):
+def build_legacy_memory_vector_filter(uid: str, subject_entity_id: str | None = None) -> dict:
+    """Return the legacy ns2 memory-search filter with an explicit V17 schema barrier.
+
+    Legacy memory vectors in ``ns2`` do not carry ``v17_schema_version``. V17
+    vectors intentionally do, so every legacy search path must exclude that
+    field before top-k is selected. This prevents V17 Short-term, Long-term,
+    Archive, stale-revision, or tombstoned candidates from occupying legacy
+    result slots or being hydrated as legacy memories.
+    """
+    filter_data = {
+        '$and': [
+            {'uid': {'$eq': uid}},
+            {'v17_schema_version': {'$exists': False}},
+        ]
+    }
+    if subject_entity_id:
+        filter_data['$and'].append({'subject_entity_id': {'$eq': subject_entity_id}})
+    return filter_data
+
+
+@dataclass(frozen=True)
+class V17VectorCandidateQueryResult:
+    hits: List[SearchVectorHit] = field(default_factory=list)
+    rejected_count: int = 0
+
+
+def upsert_memory_vector(
+    uid: str,
+    memory_id: str,
+    content: str,
+    category: str,
+    subject_entity_id: str | None = None,
+    projection_metadata: dict | None = None,
+):
     """
     Upsert a memory embedding to Pinecone.
     """
@@ -174,6 +217,14 @@ def upsert_memory_vector(uid: str, memory_id: str, content: str, category: str):
             "created_at": int(datetime.now(timezone.utc).timestamp()),
         },
     }
+    data["metadata"].update(
+        projection_metadata
+        or memory_projection_metadata(
+            {'id': memory_id, 'category': category, 'subject_entity_id': subject_entity_id, 'status': 'accepted'}
+        )
+    )
+    if subject_entity_id:
+        data["metadata"]["subject_entity_id"] = subject_entity_id
     res = index.upsert(vectors=[data], namespace=MEMORIES_NAMESPACE)
     logger.info(f'upsert_memory_vector {memory_id} {res}')
     return vector
@@ -199,25 +250,42 @@ def upsert_memory_vectors_batch(uid: str, items: List[dict]) -> int:
     vectors = embeddings.embed_documents(contents)
 
     now_ts = int(datetime.now(timezone.utc).timestamp())
-    payload = [
-        {
-            "id": f"{uid}-{item['memory_id']}",
-            "values": vectors[i],
-            "metadata": {
-                "uid": uid,
-                "memory_id": item['memory_id'],
-                "category": item['category'],
-                "created_at": now_ts,
-            },
+    payload = []
+    for i, item in enumerate(items):
+        metadata = {
+            "uid": uid,
+            "memory_id": item['memory_id'],
+            "category": item['category'],
+            "created_at": now_ts,
         }
-        for i, item in enumerate(items)
-    ]
+        metadata.update(
+            item.get('projection_metadata')
+            or memory_projection_metadata(
+                {
+                    'id': item['memory_id'],
+                    'category': item['category'],
+                    'subject_entity_id': item.get('subject_entity_id'),
+                    'status': item.get('status', 'accepted'),
+                }
+            )
+        )
+        if item.get('subject_entity_id'):
+            metadata['subject_entity_id'] = item['subject_entity_id']
+        payload.append(
+            {
+                "id": f"{uid}-{item['memory_id']}",
+                "values": vectors[i],
+                "metadata": metadata,
+            },
+        )
     res = index.upsert(vectors=payload, namespace=MEMORIES_NAMESPACE)
     logger.info(f'upsert_memory_vectors_batch count={len(payload)} {res}')
     return len(payload)
 
 
-def find_similar_memories(uid: str, content: str, threshold: float = 0.85, limit: int = 5) -> List[dict]:
+def find_similar_memories(
+    uid: str, content: str, threshold: float = 0.85, limit: int = 5, subject_entity_id: str | None = None
+) -> List[dict]:
     """
     Find memories similar to the given content.
     Returns list of matches with similarity scores.
@@ -228,7 +296,7 @@ def find_similar_memories(uid: str, content: str, threshold: float = 0.85, limit
         return []
 
     vector = embeddings.embed_query(content)
-    filter_data = {'uid': uid}
+    filter_data = build_legacy_memory_vector_filter(uid, subject_entity_id=subject_entity_id)
 
     xc = index.query(
         vector=vector, top_k=limit, include_metadata=True, filter=filter_data, namespace=MEMORIES_NAMESPACE
@@ -270,13 +338,52 @@ def search_memories_by_vector(uid: str, query: str, limit: int = 10) -> List[str
         return []
 
     vector = embeddings.embed_query(query)
-    filter_data = {'uid': uid}
+    filter_data = build_legacy_memory_vector_filter(uid)
 
     xc = index.query(
         vector=vector, top_k=limit, include_metadata=True, filter=filter_data, namespace=MEMORIES_NAMESPACE
     )
 
     return [match['metadata'].get('memory_id') for match in xc.get('matches', [])]
+
+
+def query_v17_memory_vector_candidates(
+    uid: str, query: str, *, mode: SearchMode = SearchMode.default, limit: int = 10
+) -> V17VectorCandidateQueryResult:
+    """Query existing ns2 for V17 candidates using strict tier-safe metadata filters.
+
+    The returned hits are vector candidates only. Product callers must still
+    hydrate authoritative ``memory_items`` and run the V17 search gateway before
+    returning any memory to a user or integration.
+    """
+    if index is None:
+        logger.warning('Pinecone index not initialized, skipping V17 memory vector candidate search')
+        return V17VectorCandidateQueryResult()
+
+    vector = embeddings.embed_query(query)
+    filter_data = (
+        build_v17_archive_memory_vector_filter(uid)
+        if mode == SearchMode.archive_explicit
+        else build_v17_default_memory_vector_filter(uid)
+    )
+    response = index.query(
+        vector=vector,
+        top_k=limit,
+        include_metadata=True,
+        include_values=False,
+        filter=filter_data,
+        namespace=MEMORIES_NAMESPACE,
+    )
+
+    hits: List[SearchVectorHit] = []
+    rejected_count = 0
+    for match in response.get('matches', []):
+        parsed = parse_v17_search_vector_hit(match)
+        if parsed.hit is None:
+            rejected_count += 1
+            continue
+        hits.append(parsed.hit)
+    return V17VectorCandidateQueryResult(hits=hits, rejected_count=rejected_count)
 
 
 def delete_memory_vector(uid: str, memory_id: str):
@@ -290,6 +397,51 @@ def delete_memory_vector(uid: str, memory_id: str):
     vector_id = f'{uid}-{memory_id}'
     result = index.delete(ids=[vector_id], namespace=MEMORIES_NAMESPACE)
     logger.info(f'delete_memory_vector {vector_id} {result}')
+
+
+def enqueue_projection_repair(uid: str, fact_id: str, reason: str, source_commit_id: str | None = None):
+    return projection_repair.enqueue_projection_repairs(
+        uid,
+        {
+            'commit_id': source_commit_id or 'manual',
+            'mutations': [{'type': reason, 'fact_id': fact_id}],
+        },
+    )
+
+
+def memory_projection_metadata(memory: dict, source_commit_id: str | None = None) -> dict:
+    return projection_repair.projection_metadata_for_fact(memory, source_commit_id=source_commit_id)
+
+
+def repair_memory_projection(uid: str, memory: dict | None) -> str:
+    if not memory or projection_repair.projection_action_for_fact(memory) == 'delete':
+        memory_id = (memory or {}).get('id')
+        if memory_id:
+            delete_memory_vector(uid, memory_id)
+        return 'delete'
+
+    upsert_memory_vector(
+        uid,
+        memory['id'],
+        memory.get('content', ''),
+        memory.get('category', 'system'),
+        subject_entity_id=memory.get('subject_entity_id'),
+        projection_metadata=memory_projection_metadata(memory),
+    )
+    return projection_repair.projection_action_for_fact(memory)
+
+
+def reconcile_projections(uid: str, facts: List[dict], vector_fact_ids: List[str]) -> dict:
+    return projection_repair.reconcile_memory_projection(uid, facts, vector_fact_ids)
+
+
+def process_projection_repair_queue(uid: str, fact_loader, limit: int = 100) -> dict:
+    return projection_repair.process_projection_repairs(
+        uid,
+        fact_loader=fact_loader,
+        repair_func=repair_memory_projection,
+        limit=limit,
+    )
 
 
 # ==========================================

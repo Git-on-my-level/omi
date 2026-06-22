@@ -122,20 +122,16 @@ actor RewindDatabase {
     /// Falls back to the static currentUserId (set synchronously at app start) when
     /// configure() hasn't been called yet (e.g., TierManager triggers init early).
     private func userBaseDirectory() -> URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let userId = configuredUserId ?? RewindDatabase.currentUserId ?? "anonymous"
-        return appSupport
-            .appendingPathComponent("Omi", isDirectory: true)
+        return DesktopLocalProfile.applicationSupportURL()
             .appendingPathComponent("users", isDirectory: true)
             .appendingPathComponent(userId, isDirectory: true)
     }
 
     /// Static version of userBaseDirectory for nonisolated markCleanShutdown
     private static func staticUserBaseDirectory() -> URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let userId = currentUserId ?? "anonymous"
-        return appSupport
-            .appendingPathComponent("Omi", isDirectory: true)
+        return DesktopLocalProfile.applicationSupportURL()
             .appendingPathComponent("users", isDirectory: true)
             .appendingPathComponent(userId, isDirectory: true)
     }
@@ -2127,6 +2123,13 @@ actor RewindDatabase {
             }
         }
 
+        migrator.registerMigration("addMemoryTier") { db in
+            try db.alter(table: "memories") { t in
+                t.add(column: "tier", .text).notNull().defaults(to: "long_term")
+            }
+            try db.create(index: "idx_memories_tier", on: "memories", columns: ["tier"])
+        }
+
         migrator.registerMigration("createLocalKnowledgeGraph") { db in
             try db.create(table: "local_kg_nodes") { t in
                 t.autoIncrementedPrimaryKey("id")
@@ -2154,6 +2157,20 @@ actor RewindDatabase {
             try db.alter(table: "transcription_segments") { t in
                 t.add(column: "translationsJson", .text)
             }
+        }
+
+        migrator.registerMigration("createDroppedArtifacts") { db in
+            try db.create(table: "dropped_artifacts") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("reason", .text).notNull()
+                t.column("sourceType", .text).notNull()
+                t.column("appName", .text)
+                t.column("windowTitle", .text)
+                t.column("categoriesJson", .text).notNull()
+                t.column("timestamp", .datetime).notNull()
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "idx_dropped_artifacts_timestamp", on: "dropped_artifacts", columns: ["timestamp"])
         }
 
         try migrator.migrate(queue)
@@ -2348,6 +2365,33 @@ actor RewindDatabase {
             try db.execute(
                 sql: "UPDATE screenshots SET ocrText = ?, ocrDataJson = ?, isIndexed = 1, skippedForBattery = 0 WHERE id = ?",
                 arguments: [ocrResult.fullText, ocrDataJson, id]
+            )
+        }
+    }
+
+    func insertDroppedArtifact(
+        reason: String,
+        sourceType: String,
+        appName: String?,
+        windowTitle: String?,
+        categories: [String],
+        timestamp: Date
+    ) throws {
+        guard let dbQueue = dbQueue else {
+            throw RewindError.databaseNotInitialized
+        }
+
+        let data = try JSONEncoder().encode(categories)
+        let categoriesJson = String(data: data, encoding: .utf8) ?? "[]"
+        let createdAt = Date()
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO dropped_artifacts
+                    (reason, sourceType, appName, windowTitle, categoriesJson, timestamp, createdAt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                arguments: [reason, sourceType, appName, windowTitle, categoriesJson, timestamp, createdAt]
             )
         }
     }
