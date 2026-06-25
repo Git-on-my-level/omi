@@ -1,29 +1,25 @@
 name: Promote Desktop Backend to Prod
 
-# Keeps the prod desktop (Rust) backend in sync with whatever desktop release is
-# on the STABLE channel — automatically. You change ONE thing (flip a release's
-# `channel:` field to `stable`, which already promotes the app via the appcast),
-# and this reconciler deploys the matching backend to prod. No tags to manage.
+# Promotes the prod desktop (Rust) backend only when a macOS GitHub release is
+# explicitly marked stable. Do not add schedule/push triggers here: prod backend
+# deploys must be coupled to a stable release tag, never to "latest main" or a
+# periodic reconciler.
 #
-# Why a reconciler instead of a `release: edited` trigger: GitHub does not
-# reliably emit Actions runs for release edits (verified). A scheduled
-# reconcile is the robust way to make "flip the channel" auto-promote the
-# backend. `workflow_dispatch` runs it immediately (no waiting for the cron).
-#
-# Safety: roll-FORWARD only. It deploys the newest `channel: stable` release iff
-# that commit is newer than what's already on prod (tracked by the
-# `desktop-backend-prod-deployed` git tag) — so it never downgrades prod. Use
-# the `force` input (with an optional `tag`) to deploy/rollback to a specific
-# release deliberately.
+# Release events deploy only if the edited/published release:
+#   1. has a tag matching v*-macos, and
+#   2. has an exact metadata line: channel: stable
+# Manual dispatch is a retry/rollback escape hatch, but it still verifies the
+# selected release is marked stable before deploying. force=true bypasses only
+# the roll-forward guard.
 
 on:
-  schedule:
-    - cron: '*/15 * * * *'
+  release:
+    types: [published, edited]
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Override tag to deploy (default: newest channel:stable release)'
-        required: false
+        description: 'Stable v*-macos release tag to deploy'
+        required: true
       force:
         description: 'Deploy even if not newer than current prod (allows rollback)'
         type: boolean
@@ -33,7 +29,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: desktop-backend-reconcile
+  group: desktop-backend-promote-prod
   cancel-in-progress: false
 
 env:
@@ -59,25 +55,62 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PATH: ${{ github.event_path }}
           OVERRIDE_TAG: ${{ github.event.inputs.tag }}
           FORCE: ${{ github.event.inputs.force }}
         run: |
           set -euo pipefail
 
-          # 1) TARGET: explicit override, else newest v*-macos release on channel: stable
-          TARGET_TAG="${OVERRIDE_TAG:-}"
-          if [ -z "$TARGET_TAG" ]; then
-            for tag in $(gh release list --repo "$REPO" --limit 30 --json tagName -q '.[].tagName' | grep -- '-macos'); do
-              body=$(gh release view "$tag" --repo "$REPO" --json body -q .body)
-              if printf '%s\n' "$body" | grep -qiE '^[[:space:]]*channel:[[:space:]]*stable[[:space:]]*$'; then
-                TARGET_TAG="$tag"
-                break
-              fi
-            done
+          is_stable_release_body() {
+            grep -qiE '^[[:space:]]*channel:[[:space:]]*stable[[:space:]]*$'
+          }
+
+          TARGET_TAG=""
+          RELEASE_BODY=""
+          if [ "$EVENT_NAME" = "release" ]; then
+            # A release edit/publish is the only automatic prod trigger. The
+            # release itself is the target; never scan old releases from cron.
+            TARGET_TAG=$(python3 - <<'PY'
+          import json
+          import os
+
+          with open(os.environ["EVENT_PATH"]) as f:
+              event = json.load(f)
+          print(event.get("release", {}).get("tag_name", ""))
+          PY
+          )
+            RELEASE_BODY=$(python3 - <<'PY'
+          import json
+          import os
+
+          with open(os.environ["EVENT_PATH"]) as f:
+              event = json.load(f)
+          print(event.get("release", {}).get("body") or "")
+          PY
+          )
+          else
+            TARGET_TAG="${OVERRIDE_TAG:-}"
+            if [ -z "$TARGET_TAG" ]; then
+              echo "Manual prod promotion requires a stable v*-macos release tag."
+              echo "deploy=false" >> "$GITHUB_OUTPUT"
+              echo "reason=Manual prod promotion requires a stable v*-macos release tag." >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            RELEASE_BODY=$(gh release view "$TARGET_TAG" --repo "$REPO" --json body -q .body)
           fi
-          if [ -z "$TARGET_TAG" ]; then
-            echo "No channel:stable desktop release found; nothing to do."
+
+          if ! printf '%s\n' "$TARGET_TAG" | grep -qE '^v.+-macos$'; then
+            echo "Release tag '$TARGET_TAG' is not a macOS desktop release; nothing to do."
             echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Release tag '$TARGET_TAG' is not a macOS desktop release." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! printf '%s\n' "$RELEASE_BODY" | is_stable_release_body; then
+            echo "Release $TARGET_TAG is not marked channel: stable; nothing to do."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Release $TARGET_TAG is not marked channel: stable." >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -100,6 +133,7 @@ jobs:
           echo "deploy=$DEPLOY" >> "$GITHUB_OUTPUT"
           echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
           echo "target_tag=$TARGET_TAG" >> "$GITHUB_OUTPUT"
+          echo "reason=Decision - deploy=$DEPLOY for stable release $TARGET_TAG" >> "$GITHUB_OUTPUT"
           echo "Decision - deploy=$DEPLOY for $TARGET_TAG" >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
@@ -170,11 +204,26 @@ jobs:
             DESKTOP_LEGACY_ANTHROPIC_KEY=DESKTOP_LEGACY_ANTHROPIC_KEY:latest
             GOOGLE_CALENDAR_API_KEY=DESKTOP_GOOGLE_CALENDAR_API_KEY:latest
 
+      - name: Generate Omi Bot token for prod-tracking tag
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.OMI_BOT_APP_ID }}
+          private-key: ${{ secrets.OMI_BOT_PRIVATE_KEY }}
+
       - name: Advance prod-tracking tag
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_SHA: ${{ needs.check.outputs.target_sha }}
         run: |
           set -euo pipefail
-          git tag -f "$TRACK_TAG" "${{ needs.check.outputs.target_sha }}"
-          git push -f origin "$TRACK_TAG"
+          python3 - <<'PY' > /tmp/update-desktop-backend-prod-ref.json
+          import json
+          import os
+
+          print(json.dumps({"sha": os.environ["TARGET_SHA"], "force": True}))
+          PY
+          if ! gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TRACK_TAG}" --input /tmp/update-desktop-backend-prod-ref.json >/dev/null; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${TRACK_TAG}" -f sha="${TARGET_SHA}" >/dev/null
+          fi
           echo "Promoted desktop-backend to PROD - ${{ needs.check.outputs.target_tag }} (${{ needs.check.outputs.target_sha }})" >> "$GITHUB_STEP_SUMMARY"
