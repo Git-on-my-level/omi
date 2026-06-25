@@ -1,20 +1,27 @@
 name: Promote Desktop Backend to Prod
 
 # Promotes the prod desktop (Rust) backend only when a macOS GitHub release is
-# explicitly marked stable. Do not add schedule/push triggers here: prod backend
-# deploys must be coupled to a stable release tag, never to "latest main" or a
-# periodic reconciler.
+# explicitly marked stable. Prod deploys must always be coupled to a stable
+# release tag, never to "latest main". Do not add push/pull_request triggers.
 #
-# Release events deploy only if the edited/published release:
+# Triggers:
+#   release (published, edited) — primary path: deploys immediately when a
+#     release is published or its channel is flipped to stable.
+#   schedule (every 15 min) — safety-net reconciler: GitHub does not reliably
+#     emit Actions runs for release edits, so the schedule catches any missed
+#     edit and deploys the newest channel:stable release (roll-forward only).
+#   workflow_dispatch — manual retry/rollback; requires an explicit stable tag.
+#
+# All paths deploy only if the target release:
 #   1. has a tag matching v*-macos, and
 #   2. has an exact metadata line: channel: stable
-# Manual dispatch is a retry/rollback escape hatch, but it still verifies the
-# selected release is marked stable before deploying. force=true bypasses only
-# the roll-forward guard.
+# force=true bypasses only the roll-forward guard, not the stable check.
 
 on:
   release:
     types: [published, edited]
+  schedule:
+    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       tag:
@@ -69,8 +76,7 @@ jobs:
           TARGET_TAG=""
           RELEASE_BODY=""
           if [ "$EVENT_NAME" = "release" ]; then
-            # A release edit/publish is the only automatic prod trigger. The
-            # release itself is the target; never scan old releases from cron.
+            # The release itself is the target (published or channel-flipped).
             TARGET_TAG=$(python3 - <<'PY'
           import json
           import os
@@ -89,6 +95,24 @@ jobs:
           print(event.get("release", {}).get("body") or "")
           PY
           )
+          elif [ "$EVENT_NAME" = "schedule" ]; then
+            # Safety-net reconciler: GitHub does not reliably emit Actions runs
+            # for release edits. Scan for the newest channel:stable release and
+            # deploy it (roll-forward guard below prevents downgrades).
+            for tag in $(gh release list --repo "$REPO" --limit 30 --json tagName -q '.[].tagName' | grep -- '-macos'); do
+              body=$(gh release view "$tag" --repo "$REPO" --json body -q .body)
+              if printf '%s\n' "$body" | is_stable_release_body; then
+                TARGET_TAG="$tag"
+                break
+              fi
+            done
+            if [ -z "$TARGET_TAG" ]; then
+              echo "No channel:stable desktop release found; nothing to do."
+              echo "deploy=false" >> "$GITHUB_OUTPUT"
+              echo "reason=No channel:stable desktop release found." >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            RELEASE_BODY=$(gh release view "$TARGET_TAG" --repo "$REPO" --json body -q .body)
           else
             TARGET_TAG="${OVERRIDE_TAG:-}"
             if [ -z "$TARGET_TAG" ]; then
