@@ -132,7 +132,9 @@ final class DesktopDiagnosticsManager {
   }
 
   func recordRealtimeProviderClose(provider: String, category: String?, aliveFor: TimeInterval, activeTurn: Bool) {
-    let event: DesktopHealthEventName = category == RealtimeHubCloseCategory.providerPolicyCloseFast.rawValue
+    let closeCategory = category.flatMap { RealtimeHubCloseCategory(rawValue: $0) }
+    guard RealtimeHubCloseClassifier.shouldReportToSentry(closeCategory) else { return }
+    let event: DesktopHealthEventName = closeCategory == .providerPolicyCloseFast
       ? .realtimeProviderPolicyClose
       : .realtimeProviderSessionError
     record(
