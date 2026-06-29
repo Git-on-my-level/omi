@@ -108,6 +108,14 @@ struct OMIApp: App {
         .overlay(alignment: .bottomTrailing) { WhatsNewToastOverlay() }
         .onAppear {
           log("OmiApp: Main window content appeared (mode: \(Self.launchMode.rawValue))")
+          if CodexAuthService.isActive {
+            Task {
+              await CodexProxyService.shared.ensureRunning()
+              if let fingerprint = CodexAuthService.enrollmentFingerprintIfActive() {
+                try? await APIClient.shared.activateChatGPT(fingerprint: fingerprint)
+              }
+            }
+          }
         }
     }
     .windowStyle(.titleBar)
