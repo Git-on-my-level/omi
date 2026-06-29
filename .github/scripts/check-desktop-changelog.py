@@ -27,10 +27,6 @@ def changed_files(base_ref: str, head_ref: str) -> list[str]:
     return [line for line in output.splitlines() if line]
 
 
-def added_files(base_ref: str, head_ref: str) -> list[str]:
-    output = run_git(["diff", "--name-status", "--diff-filter=A", f"{base_ref}...{head_ref}"])
-    return [line.split("\t", 1)[1] for line in output.splitlines() if line.startswith("A\t")]
-
 
 def is_desktop_change_requiring_changelog(path: str) -> bool:
     if not path.startswith(DESKTOP_PREFIX):
@@ -64,12 +60,17 @@ def validate_unreleased_fragment(head_ref: str, path: str) -> None:
     raise SystemExit(f"FAIL: {path} must contain a non-empty 'change' string or 'changes' list")
 
 
-def has_new_unreleased_fragment(base_ref: str, head_ref: str) -> bool:
-    fragment_paths = [
+def unreleased_fragment_paths(base_ref: str, head_ref: str) -> list[str]:
+    output = run_git(["diff", "--name-only", "--diff-filter=ACM", f"{base_ref}...{head_ref}"])
+    return [
         path
-        for path in added_files(base_ref, head_ref)
+        for path in output.splitlines()
         if path.startswith(UNRELEASED_CHANGELOG_PREFIX) and path.endswith(".json")
     ]
+
+
+def has_new_unreleased_fragment(base_ref: str, head_ref: str) -> bool:
+    fragment_paths = unreleased_fragment_paths(base_ref, head_ref)
     for path in fragment_paths:
         validate_unreleased_fragment(head_ref, path)
     return bool(fragment_paths)

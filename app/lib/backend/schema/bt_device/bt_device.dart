@@ -184,7 +184,7 @@ int mapCodecToBitDepth(BleAudioCodec codec) {
   }
 }
 
-enum DeviceType { omi, openglass, appleWatch, plaud, bee, fieldy, friendPendant, limitless }
+enum DeviceType { omi, openglass, appleWatch, plaud, bee, fieldy, friendPendant, limitless, frame }
 
 // Legacy index order (before Frame was removed) — keep for backward-compatible deserialization.
 const List<String> _legacyDeviceTypeNames = [
@@ -206,6 +206,7 @@ DeviceType _deviceTypeFromJson(dynamic raw) {
   } else if (raw is String) {
     name = raw;
   }
+  if (name == 'frame') return DeviceType.frame;
   return DeviceType.values.firstWhere((e) => e.name == name, orElse: () => DeviceType.omi);
 }
 
@@ -351,6 +352,8 @@ class BtDevice {
       return await _getDeviceInfoFromOmi(conn);
     } else if (type == DeviceType.appleWatch) {
       return await _getDeviceInfoFromAppleWatch(conn as AppleWatchDeviceConnection);
+    } else if (type == DeviceType.frame) {
+      return this;
     } else {
       return await _getDeviceInfoFromOmi(conn);
     }
@@ -594,6 +597,7 @@ class BtDevice {
         return isBeeFirmwareUnsupported ? 'Firmware Not Supported' : 'Compatibility Note';
       case DeviceType.omi:
       case DeviceType.openglass:
+      case DeviceType.frame:
       case DeviceType.appleWatch:
         return ''; // No warning needed
     }
@@ -631,6 +635,7 @@ class BtDevice {
 
       case DeviceType.omi:
       case DeviceType.openglass:
+      case DeviceType.frame:
       case DeviceType.appleWatch:
         return ''; // No warning needed
     }

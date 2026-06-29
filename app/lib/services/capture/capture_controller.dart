@@ -300,6 +300,8 @@ class CaptureController extends ChangeNotifier
         return 'apple_watch';
       case DeviceType.limitless:
         return 'limitless';
+      case DeviceType.frame:
+        return null;
     }
   }
 
@@ -1090,6 +1092,7 @@ class CaptureController extends ChangeNotifier
       case DeviceType.fieldy:
       case DeviceType.limitless:
       case DeviceType.plaud:
+      case DeviceType.frame:
         return null;
     }
   }

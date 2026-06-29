@@ -141,6 +141,8 @@ class DeviceConnectionFactory {
         return FriendPendantDeviceConnection(device, transport);
       case DeviceType.limitless:
         return LimitlessDeviceConnection(device, transport);
+      case DeviceType.frame:
+        return null;
     }
   }
 }
