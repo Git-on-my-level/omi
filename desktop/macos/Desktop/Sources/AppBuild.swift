@@ -2,6 +2,7 @@ import Foundation
 
 enum AppBuild {
   static let productionBundleIdentifier = "com.omi.computer-macos"
+  static let desktopDevBundleIdentifier = "com.omi.desktop-dev"
   private static let updateChannelDefaultsKey = "update_channel"
   private static let betaOverwriteMigrationKey = "didMigrateBetaOverwrite_v1"
   private static let desktopAppcastURL = URL(
@@ -17,6 +18,14 @@ enum AppBuild {
 
   static var isProductionBundle: Bool {
     bundleIdentifier == productionBundleIdentifier
+  }
+
+  static var isNamedDevelopmentBundle: Bool {
+    isNonProduction && bundleIdentifier != desktopDevBundleIdentifier
+  }
+
+  static var usesLazyDevPermissions: Bool {
+    isNamedDevelopmentBundle && UserDefaults.standard.bool(forKey: "devLazyPermissionsEnabled")
   }
 
   static var displayName: String {
@@ -65,6 +74,10 @@ enum AppBuild {
   static var currentUpdateChannel: String {
     let raw = UserDefaults.standard.string(forKey: updateChannelDefaultsKey) ?? "stable"
     return raw == "staging" ? "beta" : raw
+  }
+
+  static var manualDownloadURL: URL {
+    URL(string: "https://api.omi.me/v2/desktop/download/latest?channel=\(currentUpdateChannel)")!
   }
 
   static var inferredUpdateChannel: String {

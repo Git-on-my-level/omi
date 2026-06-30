@@ -7,13 +7,22 @@ import os
 import contextvars
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 
 import database.users as users_db
+import database.notifications as notification_db
+from models.calendar_mutation import (
+    CalendarMutationResult,
+    event_title as calendar_event_title,
+    format_deleted_calendar_events,
+)
+from utils.executors import db_executor, run_blocking
 from utils.http_client import get_auth_client
+from utils.executors import db_executor, run_blocking
 from utils.retrieval.tools.integration_base import (
     ensure_capped,
     parse_iso_with_tz,
@@ -23,10 +32,49 @@ from utils.retrieval.tools.google_utils import google_api_request, GoogleAPIErro
 
 # Import shared Google utilities
 from utils.retrieval.tools.google_utils import refresh_google_token
+
+
+def _resolve_display_tz(tz):
+    """Return ``(tzinfo, label)`` for rendering event times in the user's timezone,
+    falling back to UTC on a missing or invalid zone (issue #4643)."""
+    if tz:
+        try:
+            return ZoneInfo(tz), tz
+        except Exception:
+            pass
+    return timezone.utc, "UTC"
+
+
+def _format_event_dt(dt: datetime, display_tz, tz_label: str) -> str:
+    """Render a calendar event datetime in the user's timezone with a label.
+
+    Google event times are tz-aware; a naive value is treated as UTC so the chat
+    model never sees an unlabeled wall-clock time and mislabels the time of day.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return f"{dt.astimezone(display_tz).strftime('%Y-%m-%d %H:%M:%S')} {tz_label}"
+
+
+async def _get_user_display_tz(uid: str):
+    """Return ``(tzinfo, label)`` for the user's timezone, read off the event loop.
+
+    A timezone lookup failure must never abort the calendar tool, so fall back to
+    UTC and let the events still render (issue #4643).
+    """
+    try:
+        tz = await run_blocking(db_executor, notification_db.get_user_time_zone, uid)
+    except Exception as tz_error:
+        logger.warning(f"get_calendar_events_tool - timezone lookup failed, formatting in UTC: {tz_error}")
+        tz = None
+    return _resolve_display_tz(tz)
+
+
 from utils.log_sanitizer import sanitize, sanitize_pii
 import logging
 
 logger = logging.getLogger(__name__)
+
 
 # Import the context variable from agentic module
 try:
@@ -129,7 +177,8 @@ async def search_google_contacts(access_token: str, query: str) -> Optional[str]
 
                 if email_addresses:
                     email = email_addresses[0].get('value')
-                    name = person.get('names', [{}])[0].get('displayName', query)
+                    names = person.get('names') or [{}]
+                    name = names[0].get('displayName', query)
                     logger.info(f"✅ Found contact in Other Contacts: {sanitize_pii(name)} -> {sanitize_pii(email)}")
                     return email
                 else:
@@ -477,7 +526,9 @@ async def get_calendar_events_tool(
     Returns:
         Formatted list of calendar events with their details.
     """
-    uid, integration, access_token, access_err = prepare_access(
+    uid, integration, access_token, access_err = await run_blocking(
+        db_executor,
+        prepare_access,
         config,
         'google_calendar',
         'Google Calendar',
@@ -680,6 +731,9 @@ async def get_calendar_events_tool(
             return f"No calendar events found{date_info}."
 
         # Format events
+        # Render event times in the user's timezone so the chat model labels the time
+        # of day correctly (issue #4643). The tz read is sync Firestore, so offload it.
+        display_tz, tz_label = await _get_user_display_tz(uid)
         result = f"Calendar Events ({len(events)} found):\n\n"
 
         for i, event in enumerate(events, 1):
@@ -691,7 +745,7 @@ async def get_calendar_events_tool(
             if 'dateTime' in start:
                 try:
                     start_dt = datetime.fromisoformat(start['dateTime'].replace('Z', '+00:00'))
-                    result += f"   Start: {start_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+                    result += f"   Start: {_format_event_dt(start_dt, display_tz, tz_label)}\n"
                 except:
                     result += f"   Start: {start.get('dateTime', 'Unknown')}\n"
             elif 'date' in start:
@@ -702,7 +756,7 @@ async def get_calendar_events_tool(
             if 'dateTime' in end:
                 try:
                     end_dt = datetime.fromisoformat(end['dateTime'].replace('Z', '+00:00'))
-                    result += f"   End: {end_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+                    result += f"   End: {_format_event_dt(end_dt, display_tz, tz_label)}\n"
                 except:
                     result += f"   End: {end.get('dateTime', 'Unknown')}\n"
             elif 'date' in end:
@@ -774,7 +828,9 @@ async def create_calendar_event_tool(
         f"start_time: {start_time}, end_time: {end_time}, location: {location}"
     )
 
-    uid, integration, access_token, access_err = prepare_access(
+    uid, integration, access_token, access_err = await run_blocking(
+        db_executor,
+        prepare_access,
         config,
         'google_calendar',
         'Google Calendar',
@@ -1071,9 +1127,8 @@ async def delete_calendar_event_tool(
 
             logger.info(f"📅 Found {len(matching_events)} matching event(s) to delete")
 
-            # Delete all matching events
-            deleted_count = 0
-            failed_deletions = []
+            # Delete all matching events, keeping success and failure attribution separate.
+            mutation_result = CalendarMutationResult()
 
             for event in matching_events:
                 event_id = event.get('id')
@@ -1085,39 +1140,13 @@ async def delete_calendar_event_tool(
 
                 try:
                     await delete_google_calendar_event(access_token, event_id)
-                    deleted_count += 1
+                    mutation_result.succeeded.append(event)
                 except Exception as e:
                     error_msg = str(e)
                     logger.error(f"❌ Failed to delete {event_title_found}: {error_msg}")
-                    failed_deletions.append((event_title_found, error_msg))
+                    mutation_result.failed.append((event_title_found, error_msg))
 
-            # Build result message
-            if deleted_count > 0:
-                result = f"✅ Successfully deleted {deleted_count} calendar event(s):\n"
-                for event in matching_events[:deleted_count]:
-                    summary = event.get('summary', 'Untitled')
-                    start = event.get('start', {})
-                    if 'dateTime' in start:
-                        try:
-                            start_dt = datetime.fromisoformat(start['dateTime'].replace('Z', '+00:00'))
-                            result += f"   - {summary} ({start_dt.strftime('%Y-%m-%d %H:%M')})\n"
-                        except:
-                            result += f"   - {summary}\n"
-                    else:
-                        result += f"   - {summary}\n"
-
-                if failed_deletions:
-                    result += f"\n⚠️ Failed to delete {len(failed_deletions)} event(s):\n"
-                    for title, error in failed_deletions:
-                        result += f"   - {title}: {error}\n"
-
-                return result.strip()
-            else:
-                if failed_deletions:
-                    error_msgs = '; '.join([f"{title}: {error}" for title, error in failed_deletions])
-                    return f"Error: Failed to delete events: {error_msgs}"
-                else:
-                    return "No events were deleted."
+            return format_deleted_calendar_events(mutation_result)
 
         except GoogleAPIError as e:
             logger.error(f"❌ Google API error searching events to delete: status={e.status_code}, msg={e.message}")
@@ -1151,20 +1180,18 @@ async def delete_calendar_event_tool(
                         if not matching_events:
                             return f"No calendar events found matching '{event_title}'{date_info_retry}."
 
-                        deleted_count = 0
+                        mutation_result = CalendarMutationResult()
                         for event in matching_events:
                             event_id = event.get('id')
+                            event_title_found = calendar_event_title(event)
                             if event_id:
                                 try:
                                     await delete_google_calendar_event(new_token, event_id)
-                                    deleted_count += 1
-                                except Exception:
-                                    pass
+                                    mutation_result.succeeded.append(event)
+                                except Exception as delete_error:
+                                    mutation_result.failed.append((event_title_found, str(delete_error)))
 
-                        if deleted_count > 0:
-                            return f"✅ Successfully deleted {deleted_count} calendar event(s)"
-                        else:
-                            return "No events were deleted."
+                        return format_deleted_calendar_events(mutation_result)
                     except Exception as retry_error:
                         return f"Error deleting calendar events: {retry_error}"
                 else:

@@ -5,10 +5,12 @@ import os
 import queue
 import threading
 import time
+import wave as _wave
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
+import soundfile as sf
 import torch
 
 try:
@@ -28,6 +30,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 _MAX_GPU_QUEUE = 512
+
+_VALID_ATTN_MODES = ("full", "local", "auto")
+
+
+class AudioDurationExceededError(Exception):
+    pass
 
 
 class WorkType(Enum):
@@ -61,10 +69,31 @@ class GPUWorker:
         self._ready = threading.Event()
         self._load_error: Optional[Exception] = None
         self._running = False
+        self._submit_lock = threading.Lock()
+        self._attn_mode = os.getenv("PARAKEET_ATTENTION_MODE", "full").lower()
+        if self._attn_mode not in _VALID_ATTN_MODES:
+            raise ValueError(f"PARAKEET_ATTENTION_MODE must be one of {_VALID_ATTN_MODES}, got '{self._attn_mode}'")
+        self._attn_auto_threshold_sec = float(os.getenv("PARAKEET_AUTO_ATTN_THRESHOLD", "300"))
+        ctx_raw = os.getenv("PARAKEET_LOCAL_ATTN_CONTEXT", "128,128")
+        self._attn_local_context = [int(x.strip()) for x in ctx_raw.split(",")]
+        self._attn_is_local = False
+        self._model_dtype = None
+        self._max_file_duration_sec = float(os.getenv("PARAKEET_MAX_FILE_DURATION", "0"))
+        self._vram_total_mb = 0.0
+        self._vram_baseline_mb = 0.0
 
     @property
     def is_ready(self) -> bool:
         return self._ready.is_set() and self._load_error is None
+
+    @property
+    def vram_info(self) -> dict:
+        return {
+            "total_mb": self._vram_total_mb,
+            "baseline_mb": self._vram_baseline_mb,
+            "attention_mode": self._attn_mode,
+            "auto_threshold_sec": self._attn_auto_threshold_sec,
+        }
 
     def start(self) -> None:
         self._running = True
@@ -78,14 +107,15 @@ class GPUWorker:
             raise self._load_error
 
     def stop(self) -> None:
-        if not self._running:
-            return
+        with self._submit_lock:
+            if not self._running:
+                return
+            self._running = False
         evt = threading.Event()
         try:
             self._queue.put(WorkItem(WorkType.SHUTDOWN, None, sync_event=evt), timeout=5)
         except queue.Full:
             pass
-        self._running = False
         if self._thread:
             self._thread.join(timeout=30)
 
@@ -94,23 +124,31 @@ class GPUWorker:
             fut = loop.create_future()
             fut.set_exception(RuntimeError("GPU worker not ready"))
             return fut, None
-        fut = loop.create_future()
-        item = WorkItem(WorkType.BATCH_TRANSCRIBE, payload, future=fut, loop=loop)
-        try:
-            self._queue.put_nowait(item)
-        except queue.Full:
-            fut.set_exception(RuntimeError("GPU queue full"))
-        return fut, item
+        with self._submit_lock:
+            if not self._running:
+                fut = loop.create_future()
+                fut.set_exception(RuntimeError("GPU worker shutting down"))
+                return fut, None
+            fut = loop.create_future()
+            item = WorkItem(WorkType.BATCH_TRANSCRIBE, payload, future=fut, loop=loop)
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:
+                fut.set_exception(RuntimeError("GPU queue full"))
+            return fut, item
 
     def submit_sync(self, payload: dict, timeout: float = 120.0) -> list:
         if not self.is_ready:
             raise RuntimeError("GPU worker not ready")
-        evt = threading.Event()
-        item = WorkItem(WorkType.BATCH_TRANSCRIBE, payload, sync_event=evt)
-        try:
-            self._queue.put(item, timeout=5)
-        except queue.Full:
-            raise RuntimeError("GPU queue full")
+        with self._submit_lock:
+            if not self._running:
+                raise RuntimeError("GPU worker shutting down")
+            evt = threading.Event()
+            item = WorkItem(WorkType.BATCH_TRANSCRIBE, payload, sync_event=evt)
+            try:
+                self._queue.put(item, timeout=5)
+            except queue.Full:
+                raise RuntimeError("GPU queue full")
         if not evt.wait(timeout=timeout):
             raise TimeoutError("GPU transcription timed out")
         if item.sync_error is not None:
@@ -120,12 +158,15 @@ class GPUWorker:
     def submit_embedding_sync(self, payload: dict, timeout: float = 30.0):
         if not self.is_ready:
             raise RuntimeError("GPU worker not ready")
-        evt = threading.Event()
-        item = WorkItem(WorkType.EMBEDDING, payload, sync_event=evt)
-        try:
-            self._queue.put(item, timeout=5)
-        except queue.Full:
-            raise RuntimeError("GPU queue full")
+        with self._submit_lock:
+            if not self._running:
+                raise RuntimeError("GPU worker shutting down")
+            evt = threading.Event()
+            item = WorkItem(WorkType.EMBEDDING, payload, sync_event=evt)
+            try:
+                self._queue.put(item, timeout=5)
+            except queue.Full:
+                raise RuntimeError("GPU queue full")
         if not evt.wait(timeout=timeout):
             raise TimeoutError("GPU embedding timed out")
         if item.sync_error is not None:
@@ -212,6 +253,7 @@ class GPUWorker:
         if use_bf16:
             logger.info(f"Converting {model_name} to BF16 (halves GPU memory)")
             model = model.to(torch.bfloat16)
+            self._model_dtype = torch.bfloat16
         model.eval()
 
         if disable_cuda_graphs:
@@ -219,18 +261,45 @@ class GPUWorker:
                 disabled = model.decoding.decoding.disable_cuda_graphs()
                 logger.info(f"CUDA graph decoding disabled (was active: {disabled})")
 
-        if do_compile:
+        if self._attn_mode == "local":
+            model.change_attention_model("rel_pos_local_attn", self._attn_local_context)
+            model.change_subsampling_conv_chunking_factor(1)
+            if self._model_dtype is not None:
+                model.to(self._model_dtype)
+            self._attn_is_local = True
+            logger.info(f"Attention mode: local (context={self._attn_local_context}) — linear VRAM scaling")
+        elif self._attn_mode == "auto":
+            logger.info(
+                f"Attention mode: auto — full for <{self._attn_auto_threshold_sec}s, "
+                f"local for >={self._attn_auto_threshold_sec}s (torch.compile disabled for auto mode)"
+            )
+        else:
+            logger.info("Attention mode: full (default)")
+
+        if self._max_file_duration_sec > 0:
+            logger.info(f"Max file duration guard: {self._max_file_duration_sec}s")
+
+        if do_compile and self._attn_mode != "auto":
             logger.info("Compiling batch model with torch.compile")
             model = torch.compile(model)
+        elif do_compile and self._attn_mode == "auto":
+            logger.info("Skipping torch.compile — incompatible with auto attention switching")
 
         self._model = model
         torch.cuda.empty_cache()
 
         self._load_embedding_model()
 
-        vram_used = torch.cuda.memory_allocated() / 1024**2
-        vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**2
-        logger.info(f"VRAM after model load: {vram_used:.0f}MiB / {vram_total:.0f}MiB")
+        if torch.cuda.is_available():
+            device = os.getenv("PARAKEET_DEVICE", "cuda:0")
+            dev_idx = int(device.split(":")[-1]) if ":" in device else 0
+            free_bytes, total_bytes = torch.cuda.mem_get_info(dev_idx)
+            self._vram_total_mb = total_bytes / (1024 * 1024)
+            self._vram_baseline_mb = (total_bytes - free_bytes) / (1024 * 1024)
+            logger.info(
+                f"VRAM after model load: {self._vram_baseline_mb:.0f}MiB used / "
+                f"{self._vram_total_mb:.0f}MiB total ({free_bytes / (1024 * 1024):.0f}MiB free)"
+            )
         logger.info("Batch model loaded and ready")
 
     def _load_embedding_model(self) -> None:
@@ -268,11 +337,61 @@ class GPUWorker:
         sample_rate = payload["sample_rate"]
         return self._embedding_model({"waveform": waveform, "sample_rate": sample_rate})
 
+    def _get_audio_duration_sec(self, path: str) -> float:
+        try:
+            info = sf.info(path)
+            return info.duration
+        except Exception:
+            pass
+        try:
+            with _wave.open(path) as wf:
+                return wf.getnframes() / wf.getframerate()
+        except Exception as exc:
+            logger.warning(f"Cannot determine audio duration for {path}: {exc}")
+            if self._max_file_duration_sec > 0:
+                return float('inf')
+            return 0.0
+
+    def _switch_attention(self, to_local: bool) -> None:
+        if to_local == self._attn_is_local:
+            return
+        if to_local:
+            self._model.change_attention_model("rel_pos_local_attn", self._attn_local_context)
+            self._model.change_subsampling_conv_chunking_factor(1)
+            self._attn_is_local = True
+        else:
+            self._model.change_attention_model("rel_pos")
+            self._attn_is_local = False
+        if self._model_dtype is not None:
+            self._model.to(self._model_dtype)
+
     @torch.inference_mode()
     def _batch_transcribe(self, payload: dict) -> list:
         audio_paths = payload["audio_paths"]
         timestamps = payload.get("timestamps", True)
         batch_size = payload.get("batch_size", len(audio_paths))
+
+        if self._max_file_duration_sec > 0:
+            for path in audio_paths:
+                dur = self._get_audio_duration_sec(path)
+                if dur > self._max_file_duration_sec:
+                    raise AudioDurationExceededError(
+                        f"Audio file {dur:.0f}s exceeds max duration "
+                        f"({self._max_file_duration_sec:.0f}s). Use shorter files or "
+                        f"set PARAKEET_ATTENTION_MODE=local/auto for longer audio."
+                    )
+
+        if self._attn_mode == "auto":
+            durations_from_batcher = payload.get("durations")
+            if durations_from_batcher:
+                max_dur = max(durations_from_batcher)
+            else:
+                max_dur = max((self._get_audio_duration_sec(p) for p in audio_paths), default=0.0)
+            need_local = max_dur >= self._attn_auto_threshold_sec
+            if need_local != self._attn_is_local:
+                mode_name = "local" if need_local else "full"
+                logger.info(f"Auto-switching attention to {mode_name} (longest file: {max_dur:.0f}s)")
+                self._switch_attention(need_local)
 
         results = self._model.transcribe(
             audio_paths,

@@ -49,6 +49,8 @@ export class FakeRuntimeAdapter implements RuntimeAdapter {
   failNextExecutionAsStale = false;
   deferOnlyPromptIncludes: string | undefined;
   nextArtifacts: AdapterArtifactReference[] | undefined;
+  /** When set, FakeRuntimeAdapter reports this as the adapter-effective MCP set. */
+  effectiveMcpServersOverride: Record<string, unknown>[] | null = null;
   pendingResult:
     | {
         promise: Promise<AdapterAttemptResult>;
@@ -113,7 +115,7 @@ export class FakeRuntimeAdapter implements RuntimeAdapter {
     sink({
       type: "text_delta",
       text: `delta-${context.attemptId}`,
-      sessionId: context.binding.adapterNativeSessionId,
+      adapterSessionId: context.binding.adapterNativeSessionId,
     });
     if (this.failNextExecutionAsStale) {
       this.failNextExecutionAsStale = false;
@@ -135,7 +137,6 @@ export class FakeRuntimeAdapter implements RuntimeAdapter {
     this.nextArtifacts = undefined;
     return {
       text: `done-${context.attemptId}`,
-      sessionId: context.binding.adapterNativeSessionId,
       adapterSessionId: context.binding.adapterNativeSessionId,
       terminalStatus: "succeeded",
       inputTokens: 1,
@@ -153,6 +154,10 @@ export class FakeRuntimeAdapter implements RuntimeAdapter {
     };
   }
 
+  effectiveMcpServers(_mcpServers: Record<string, unknown>[]): Record<string, unknown>[] {
+    return this.effectiveMcpServersOverride ?? _mcpServers;
+  }
+
   deferResult(): void {
     this.pendingResult = {} as typeof this.pendingResult;
     this.pendingResult!.promise = new Promise<AdapterAttemptResult>((resolve) => {
@@ -166,7 +171,6 @@ export class FakeRuntimeAdapter implements RuntimeAdapter {
     }
     this.pendingResult.resolve({
       text: result.text ?? "cancelled text",
-      sessionId: result.sessionId ?? "native-cancelled",
       adapterSessionId: result.adapterSessionId ?? "native-cancelled",
       terminalStatus: result.terminalStatus ?? "cancelled",
       ...result,

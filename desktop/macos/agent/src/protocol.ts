@@ -47,10 +47,19 @@ export interface ToolResultMessage {
   type: "tool_result";
   callId: string;
   result: string;
+  requestId?: string;
+  clientId?: string;
+  protocolVersion?: ProtocolVersion;
 }
 
 export interface ControlToolRequestMessage extends ProtocolEnvelope {
   type: "control_tool";
+  name: string;
+  input: Record<string, unknown>;
+}
+
+export interface DirectControlToolRequestMessage extends ProtocolEnvelope {
+  type: "direct_control_tool";
   name: string;
   input: Record<string, unknown>;
 }
@@ -76,7 +85,7 @@ export interface AuthenticateMessage {
 
 export interface WarmupSessionConfig {
   key: string;
-  model: string;
+  model?: string;
   systemPrompt?: string;
 }
 
@@ -100,6 +109,7 @@ export type InboundMessage =
   | QueryMessage
   | ToolResultMessage
   | ControlToolRequestMessage
+  | DirectControlToolRequestMessage
   | StopMessage
   | InterruptMessage
   | InvalidateSessionMessage
@@ -142,6 +152,7 @@ export interface ResultMessage extends QueryScopedOutbound {
   text: string;
   sessionId: string;
   terminalStatus?: "succeeded" | "failed" | "cancelled";
+  failure?: RuntimeFailurePayload;
   costUsd?: number;
   inputTokens?: number;
   outputTokens?: number;
@@ -149,10 +160,20 @@ export interface ResultMessage extends QueryScopedOutbound {
   cacheWriteTokens?: number;
 }
 
+export interface RuntimeFailurePayload {
+  code: string;
+  userMessage: string;
+  technicalMessage?: string;
+  source?: string;
+  adapterId?: string;
+  provider?: string;
+  retryable?: boolean;
+}
+
 export interface ToolActivityMessage extends QueryScopedOutbound {
   type: "tool_activity";
   name: string;
-  status: "started" | "completed";
+  status: "started" | "completed" | "failed";
   toolUseId?: string;
   input?: Record<string, unknown>;
 }
@@ -172,6 +193,7 @@ export interface ThinkingDeltaMessage extends QueryScopedOutbound {
 export interface ErrorMessage extends QueryScopedOutbound {
   type: "error";
   message: string;
+  failure?: RuntimeFailurePayload;
 }
 
 /** Sent when ACP requires user authentication (OAuth) */

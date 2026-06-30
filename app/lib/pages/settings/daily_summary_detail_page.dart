@@ -147,6 +147,7 @@ class _DailySummaryDetailPageState extends State<DailySummaryDetailPage> with Si
     } catch (e) {
       if (!mounted) return;
       Navigator.pop(context); // Dismiss loading
+      AppSnackbar.showSnackbarError(context.l10n.somethingWentWrong);
     }
   }
 
@@ -368,7 +369,7 @@ class _DailySummaryDetailPageState extends State<DailySummaryDetailPage> with Si
       leading: IconButton(
         icon: Container(
           padding: const EdgeInsets.all(8),
-          decoration: BoxDecoration(color: Colors.black.withOpacity(0.3), shape: BoxShape.circle),
+          decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.3), shape: BoxShape.circle),
           child: const Icon(Icons.arrow_back, color: Colors.white, size: 20),
         ),
         onPressed: () => Navigator.pop(context),
@@ -388,14 +389,15 @@ class _DailySummaryDetailPageState extends State<DailySummaryDetailPage> with Si
                       width: 16,
                       height: 16,
                       child: CircularProgressIndicator(
-                          strokeWidth: 2, valueColor: AlwaysStoppedAnimation<Color>(Colors.white)),
+                        strokeWidth: 2,
+                        valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                      ),
                     )
                   : const Icon(Icons.share_outlined, color: Colors.white, size: 20),
             ),
           ),
         ),
         IconButton(
-          tooltip: context.l10n.deleteRecap,
           icon: Container(
             padding: const EdgeInsets.all(8),
             decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.3), shape: BoxShape.circle),
@@ -435,7 +437,11 @@ class _DailySummaryDetailPageState extends State<DailySummaryDetailPage> with Si
                   // Date above emoji and title
                   Text(
                     summary.formattedDate,
-                    style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 13, fontWeight: FontWeight.w500),
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.6),
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
                   const SizedBox(height: 8),
                   // Emoji and title row
@@ -511,15 +517,6 @@ class _DailySummaryDetailPageState extends State<DailySummaryDetailPage> with Si
     return parts.first.trim();
   }
 
-  // Get truly unique location count (by short name)
-  int _getUniqueLocationCount(List<LocationPin> locations) {
-    final uniqueNames = <String>{};
-    for (final loc in locations) {
-      uniqueNames.add(_getShortLocationName(loc.address));
-    }
-    return uniqueNames.length;
-  }
-
   // Parse time string to minutes for comparison (e.g., "14:42" -> 882)
   int _parseTimeToMinutes(String? timeStr) {
     if (timeStr == null || timeStr.isEmpty) return 0;
@@ -564,7 +561,6 @@ class _DailySummaryDetailPageState extends State<DailySummaryDetailPage> with Si
         // New location (different from previous)
         current = _TimelineLocation(
           shortName: shortName,
-          fullAddress: loc.address,
           latitude: loc.latitude,
           longitude: loc.longitude,
           startTime: loc.time,
@@ -758,7 +754,7 @@ class _DailySummaryDetailPageState extends State<DailySummaryDetailPage> with Si
               height: 22,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color: item.completed ? Colors.green.withOpacity(0.2) : Colors.transparent,
+                color: item.completed ? Colors.green.withValues(alpha: 0.2) : Colors.transparent,
                 border: Border.all(color: item.completed ? Colors.green : Colors.grey.shade600, width: 1.5),
               ),
               child: item.completed ? const Icon(Icons.check, color: Colors.green, size: 14) : null,
@@ -780,17 +776,6 @@ class _DailySummaryDetailPageState extends State<DailySummaryDetailPage> with Si
         ),
       ),
     );
-  }
-
-  Color _getPriorityColor(String priority) {
-    switch (priority.toLowerCase()) {
-      case 'high':
-        return const Color(0xFFFF6B6B);
-      case 'medium':
-        return const Color(0xFFFFB347);
-      default:
-        return const Color(0xFF6BCB77);
-    }
   }
 
   Widget _buildUnresolvedQuestionsSection(DailySummary summary) {
@@ -908,7 +893,7 @@ class _DailySummaryDetailPageState extends State<DailySummaryDetailPage> with Si
                   Container(
                     width: 2,
                     height: 12,
-                    color: isFirst ? Colors.transparent : Colors.deepPurple.withOpacity(0.4),
+                    color: isFirst ? Colors.transparent : Colors.deepPurple.withValues(alpha: 0.4),
                   ),
                   // Dot
                   Container(
@@ -918,12 +903,17 @@ class _DailySummaryDetailPageState extends State<DailySummaryDetailPage> with Si
                       color: Colors.deepPurple,
                       shape: BoxShape.circle,
                       border: Border.all(color: const Color(0xFF0A0A0A), width: 2),
-                      boxShadow: [BoxShadow(color: Colors.deepPurple.withOpacity(0.4), blurRadius: 6, spreadRadius: 1)],
+                      boxShadow: [
+                        BoxShadow(color: Colors.deepPurple.withValues(alpha: 0.4), blurRadius: 6, spreadRadius: 1),
+                      ],
                     ),
                   ),
                   // Bottom line (hidden for last item)
                   Expanded(
-                    child: Container(width: 2, color: isLast ? Colors.transparent : Colors.deepPurple.withOpacity(0.4)),
+                    child: Container(
+                      width: 2,
+                      color: isLast ? Colors.transparent : Colors.deepPurple.withValues(alpha: 0.4),
+                    ),
                   ),
                 ],
               ),
@@ -989,15 +979,9 @@ Future<bool?> showDeleteRecapConfirmDialog(BuildContext context) {
       context: context,
       builder: (dialogCtx) => CupertinoAlertDialog(
         title: Text(l10n.deleteRecapConfirmTitle),
-        content: Padding(
-          padding: const EdgeInsets.only(top: 8),
-          child: Text(l10n.deleteRecapConfirmBody),
-        ),
+        content: Padding(padding: const EdgeInsets.only(top: 8), child: Text(l10n.deleteRecapConfirmBody)),
         actions: [
-          CupertinoDialogAction(
-            onPressed: () => Navigator.pop(dialogCtx, false),
-            child: Text(l10n.cancel),
-          ),
+          CupertinoDialogAction(onPressed: () => Navigator.pop(dialogCtx, false), child: Text(l10n.cancel)),
           CupertinoDialogAction(
             isDestructiveAction: true,
             onPressed: () => Navigator.pop(dialogCtx, true),
@@ -1013,10 +997,7 @@ Future<bool?> showDeleteRecapConfirmDialog(BuildContext context) {
       title: Text(l10n.deleteRecapConfirmTitle),
       content: Text(l10n.deleteRecapConfirmBody),
       actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(dialogCtx, false),
-          child: Text(l10n.cancel),
-        ),
+        TextButton(onPressed: () => Navigator.pop(dialogCtx, false), child: Text(l10n.cancel)),
         TextButton(
           onPressed: () => Navigator.pop(dialogCtx, true),
           style: TextButton.styleFrom(foregroundColor: const Color(0xFFFF6B6B)),
@@ -1030,7 +1011,6 @@ Future<bool?> showDeleteRecapConfirmDialog(BuildContext context) {
 // Helper class for timeline locations
 class _TimelineLocation {
   final String shortName;
-  final String? fullAddress;
   final double latitude;
   final double longitude;
   final String? startTime;
@@ -1038,7 +1018,6 @@ class _TimelineLocation {
 
   _TimelineLocation({
     required this.shortName,
-    this.fullAddress,
     required this.latitude,
     required this.longitude,
     this.startTime,

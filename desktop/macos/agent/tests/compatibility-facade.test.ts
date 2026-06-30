@@ -9,6 +9,7 @@ import {
   selectAdapterScopedToolCallCorrelation,
   selectUnscopedToolCallCorrelation,
 } from "../src/runtime/compatibility-facade.js";
+import { AdapterRuntimeError } from "../src/runtime/failures.js";
 import { AgentRuntimeKernel } from "../src/runtime/kernel.js";
 import { SqliteAgentStore } from "../src/runtime/sqlite-store.js";
 import { baseRunInput, createKernelHarness, FakeRuntimeAdapter, waitUntil } from "./kernel-fakes.js";
@@ -22,6 +23,111 @@ afterEach(() => {
 });
 
 describe("JsonlCompatibilityFacade", () => {
+  it("rejects protocol v2 queries that only provide legacy id", async () => {
+    const { store, kernel } = createKernelHarness(newDatabasePath());
+    const facade = new JsonlCompatibilityFacade({
+      kernel,
+      send: () => {},
+      defaultAdapterId: "fake",
+      defaultCwd: () => "/tmp/default",
+    });
+
+    await expect(
+      facade.handleQuery({
+        ...v1Query({ id: "legacy-id-only", prompt: "missing v2 request id" }),
+        protocolVersion: 2,
+        requestId: undefined,
+        clientId: "client-v2",
+      }),
+    ).rejects.toThrow("protocol v2 query requires requestId");
+    store.close();
+  });
+
+  it("emits structured runtime failures with the legacy error message", async () => {
+    const { store, adapter, kernel } = createKernelHarness(newDatabasePath());
+    const sent: OutboundMessage[] = [];
+    adapter.failNextExecutionError = new AdapterRuntimeError({
+      code: "adapter_process_exited",
+      source: "adapter_process",
+      adapterId: "openclaw",
+      provider: "openai",
+      retryable: true,
+      userMessage: "OpenClaw failed: OpenAI API error: upstream unavailable",
+      technicalMessage: "OpenAI API error: upstream unavailable",
+    });
+    const facade = new JsonlCompatibilityFacade({
+      kernel,
+      send: (message) => sent.push(message),
+      defaultAdapterId: "fake",
+      defaultCwd: () => "/tmp/default",
+    });
+
+    await facade.handleQuery({
+      ...v1Query({ id: "request-failed", prompt: "fail" }),
+      protocolVersion: 2,
+      requestId: "request-failed",
+      clientId: "client-failed",
+      adapterId: "fake",
+    });
+
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: "error",
+      message: "OpenClaw failed: OpenAI API error: upstream unavailable",
+      failure: expect.objectContaining({
+        code: "adapter_process_exited",
+        adapterId: "openclaw",
+        provider: "openai",
+      }),
+    }));
+    store.close();
+  });
+
+  it("emits structured runtime failures when binding fails before execution", async () => {
+    const { store, adapter, kernel } = createKernelHarness(newDatabasePath());
+    const sent: OutboundMessage[] = [];
+    adapter.failNextOpenError = new AdapterRuntimeError({
+      code: "adapter_config_invalid",
+      source: "adapter_process",
+      adapterId: "openclaw",
+      retryable: false,
+      userMessage:
+        "OpenClaw needs a config migration. Run `openclaw doctor --fix`, then retry. Inspect with `openclaw config validate`.",
+      technicalMessage: "OpenClaw config is invalid",
+    });
+    const facade = new JsonlCompatibilityFacade({
+      kernel,
+      send: (message) => sent.push(message),
+      defaultAdapterId: "fake",
+      defaultCwd: () => "/tmp/default",
+    });
+
+    await facade.handleQuery({
+      ...v1Query({ id: "request-binding-failed", prompt: "fail before execution" }),
+      protocolVersion: 2,
+      requestId: "request-binding-failed",
+      clientId: "client-binding-failed",
+      adapterId: "fake",
+    });
+
+    expect(adapter.executed).toHaveLength(0);
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: "error",
+      message:
+        "OpenClaw needs a config migration. Run `openclaw doctor --fix`, then retry. Inspect with `openclaw config validate`.",
+      failure: expect.objectContaining({
+        code: "adapter_config_invalid",
+        source: "adapter_process",
+        adapterId: "openclaw",
+        retryable: false,
+      }),
+    }));
+    expect(JSON.parse(store.getRow("SELECT result_json FROM runs").result_json).failure).toMatchObject({
+      code: "adapter_config_invalid",
+      adapterId: "openclaw",
+    });
+    store.close();
+  });
+
   it("selects the sole running request for unscoped tool-call correlation", () => {
     expect(
       selectUnscopedToolCallCorrelation([
@@ -112,20 +218,162 @@ describe("JsonlCompatibilityFacade", () => {
       runId: adapter.executed[0].runId,
       attemptId,
     });
-    expect(facade.toolCallCorrelationForRequest("control-run-1")).toMatchObject({
+    expect(facade.toolCallCorrelationForRequest("control-run-1", "control-client")).toMatchObject({
       requestId: "control-run-1",
       clientId: "control-client",
       attemptId,
     });
+    expect(facade.toolCallCorrelationForRequest("control-run-1", "other-client")).toEqual({});
 
     adapter.resolveDeferred({
-      text: "done",
-      sessionId: adapter.executed[0].binding.adapterNativeSessionId,
-      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
+      text: "done",      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
       terminalStatus: "succeeded",
     });
     await running;
-    expect(facade.toolCallCorrelationForRequest("control-run-1")).toEqual({});
+    expect(facade.toolCallCorrelationForRequest("control-run-1", "control-client")).toEqual({});
+    store.close();
+  });
+
+  it("requires client id when resolving request-scoped v2 tool-call correlation", async () => {
+    const { store, adapter, kernel } = createKernelHarness(newDatabasePath(), "fake", 2);
+    adapter.deferResult();
+    const facade = new JsonlCompatibilityFacade({
+      kernel,
+      send: () => {},
+      defaultAdapterId: "fake",
+      suppressToolUseEvents: false,
+    });
+
+    facade.registerExternalRequestContext({
+      protocolVersion: 2,
+      requestId: "shared-control-run",
+      clientId: "client-a",
+      ownerId: "owner",
+      adapterId: "fake",
+    });
+    facade.registerExternalRequestContext({
+      protocolVersion: 2,
+      requestId: "shared-control-run",
+      clientId: "client-b",
+      ownerId: "owner",
+      adapterId: "fake",
+    });
+    const first = kernel.executeRun({
+      ...baseRunInput,
+      requestId: "shared-control-run",
+      clientId: "client-a",
+      prompt: "control-created child a",
+    });
+    const second = kernel.executeRun({
+      ...baseRunInput,
+      requestId: "shared-control-run",
+      clientId: "client-b",
+      prompt: "control-created child b",
+      externalRefId: "task-b",
+    });
+    await waitUntil(() => adapter.executed.length === 2);
+
+    expect(facade.toolCallCorrelationForRequest("shared-control-run", "client-a")).toMatchObject({
+      requestId: "shared-control-run",
+      clientId: "client-a",
+      runId: adapter.executed[0].runId,
+    });
+    expect(facade.toolCallCorrelationForRequest("shared-control-run", "client-b")).toMatchObject({
+      requestId: "shared-control-run",
+      clientId: "client-b",
+      runId: adapter.executed[1].runId,
+    });
+    expect(facade.legacyUnscopedToolCallCorrelationForRequest("shared-control-run")).toEqual({});
+
+    adapter.resolveDeferred({
+      text: "done",      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
+      terminalStatus: "succeeded",
+    });
+    await Promise.all([first, second]);
+    store.close();
+  });
+
+  it("routes simultaneous Hermes and OpenClaw relay contexts by clientId plus requestId", async () => {
+    const store = new SqliteAgentStore({ databasePath: newDatabasePath(), reconcileOnOpen: false });
+    const hermes = new FakeRuntimeAdapter("hermes");
+    const openclaw = new FakeRuntimeAdapter("openclaw");
+    hermes.deferResult();
+    openclaw.deferResult();
+    const registry = new AdapterRegistry();
+    registry.register("hermes", () => hermes, 1);
+    registry.register("openclaw", () => openclaw, 1);
+    const kernel = new AgentRuntimeKernel({ store, registry });
+    const facade = new JsonlCompatibilityFacade({
+      kernel,
+      send: () => {},
+      defaultAdapterId: "hermes",
+      suppressToolUseEvents: false,
+    });
+
+    facade.registerExternalRequestContext({
+      protocolVersion: 2,
+      requestId: "shared-request",
+      clientId: "client-hermes",
+      ownerId: "owner",
+      adapterId: "hermes",
+    });
+    facade.registerExternalRequestContext({
+      protocolVersion: 2,
+      requestId: "shared-request",
+      clientId: "client-openclaw",
+      ownerId: "owner",
+      adapterId: "openclaw",
+    });
+
+    const hermesRun = kernel.executeRun({
+      ...baseRunInput,
+      adapterId: "hermes",
+      defaultAdapterId: "hermes",
+      requestId: "shared-request",
+      clientId: "client-hermes",
+      externalRefId: "task-hermes",
+    });
+    const openclawRun = kernel.executeRun({
+      ...baseRunInput,
+      adapterId: "openclaw",
+      defaultAdapterId: "openclaw",
+      requestId: "shared-request",
+      clientId: "client-openclaw",
+      externalRefId: "task-openclaw",
+    });
+    await waitUntil(() => hermes.executed.length === 1 && openclaw.executed.length === 1);
+
+    expect(facade.toolCallCorrelationForRequest("shared-request", "client-hermes")).toMatchObject({
+      requestId: "shared-request",
+      clientId: "client-hermes",
+      runId: hermes.executed[0].runId,
+      attemptId: hermes.executed[0].attemptId,
+    });
+    expect(facade.toolCallCorrelationForRequest("shared-request", "client-openclaw")).toMatchObject({
+      requestId: "shared-request",
+      clientId: "client-openclaw",
+      runId: openclaw.executed[0].runId,
+      attemptId: openclaw.executed[0].attemptId,
+    });
+    expect(facade.toolCallCorrelationForAdapter("hermes")).toMatchObject({
+      clientId: "client-hermes",
+      runId: hermes.executed[0].runId,
+    });
+    expect(facade.toolCallCorrelationForAdapter("openclaw")).toMatchObject({
+      clientId: "client-openclaw",
+      runId: openclaw.executed[0].runId,
+    });
+    expect(facade.legacyUnscopedToolCallCorrelationForRequest("shared-request")).toEqual({});
+
+    hermes.resolveDeferred({
+      adapterSessionId: hermes.executed[0].binding.adapterNativeSessionId,
+      terminalStatus: "succeeded",
+    });
+    openclaw.resolveDeferred({
+      adapterSessionId: openclaw.executed[0].binding.adapterNativeSessionId,
+      terminalStatus: "succeeded",
+    });
+    await Promise.all([hermesRun, openclawRun]);
     store.close();
   });
 
@@ -225,6 +473,7 @@ describe("JsonlCompatibilityFacade", () => {
       clientId: "client-mcp",
       protocolVersion: 2,
       sessionId: "session-mcp",
+      adapterId: "fake",
     });
     store.close();
   });
@@ -362,11 +611,111 @@ describe("JsonlCompatibilityFacade", () => {
     adapter.resolveDeferred({
       text: "partial",
       terminalStatus: "cancelled",
-      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
-      sessionId: adapter.executed[0].binding.adapterNativeSessionId,
-    });
+      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,    });
     await running;
     expect(sent.some((message) => message.type === "result" && message.terminalStatus === "cancelled")).toBe(true);
+    store.close();
+  });
+
+  it("allows runId-only v2 interrupts to reach kernel cancellation", async () => {
+    const { store, adapter, kernel } = createKernelHarness(newDatabasePath());
+    adapter.deferResult();
+    const sent: OutboundMessage[] = [];
+    const facade = new JsonlCompatibilityFacade({
+      kernel,
+      send: (message) => sent.push(message),
+      defaultAdapterId: "fake",
+      defaultCwd: () => "/tmp/default",
+    });
+
+    const running = facade.handleQuery({
+      ...v1Query({ prompt: "cancel by run id" }),
+      protocolVersion: 2,
+      requestId: "request-run-only-cancel",
+      clientId: "client-run-only-cancel",
+      ownerId: "owner-run-only-cancel",
+      legacySessionKey: "run-only-cancel-key",
+    });
+    await waitUntil(() => adapter.executed.length === 1);
+
+    await facade.handleInterrupt({
+      protocolVersion: 2,
+      runId: adapter.executed[0].runId,
+      attemptId: adapter.executed[0].attemptId,
+      ownerId: "owner-run-only-cancel",
+    });
+
+    expect(adapter.cancelled).toHaveLength(1);
+    expect(adapter.cancelled[0].runId).toBe(adapter.executed[0].runId);
+    const cancelAck = sent.find((message): message is Extract<OutboundMessage, { type: "cancel_ack" }> => message.type === "cancel_ack");
+    expect(cancelAck).toMatchObject({
+      protocolVersion: 2,
+      requestId: "request-run-only-cancel",
+      clientId: "client-run-only-cancel",
+      runId: adapter.executed[0].runId,
+      attemptId: adapter.executed[0].attemptId,
+      accepted: true,
+      dispatchAttempted: true,
+    });
+
+    adapter.resolveDeferred({
+      text: "cancelled by run id",
+      terminalStatus: "cancelled",
+      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
+    });
+    await running;
+    store.close();
+  });
+
+  it("rejects runId-only v2 interrupts without active context or explicit owner guard", async () => {
+    const { store, adapter, kernel } = createKernelHarness(newDatabasePath());
+    adapter.deferResult();
+    const sent: OutboundMessage[] = [];
+    const facade = new JsonlCompatibilityFacade({
+      kernel,
+      send: (message) => sent.push(message),
+      defaultAdapterId: "fake",
+      defaultCwd: () => "/tmp/default",
+    });
+
+    const running = facade.handleQuery({
+      ...v1Query({ prompt: "reject bare run id cancel" }),
+      protocolVersion: 2,
+      requestId: "request-bare-run-cancel",
+      clientId: "client-bare-run-cancel",
+      ownerId: "owner-bare-run-cancel",
+      legacySessionKey: "bare-run-cancel-key",
+    });
+    await waitUntil(() => adapter.executed.length === 1);
+
+    await facade.handleInterrupt({
+      protocolVersion: 2,
+      runId: adapter.executed[0].runId,
+      attemptId: adapter.executed[0].attemptId,
+      requestId: "external-cancel-request",
+      clientId: "external-client",
+    });
+
+    expect(adapter.cancelled).toHaveLength(0);
+    const cancelAck = sent.find((message): message is Extract<OutboundMessage, { type: "cancel_ack" }> =>
+      message.type === "cancel_ack" && message.requestId === "external-cancel-request"
+    );
+    expect(cancelAck).toMatchObject({
+      protocolVersion: 2,
+      requestId: "external-cancel-request",
+      clientId: "external-client",
+      runId: adapter.executed[0].runId,
+      accepted: false,
+      dispatchAttempted: false,
+      adapterAcknowledged: false,
+    });
+
+    adapter.resolveDeferred({
+      text: "done",
+      terminalStatus: "succeeded",
+      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
+    });
+    await running;
     store.close();
   });
 
@@ -413,9 +762,7 @@ describe("JsonlCompatibilityFacade", () => {
     adapter.resolveDeferred({
       text: "still running",
       terminalStatus: "succeeded",
-      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
-      sessionId: adapter.executed[0].binding.adapterNativeSessionId,
-    });
+      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,    });
     await running;
     store.close();
   });
@@ -461,14 +808,12 @@ describe("JsonlCompatibilityFacade", () => {
     adapter.resolveDeferred({
       text: "cancelled",
       terminalStatus: "cancelled",
-      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
-      sessionId: adapter.executed[0].binding.adapterNativeSessionId,
-    });
+      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,    });
     await running;
     store.close();
   });
 
-  it("uses the sole active request context when interrupt omits clientId", async () => {
+  it("rejects protocol v2 request-scoped interrupts that omit clientId", async () => {
     const { store, adapter, kernel } = createKernelHarness(newDatabasePath());
     adapter.deferResult();
     const sent: OutboundMessage[] = [];
@@ -495,22 +840,21 @@ describe("JsonlCompatibilityFacade", () => {
       requestId: "request-without-client",
     });
 
-    expect(adapter.cancelled).toHaveLength(1);
-    expect(adapter.cancelled[0].runId).toBe(adapter.executed[0].runId);
+    expect(adapter.cancelled).toHaveLength(0);
     const cancelAck = sent.find((message): message is Extract<OutboundMessage, { type: "cancel_ack" }> => message.type === "cancel_ack");
     expect(cancelAck).toMatchObject({
       protocolVersion: 2,
       requestId: "request-without-client",
-      clientId: "non-default-client",
-      accepted: true,
+      accepted: false,
+      dispatchAttempted: false,
+      adapterAcknowledged: false,
     });
+    expect(cancelAck).not.toHaveProperty("clientId");
 
     adapter.resolveDeferred({
       text: "cancelled",
       terminalStatus: "cancelled",
-      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
-      sessionId: adapter.executed[0].binding.adapterNativeSessionId,
-    });
+      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,    });
     await running;
     store.close();
   });
@@ -554,14 +898,12 @@ describe("JsonlCompatibilityFacade", () => {
     adapter.resolveDeferred({
       text: "still running",
       terminalStatus: "succeeded",
-      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
-      sessionId: adapter.executed[0].binding.adapterNativeSessionId,
-    });
+      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,    });
     await running;
     store.close();
   });
 
-  it("treats an explicit empty client id as scoped rather than omitted", async () => {
+  it("rejects an explicit empty v2 client id instead of using scoped fallback", async () => {
     const { store, adapter, kernel } = createKernelHarness(newDatabasePath());
     adapter.deferResult();
     const sent: OutboundMessage[] = [];
@@ -593,16 +935,14 @@ describe("JsonlCompatibilityFacade", () => {
     expect(cancelAck).toMatchObject({
       protocolVersion: 2,
       requestId: "empty-client-request",
-      clientId: "",
       accepted: false,
     });
+    expect(cancelAck).not.toHaveProperty("clientId");
 
     adapter.resolveDeferred({
       text: "still running",
       terminalStatus: "succeeded",
-      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
-      sessionId: adapter.executed[0].binding.adapterNativeSessionId,
-    });
+      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,    });
     await running;
     store.close();
   });
@@ -657,14 +997,12 @@ describe("JsonlCompatibilityFacade", () => {
     adapter.resolveDeferred({
       text: "client a cancelled",
       terminalStatus: "cancelled",
-      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
-      sessionId: adapter.executed[0].binding.adapterNativeSessionId,
-    });
+      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,    });
     await Promise.all([first, second]);
     store.close();
   });
 
-  it("uses owner-scoped latest runs when interrupt omits request and run ids", async () => {
+  it("rejects v2 interrupt when requestId is missing", async () => {
     const { store, adapter, kernel } = createKernelHarness(newDatabasePath(), "fake", 2);
     adapter.deferResult();
     const sent: OutboundMessage[] = [];
@@ -696,21 +1034,26 @@ describe("JsonlCompatibilityFacade", () => {
     await facade.handleInterrupt({
       type: "interrupt",
       protocolVersion: 2,
+      id: "legacy-interrupt-id",
       clientId: "shared-client",
       ownerId: "owner-a",
     });
 
-    expect(adapter.cancelled).toHaveLength(1);
-    expect(adapter.cancelled[0].runId).toBe(adapter.executed[0].runId);
+    expect(adapter.cancelled).toHaveLength(0);
     const cancelAck = sent.find((message): message is Extract<OutboundMessage, { type: "cancel_ack" }> => message.type === "cancel_ack");
-    expect(cancelAck?.runId).toBe(adapter.executed[0].runId);
+    expect(cancelAck).toMatchObject({
+      protocolVersion: 2,
+      clientId: "shared-client",
+      accepted: false,
+      dispatchAttempted: false,
+      adapterAcknowledged: false,
+    });
+    expect(cancelAck).not.toHaveProperty("runId");
 
     adapter.resolveDeferred({
-      text: "cancelled",
-      terminalStatus: "cancelled",
-      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
-      sessionId: adapter.executed[0].binding.adapterNativeSessionId,
-    });
+      text: "owner a finished",
+      terminalStatus: "succeeded",
+      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,    });
     await Promise.all([ownerA, ownerB]);
     store.close();
   });
@@ -751,15 +1094,20 @@ describe("JsonlCompatibilityFacade", () => {
       ownerId: "a",
     });
 
-    expect(adapter.cancelled).toHaveLength(1);
-    expect(adapter.cancelled[0].runId).toBe(adapter.executed[0].runId);
+    expect(adapter.cancelled).toHaveLength(0);
+    const cancelAck = sent.find((message): message is Extract<OutboundMessage, { type: "cancel_ack" }> => message.type === "cancel_ack");
+    expect(cancelAck).toMatchObject({
+      protocolVersion: 2,
+      clientId: "b:c",
+      accepted: false,
+      dispatchAttempted: false,
+      adapterAcknowledged: false,
+    });
 
     adapter.resolveDeferred({
-      text: "cancelled",
-      terminalStatus: "cancelled",
-      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
-      sessionId: adapter.executed[0].binding.adapterNativeSessionId,
-    });
+      text: "first finished",
+      terminalStatus: "succeeded",
+      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,    });
     await Promise.all([first, second]);
     store.close();
   });
@@ -806,9 +1154,7 @@ describe("JsonlCompatibilityFacade", () => {
     adapter.resolveDeferred({
       text: "first done",
       terminalStatus: "succeeded",
-      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
-      sessionId: adapter.executed[0].binding.adapterNativeSessionId,
-    });
+      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,    });
     await first;
     await second;
 
@@ -921,6 +1267,35 @@ describe("JsonlCompatibilityFacade", () => {
     store.close();
   });
 
+  it("does not apply the process default model to per-query local adapters", async () => {
+    const store = new SqliteAgentStore({ databasePath: newDatabasePath(), reconcileOnOpen: false });
+    const piMonoAdapter = new FakeRuntimeAdapter("pi-mono");
+    const openclawAdapter = new FakeRuntimeAdapter("openclaw");
+    const registry = new AdapterRegistry();
+    registry.register("pi-mono", () => piMonoAdapter, 1);
+    registry.register("openclaw", () => openclawAdapter, 1);
+    const kernel = new AgentRuntimeKernel({ store, registry });
+    const facade = new JsonlCompatibilityFacade({
+      kernel,
+      send: () => {},
+      defaultAdapterId: "pi-mono",
+      defaultCwd: () => "/tmp/default",
+    });
+
+    await facade.handleQuery(v1Query({
+      id: "request-openclaw",
+      adapterId: "openclaw",
+      sessionKey: undefined,
+      model: undefined,
+    }));
+
+    expect(openclawAdapter.opened[0].model).toBeUndefined();
+    expect(openclawAdapter.executed[0].model).toBeUndefined();
+    expect(store.getRow("SELECT default_adapter_id FROM sessions").default_adapter_id).toBe("openclaw");
+    expect(store.getRow("SELECT adapter_id FROM adapter_bindings").adapter_id).toBe("openclaw");
+    store.close();
+  });
+
   it("suppresses pi-mono tool_use events while preserving correlated tool activity", async () => {
     const { store, adapter, kernel } = createKernelHarness(newDatabasePath(), "pi-mono");
     adapter.deferResult();
@@ -956,9 +1331,7 @@ describe("JsonlCompatibilityFacade", () => {
     });
     adapter.resolveDeferred({
       text: "done",
-      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
-      sessionId: adapter.executed[0].binding.adapterNativeSessionId,
-      terminalStatus: "succeeded",
+      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,      terminalStatus: "succeeded",
     });
     await running;
 
@@ -997,12 +1370,12 @@ describe("JsonlCompatibilityFacade", () => {
       requestId: "request-terminal-marker",
       runId: adapter.executed[0].runId,
     });
-    expect(facade.toolCallCorrelationForRequest("request-terminal-marker")).toMatchObject({
+    expect(facade.toolCallCorrelationForRequest("request-terminal-marker", "client-terminal-marker")).toMatchObject({
       requestId: "request-terminal-marker",
       runId: adapter.executed[0].runId,
       attemptId: adapter.executed[0].attemptId,
     });
-    expect(facade.toolCallCorrelationForRequest("stale-request-from-reused-mcp-process")).toEqual({});
+    expect(facade.toolCallCorrelationForRequest("stale-request-from-reused-mcp-process", "client-terminal-marker")).toEqual({});
     expect(facade.toolCallCorrelationForAdapter("fake")).toMatchObject({
       requestId: "request-terminal-marker",
       runId: adapter.executed[0].runId,
@@ -1011,9 +1384,7 @@ describe("JsonlCompatibilityFacade", () => {
 
     adapter.resolveDeferred({
       text: "done",
-      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,
-      sessionId: adapter.executed[0].binding.adapterNativeSessionId,
-      terminalStatus: "succeeded",
+      adapterSessionId: adapter.executed[0].binding.adapterNativeSessionId,      terminalStatus: "succeeded",
     });
     await running;
 

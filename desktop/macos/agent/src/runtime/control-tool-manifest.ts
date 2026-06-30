@@ -7,6 +7,16 @@ export interface AgentControlManifestProperty {
   additionalProperties?: boolean;
 }
 
+export type AgentControlSurface = "desktopChat" | "realtimeHub";
+
+export interface AgentControlMcpInputSchemaOptions {
+  anyOf?: unknown[];
+  allOf?: unknown[];
+  oneOf?: unknown[];
+  if?: unknown;
+  then?: unknown;
+}
+
 export interface AgentControlManifestTool {
   name:
     | "list_agent_sessions"
@@ -21,12 +31,12 @@ export interface AgentControlManifestTool {
   promptSnippet: string;
   promptGuidelines: string[];
   latency: "fast local" | "async background";
-  surfaces: ["desktopChat"];
+  surfaces: AgentControlSurface[];
   runtimePreconditions: string[];
   timeoutClass: AgentControlTimeoutClass;
   properties: Record<string, AgentControlManifestProperty>;
   required: string[];
-  jsonSchemaOptions?: Record<string, unknown>;
+  mcpInputSchemaOptions?: AgentControlMcpInputSchemaOptions;
 }
 
 export const agentControlCapabilityManifest = [
@@ -39,17 +49,21 @@ Use when the user asks what Omi agents/subagents are active, recent, failed, or 
 Returns canonical Omi session IDs, latest/active run summaries, and adapter binding metadata.`,
     promptSnippet: "list_agent_sessions - List Omi-managed agent sessions and active runs",
     promptGuidelines: [
-      "Use for current or recent kernel-backed Omi agents/subagents across main chat, task chat, and any future migrated floating-pill sessions.",
+      "Use for current or recent kernel-backed Omi agents/subagents across chat, PTT/realtime, task chat, and any future migrated floating-pill sessions.",
       "Returns durable Omi session IDs, latest/active run summaries, and adapter binding metadata.",
     ],
     latency: "fast local",
-    surfaces: ["desktopChat"],
+    surfaces: ["desktopChat", "realtimeHub"],
     runtimePreconditions: ["Defaults ownerId to the active signed-in owner when omitted."],
     timeoutClass: "normal",
     properties: {
       ownerId: { type: "string", description: "Owner id to list. Defaults to the active signed-in owner." },
       status: { type: "string", enum: ["open", "archived", "closed"] },
-      surfaceKind: { type: "string", description: "Filter to a surface kind such as main_chat, task_chat, or floating_pill." },
+      surfaceKind: {
+        type: "string",
+        enum: ["main_chat", "task_chat", "realtime", "delegated_agent", "floating_pill"],
+        description: "Filter to a canonical surface kind.",
+      },
       limit: { type: "number", description: "Maximum sessions to return. Default 50, max 200." },
       beforeUpdatedAtMs: { type: "number", description: "Pagination cursor: only sessions updated before this epoch-ms timestamp." },
     },
@@ -67,7 +81,7 @@ Use a runId returned by list_agent_sessions or a correlated Omi response. Return
       "Returns the run, attempts, adapter bindings, events, and artifact metadata.",
     ],
     latency: "fast local",
-    surfaces: ["desktopChat"],
+    surfaces: ["desktopChat", "realtimeHub"],
     runtimePreconditions: [
       "Requires a canonical Omi run_id.",
       "Defaults ownerId to the active signed-in owner when omitted and rejects runs outside that owner.",
@@ -93,7 +107,7 @@ Use when the user asks to stop a running Omi agent/subagent. Returns whether can
       "Returns whether cancellation was accepted, dispatched, and acknowledged.",
     ],
     latency: "fast local",
-    surfaces: ["desktopChat"],
+    surfaces: ["desktopChat", "realtimeHub"],
     runtimePreconditions: [
       "Requires a canonical Omi run_id.",
       "Defaults ownerId to the active signed-in owner when omitted and rejects runs outside that owner.",
@@ -108,7 +122,7 @@ Use when the user asks to stop a running Omi agent/subagent. Returns whether can
   {
     name: "inspect_agent_artifacts",
     label: "Inspect Agent Artifacts",
-    description: `Inspect canonical artifact metadata for an Omi agent session, run, or attempt.
+    description: `Inspect canonical artifact metadata for an Omi agent artifact, session, run, or attempt.
 
 Returns metadata and references only. It does not read arbitrary artifact contents.`,
     promptSnippet: "inspect_agent_artifacts - Inspect Omi agent artifact metadata",
@@ -117,13 +131,14 @@ Returns metadata and references only. It does not read arbitrary artifact conten
       "Use after get_agent_run when the user asks what files or outputs an agent produced.",
     ],
     latency: "fast local",
-    surfaces: ["desktopChat"],
+    surfaces: ["desktopChat", "realtimeHub"],
     runtimePreconditions: [
-      "Requires at least one of sessionId, runId, or attemptId.",
+      "Requires at least one of artifactId, sessionId, runId, or attemptId.",
       "Defaults ownerId to the active signed-in owner when omitted and rejects selectors outside that owner.",
     ],
     timeoutClass: "normal",
     properties: {
+      artifactId: { type: "string", description: "Canonical Omi artifact_id." },
       sessionId: { type: "string", description: "Canonical Omi session_id." },
       runId: { type: "string", description: "Canonical Omi run_id." },
       attemptId: { type: "string", description: "Canonical Omi attempt_id." },
@@ -132,8 +147,9 @@ Returns metadata and references only. It does not read arbitrary artifact conten
       limit: { type: "number", description: "Maximum artifacts to return. Default 50, max 200." },
     },
     required: [],
-    jsonSchemaOptions: {
+    mcpInputSchemaOptions: {
       anyOf: [
+        { required: ["artifactId"] },
         { required: ["sessionId"] },
         { required: ["runId"] },
         { required: ["attemptId"] },
@@ -153,7 +169,7 @@ This only records artifact metadata state and ordered kernel events. It does not
       "This never reads artifact contents and has no OS side effects.",
     ],
     latency: "fast local",
-    surfaces: ["desktopChat"],
+    surfaces: ["desktopChat", "realtimeHub"],
     runtimePreconditions: [
       "Requires artifactId.",
       "Defaults ownerId to the active signed-in owner when omitted and rejects artifacts outside that owner.",
@@ -247,7 +263,7 @@ Supports call, spawn, and continue modes. Child context is intentionally minimal
       metadata: { type: "object", description: "Small structured metadata for the child run.", additionalProperties: true },
     },
     required: ["mode", "parentRunId", "objective"],
-    jsonSchemaOptions: {
+    mcpInputSchemaOptions: {
       allOf: [
         {
           if: { properties: { mode: { const: "continue" } }, required: ["mode"] },

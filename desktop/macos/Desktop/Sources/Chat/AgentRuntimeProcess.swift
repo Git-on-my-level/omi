@@ -3,13 +3,26 @@ import Foundation
 actor AgentRuntimeProcess {
   static let shared = AgentRuntimeProcess()
 
+  nonisolated static func shouldEnablePlaywrightExtension(
+    useExtension: Bool,
+    token: String,
+    targetHasExtension: Bool
+  ) -> Bool {
+    useExtension && !token.isEmpty && targetHasExtension
+  }
+
   struct WarmupSessionConfig {
     let key: String
-    let model: String
+    let model: String?
     let systemPrompt: String?
   }
 
   struct RuntimeMessage {
+    struct RequestKey: Hashable, Equatable {
+      let clientId: String
+      let requestId: String
+    }
+
     enum Kind: Equatable {
       case initMessage
       case textDelta
@@ -32,7 +45,10 @@ actor AgentRuntimeProcess {
     let protocolVersion: Int?
     let payload: [String: Any]
 
-    var routingKey: String? { requestId }
+    var requestKey: RequestKey? {
+      guard let clientId, let requestId else { return nil }
+      return RequestKey(clientId: clientId, requestId: requestId)
+    }
 
     static func parse(_ json: String) -> RuntimeMessage? {
       guard let data = json.data(using: .utf8),
@@ -101,18 +117,25 @@ actor AgentRuntimeProcess {
   private var stdinPipe: Pipe?
   private var stdoutPipe: Pipe?
   private var stderrPipe: Pipe?
-  private var readTask: Task<Void, Never>?
+  private var stdoutLineBuffer = Data()
   private var isRunning = false
   private var processGeneration: UInt64 = 0
   private var lastExitWasOOM = false
   private var clients: [String: ClientRegistration] = [:]
-  private var activeRequests: [String: ActiveRequest] = [:]
-  private var activeControlRequests: [String: ActiveControlRequest] = [:]
+  private var activeRequests: [RuntimeMessage.RequestKey: ActiveRequest] = [:]
+  private var activeControlRequests: [RuntimeMessage.RequestKey: ActiveControlRequest] = [:]
   private var initContinuations: [CheckedContinuation<Void, Error>] = []
   private var receivedInit = false
   private var isRestarting = false
 
   var isAlive: Bool { isRunning }
+
+  static func adapterId(forHarnessMode harnessMode: String) -> String? {
+    guard let harness = AgentRuntimeRouting.harnessMode(from: harnessMode) else {
+      return nil
+    }
+    return AgentRuntimeRouting.adapterId(for: harness).rawValue
+  }
 
   func registerClient(clientId: String, harnessMode: String) async throws {
     guard !isRestarting else {
@@ -132,12 +155,12 @@ actor AgentRuntimeProcess {
   func unregisterClient(clientId: String) async {
     clients.removeValue(forKey: clientId)
 
-    for (requestId, request) in activeRequests where request.clientId == clientId {
-      activeRequests.removeValue(forKey: requestId)
+    for (requestKey, request) in activeRequests where request.clientId == clientId {
+      activeRequests.removeValue(forKey: requestKey)
       request.continuation.resume(throwing: BridgeError.stopped)
     }
-    for (requestId, request) in activeControlRequests where request.clientId == clientId {
-      activeControlRequests.removeValue(forKey: requestId)
+    for (requestKey, request) in activeControlRequests where request.clientId == clientId {
+      activeControlRequests.removeValue(forKey: requestKey)
       request.continuation.resume(throwing: BridgeError.stopped)
     }
 
@@ -191,8 +214,10 @@ actor AgentRuntimeProcess {
     dict["sessions"] = sessions.map { session -> [String: Any] in
       var entry: [String: Any] = [
         "key": session.key,
-        "model": session.model,
       ]
+      if let model = session.model {
+        entry["model"] = model
+      }
       if let systemPrompt = session.systemPrompt {
         entry["systemPrompt"] = systemPrompt
       }
@@ -226,43 +251,46 @@ actor AgentRuntimeProcess {
     sendJson(dict)
   }
 
-  func controlTool(
+  func directControlTool(
     clientId: String,
     harnessMode: String,
     name: String,
     input: [String: Any]
   ) async throws -> String {
+    guard let ownerId = currentOwnerId() else {
+      throw BridgeError.agentError("Agent control requires a signed-in owner")
+    }
     try await registerClient(clientId: clientId, harnessMode: harnessMode)
 
     let requestId = UUID().uuidString
+    let requestKey = RuntimeMessage.RequestKey(clientId: clientId, requestId: requestId)
     return try await withCheckedThrowingContinuation { continuation in
-      activeControlRequests[requestId] = ActiveControlRequest(
+      activeControlRequests[requestKey] = ActiveControlRequest(
         clientId: clientId,
         requestId: requestId,
         continuation: continuation
       )
-      var dict: [String: Any] = [
-        "type": "control_tool",
+      let dict: [String: Any] = [
+        "type": "direct_control_tool",
         "protocolVersion": 2,
         "requestId": requestId,
         "clientId": clientId,
         "name": name,
         "input": input,
+        "ownerId": ownerId,
       ]
-      if let ownerId = currentOwnerId() {
-        dict["ownerId"] = ownerId
-      }
       let sent = sendJson(dict)
-      if !sent, let request = activeControlRequests.removeValue(forKey: requestId) {
-        request.continuation.resume(throwing: BridgeError.agentError("Failed to send control tool request"))
+      if !sent, let request = activeControlRequests.removeValue(forKey: requestKey) {
+        request.continuation.resume(throwing: BridgeError.agentError("Failed to send direct control tool request"))
       }
     }
   }
 
   func interrupt(clientId: String, requestId: String) {
-    guard var request = activeRequests[requestId], request.clientId == clientId else { return }
+    let requestKey = RuntimeMessage.RequestKey(clientId: clientId, requestId: requestId)
+    guard var request = activeRequests[requestKey] else { return }
     request.isInterrupted = true
-    activeRequests[requestId] = request
+    activeRequests[requestKey] = request
     var dict: [String: Any] = [
       "type": "interrupt",
       "protocolVersion": 2,
@@ -301,6 +329,9 @@ actor AgentRuntimeProcess {
     onAuthSuccess: @escaping AgentBridge.AuthSuccessHandler
   ) async throws -> AgentBridge.QueryResult {
     try await registerClient(clientId: clientId, harnessMode: harnessMode)
+    guard let adapterId = Self.adapterId(forHarnessMode: harnessMode) else {
+      throw BridgeError.agentError("Unknown AI runtime mode: \(harnessMode)")
+    }
 
     return try await withCheckedThrowingContinuation { continuation in
       let surfaceRef: AgentSurfaceReference?
@@ -326,7 +357,7 @@ actor AgentRuntimeProcess {
         onAuthSuccess: onAuthSuccess,
         continuation: continuation
       )
-      activeRequests[requestId] = request
+      activeRequests[RuntimeMessage.RequestKey(clientId: clientId, requestId: requestId)] = request
       if let surfaceRef {
         Task { @MainActor in
           AgentRuntimeStatusStore.shared.beginRequest(surface: surfaceRef)
@@ -341,7 +372,7 @@ actor AgentRuntimeProcess {
         "clientId": clientId,
         "prompt": prompt,
         "systemPrompt": systemPrompt,
-        "adapterId": harnessMode == "piMono" ? "pi-mono" : "acp",
+        "adapterId": adapterId,
       ]
       if let sessionKey {
         queryDict["sessionKey"] = sessionKey
@@ -381,9 +412,12 @@ actor AgentRuntimeProcess {
 
   private func startProcess(preferredHarnessMode: String) async throws {
     guard !isRunning else { return }
+    guard let preferredHarness = AgentRuntimeRouting.harnessMode(from: preferredHarnessMode) else {
+      log("AgentRuntimeProcess: refusing unknown harness mode \(preferredHarnessMode)")
+      throw BridgeError.agentError("Unknown AI runtime mode: \(preferredHarnessMode)")
+    }
+    let preferredAdapterId = AgentRuntimeRouting.adapterId(for: preferredHarness)
 
-    readTask?.cancel()
-    readTask = nil
     process = nil
     closePipes()
     lastExitWasOOM = false
@@ -416,11 +450,12 @@ actor AgentRuntimeProcess {
     env["OMI_AGENT_STATE_DIR"] = Self.defaultStateDirectory()
     env.removeValue(forKey: "ANTHROPIC_API_KEY")
     env.removeValue(forKey: "CLAUDE_CODE_USE_VERTEX")
+    applyLocalAgentEnvironment(to: &env)
 
     let rustBase = await APIClient.shared.rustBackendURL
     if !rustBase.isEmpty {
       env["OMI_API_BASE_URL"] = rustBase.hasSuffix("/") ? "\(rustBase)v2" : "\(rustBase)/v2"
-    } else if preferredHarnessMode == "piMono" {
+    } else if preferredAdapterId == .piMono {
       log("AgentRuntimeProcess: pi-mono start refused, OMI_DESKTOP_API_URL is not configured")
       throw BridgeError.bridgeScriptNotFound
     }
@@ -437,7 +472,7 @@ actor AgentRuntimeProcess {
     let authService = await MainActor.run { AuthService.shared }
     if let token = try? await authService.getIdToken(), !token.isEmpty {
       env["OMI_AUTH_TOKEN"] = token
-    } else if preferredHarnessMode == "piMono" {
+    } else if preferredAdapterId == .piMono {
       log("AgentRuntimeProcess: pi-mono start refused, Firebase ID token is missing")
       throw BridgeError.authMissing
     }
@@ -452,11 +487,22 @@ actor AgentRuntimeProcess {
     let useExtension =
       defaults.object(forKey: "playwrightUseExtension") == nil
       || defaults.bool(forKey: "playwrightUseExtension")
-    if useExtension {
+    let playwrightToken = defaults.string(forKey: "playwrightExtensionToken") ?? ""
+    let playwrightTarget = BrowserAutomationTargetResolver.preferredTarget()
+    let hasInstalledPlaywrightBridge =
+      playwrightTarget.map { BrowserAutomationTargetResolver.isExtensionInstalled(in: $0) } ?? false
+    if Self.shouldEnablePlaywrightExtension(
+      useExtension: useExtension,
+      token: playwrightToken,
+      targetHasExtension: hasInstalledPlaywrightBridge)
+    {
+      env["PLAYWRIGHT_MCP_ENABLED"] = "true"
       env["PLAYWRIGHT_USE_EXTENSION"] = "true"
-      if let token = defaults.string(forKey: "playwrightExtensionToken"), !token.isEmpty {
-        env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] = token
-      }
+      env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] = playwrightToken
+    } else {
+      env.removeValue(forKey: "PLAYWRIGHT_MCP_ENABLED")
+      env.removeValue(forKey: "PLAYWRIGHT_USE_EXTENSION")
+      env.removeValue(forKey: "PLAYWRIGHT_MCP_EXTENSION_TOKEN")
     }
 
     proc.environment = env
@@ -512,6 +558,78 @@ actor AgentRuntimeProcess {
     }
   }
 
+  private func applyLocalAgentEnvironment(to env: inout [String: String]) {
+    // Seed auto-discovered commands for every local adapter so the shared Node
+    // process can route to Hermes or OpenClaw even when it was launched for a
+    // different adapter. registerClient returns early once isRunning, so the
+    // startup adapter's env would otherwise be the only one the process sees.
+    let home = NSHomeDirectory()
+    if env["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
+      env["HOME"] = home
+    }
+    if env["HERMES_HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
+      env["HERMES_HOME"] = "\(home)/.hermes"
+    }
+
+    let adapterPathDirs = [
+      "\(home)/.hermes/hermes-agent/venv/bin",
+      "\(home)/.hermes/node/bin",
+      "\(home)/.hermes/hermes-agent",
+    ]
+    let adapterSearchDirs = adapterPathDirs + [
+      "\(home)/.local/bin",
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+    ]
+    let trustedPathDirs = [
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+    ]
+    let existingPath = env["PATH"] ?? "/usr/bin:/bin"
+    var pathElements: [String] = []
+    for path in existingPath.split(separator: ":").map(String.init) + trustedPathDirs + adapterPathDirs {
+      if !pathElements.contains(path) {
+        pathElements.append(path)
+      }
+    }
+    env["PATH"] = pathElements.joined(separator: ":")
+
+    if env["OMI_HERMES_ADAPTER_COMMAND"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true,
+      let hermes = firstExecutable(named: "hermes", in: adapterSearchDirs)
+    {
+      env["OMI_HERMES_ADAPTER_COMMAND"] = "\(Self.shellQuote(hermes)) acp"
+    }
+
+    if env["OMI_OPENCLAW_ADAPTER_COMMAND"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true,
+      let openClaw = firstExecutable(named: "openclaw", in: adapterSearchDirs)
+    {
+      env["OMI_OPENCLAW_ADAPTER_COMMAND"] = Self.openClawAdapterCommand(openClawPath: openClaw)
+    }
+  }
+
+  static func openClawAdapterCommand(openClawPath: String, fileManager: FileManager = .default) -> String {
+    let nodePath = ((openClawPath as NSString).deletingLastPathComponent as NSString).appendingPathComponent("node")
+    if fileManager.isExecutableFile(atPath: nodePath) {
+      return "\(shellQuote(nodePath)) \(shellQuote(openClawPath)) acp"
+    }
+    return "\(shellQuote(openClawPath)) acp"
+  }
+
+  private static func shellQuote(_ value: String) -> String {
+    "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+  }
+
+  private func firstExecutable(named name: String, in directories: [String]) -> String? {
+    let fileManager = FileManager.default
+    for dir in directories {
+      let path = (dir as NSString).appendingPathComponent(name)
+      if fileManager.isExecutableFile(atPath: path) {
+        return path
+      }
+    }
+    return nil
+  }
+
   private func cleanupFailedStart(process failedProcess: Process, error: Error) async {
     log("AgentRuntimeProcess: startup failed after launch: \(error)")
     if failedProcess.isRunning {
@@ -527,8 +645,6 @@ actor AgentRuntimeProcess {
     if let currentProcess = process, currentProcess === failedProcess {
       process = nil
     }
-    readTask?.cancel()
-    readTask = nil
     closePipes()
     isRunning = false
     receivedInit = false
@@ -589,8 +705,6 @@ actor AgentRuntimeProcess {
       }
     }
 
-    readTask?.cancel()
-    readTask = nil
     process = nil
     closePipes()
     isRunning = false
@@ -601,32 +715,47 @@ actor AgentRuntimeProcess {
 
   private func startReadingStdout() {
     guard let stdoutPipe else { return }
+    let expectedGeneration = processGeneration
 
-    readTask = Task.detached { [weak self] in
-      let handle = stdoutPipe.fileHandleForReading
-      var buffer = Data()
+    let handle = stdoutPipe.fileHandleForReading
+    handle.readabilityHandler = { [weak self] handle in
+      let data = handle.availableData
+      guard !data.isEmpty else {
+        handle.readabilityHandler = nil
+        return
+      }
+      Task { [weak self] in
+        await self?.processStdoutData(data, generation: expectedGeneration)
+      }
+    }
+  }
 
-      while !Task.isCancelled {
-        let chunk = handle.availableData
-        if chunk.isEmpty { break }
-        buffer.append(chunk)
+  private func processStdoutData(_ data: Data, generation: UInt64) {
+    // Drop stdout chunks from a previous process generation. When the bridge is
+    // restarted or startup cleanup closes the pipe, a readability callback that
+    // already captured the old data can still fire after the new process has
+    // begun. Without this guard, stale init/result lines from the old Node
+    // process could mutate the new process state or resume the wrong continuation.
+    if generation != processGeneration {
+      log("AgentRuntimeProcess: dropping stale stdout chunk (gen=\(generation), current=\(processGeneration))")
+      return
+    }
+    stdoutLineBuffer.append(data)
 
-        while let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-          let lineData = buffer[buffer.startIndex..<newlineIndex]
-          buffer = Data(buffer[buffer.index(after: newlineIndex)...])
+    while let newlineIndex = stdoutLineBuffer.firstIndex(of: UInt8(ascii: "\n")) {
+      let lineData = stdoutLineBuffer[stdoutLineBuffer.startIndex..<newlineIndex]
+      stdoutLineBuffer = Data(stdoutLineBuffer[stdoutLineBuffer.index(after: newlineIndex)...])
 
-          guard let line = String(data: lineData, encoding: .utf8),
-            !line.trimmingCharacters(in: .whitespaces).isEmpty
-          else {
-            continue
-          }
+      guard let line = String(data: lineData, encoding: .utf8),
+        !line.trimmingCharacters(in: .whitespaces).isEmpty
+      else {
+        continue
+      }
 
-          if let message = RuntimeMessage.parse(line) {
-            await self?.handleMessage(message)
-          } else {
-            log("AgentRuntimeProcess: failed to parse message: \(line.prefix(200))")
-          }
-        }
+      if let message = RuntimeMessage.parse(line) {
+        handleMessage(message)
+      } else {
+        log("AgentRuntimeProcess: failed to parse message: \(line.prefix(200))")
       }
     }
   }
@@ -689,9 +818,9 @@ actor AgentRuntimeProcess {
       handleToolUse(message)
 
     case .cancelAck:
-      if let requestId = message.routingKey, var request = activeRequests[requestId] {
+      if let requestKey = message.requestKey, var request = activeRequests[requestKey] {
         request.cancelAck = message
-        activeRequests[requestId] = request
+        activeRequests[requestKey] = request
       }
 
     case .controlToolResult:
@@ -709,10 +838,10 @@ actor AgentRuntimeProcess {
   }
 
   private func routedRequest(for message: RuntimeMessage) -> ActiveRequest? {
-    if let requestId = message.routingKey {
-      return activeRequests[requestId]
+    if let requestKey = message.requestKey {
+      return activeRequests[requestKey]
     }
-    if activeRequests.count == 1 {
+    if message.protocolVersion != 2 && activeRequests.count == 1 {
       return activeRequests.values.first
     }
     return nil
@@ -722,11 +851,13 @@ actor AgentRuntimeProcess {
     let callId = message.payload["callId"] as? String ?? ""
     let name = message.payload["name"] as? String ?? ""
     guard let request = routedRequest(for: message) else {
-      if let requestId = message.routingKey, activeControlRequests[requestId] != nil {
+      if let requestKey = message.requestKey, activeControlRequests[requestKey] != nil {
         log("AgentRuntimeProcess: rejecting Swift-backed tool call from control request")
         completeToolCall(
           callId: callId,
-          result: "Error: Swift-backed Omi tools are unavailable for control-created agent runs"
+          result: "Error: Swift-backed Omi tools are unavailable for control-created agent runs",
+          requestId: message.requestId,
+          clientId: message.clientId
         )
         return
       }
@@ -740,33 +871,45 @@ actor AgentRuntimeProcess {
     let input = message.payload["input"] as? [String: Any] ?? [:]
     Task {
       let result = await request.onToolCall(callId, name, input)
-      completeToolCall(callId: callId, result: result)
+      completeToolCall(callId: callId, result: result, requestId: request.requestId, clientId: request.clientId)
     }
   }
 
-  private func completeToolCall(callId: String, result: String) {
-    sendJson([
+  private func completeToolCall(callId: String, result: String, requestId: String? = nil, clientId: String? = nil) {
+    var payload: [String: Any] = [
       "type": "tool_result",
       "callId": callId,
       "result": result,
-    ])
+    ]
+    if let requestId { payload["requestId"] = requestId }
+    if let clientId { payload["clientId"] = clientId }
+    sendJson(payload)
   }
 
   private func completeRequest(_ message: RuntimeMessage) {
-    guard let requestId = message.routingKey, let request = activeRequests.removeValue(forKey: requestId) else {
+    guard let requestKey = message.requestKey, let request = activeRequests.removeValue(forKey: requestKey) else {
       log("AgentRuntimeProcess: dropping unroutable result")
       return
     }
-    if (message.payload["terminalStatus"] as? String) == "cancelled" {
+    let terminalStatus = message.payload["terminalStatus"] as? String
+    if terminalStatus == "cancelled" {
       request.continuation.resume(throwing: BridgeError.stopped)
+      return
+    }
+    if let terminalStatus,
+       ["failed", "timed_out", "orphaned"].contains(terminalStatus) {
+      let failure = AgentRuntimeFailure.parse(from: message.payload["failure"])
+      let raw = failure?.displayMessage ?? message.payload["text"] as? String ?? "Agent failed"
+      log("AgentRuntimeProcess: agent result failed (raw): \(raw)")
+      request.continuation.resume(throwing: failure.map(BridgeError.agentRuntimeFailure) ?? BridgeError.agentError(raw))
       return
     }
     request.continuation.resume(returning: queryResult(from: message))
   }
 
   private func completeControlRequest(_ message: RuntimeMessage) {
-    guard let requestId = message.routingKey,
-      let request = activeControlRequests.removeValue(forKey: requestId)
+    guard let requestKey = message.requestKey,
+      let request = activeControlRequests.removeValue(forKey: requestKey)
     else {
       log("AgentRuntimeProcess: dropping unroutable control tool result")
       return
@@ -775,20 +918,21 @@ actor AgentRuntimeProcess {
   }
 
   private func failRequest(_ message: RuntimeMessage) {
-    let raw = message.payload["message"] as? String ?? "Unknown error"
-    if let requestId = message.routingKey,
-      let controlRequest = activeControlRequests.removeValue(forKey: requestId)
+    let failure = AgentRuntimeFailure.parse(from: message.payload["failure"])
+    let raw = failure?.displayMessage ?? message.payload["message"] as? String ?? "Unknown error"
+    if let requestKey = message.requestKey,
+      let controlRequest = activeControlRequests.removeValue(forKey: requestKey)
     {
       log("AgentRuntimeProcess: control tool error (raw): \(raw)")
-      controlRequest.continuation.resume(throwing: BridgeError.agentError(raw))
+      controlRequest.continuation.resume(throwing: failure.map(BridgeError.agentRuntimeFailure) ?? BridgeError.agentError(raw))
       return
     }
-    guard let requestId = message.routingKey, let request = activeRequests.removeValue(forKey: requestId) else {
+    guard let requestKey = message.requestKey, let request = activeRequests.removeValue(forKey: requestKey) else {
       log("AgentRuntimeProcess: dropping unroutable error")
       return
     }
     log("AgentRuntimeProcess: agent error (raw): \(raw)")
-    request.continuation.resume(throwing: BridgeError.agentError(raw))
+    request.continuation.resume(throwing: failure.map(BridgeError.agentRuntimeFailure) ?? BridgeError.agentError(raw))
   }
 
   private func queryResult(from message: RuntimeMessage) -> AgentBridge.QueryResult {
@@ -912,6 +1056,13 @@ actor AgentRuntimeProcess {
     stdinPipe = nil
     stdoutPipe = nil
     stderrPipe = nil
+    stdoutLineBuffer.removeAll(keepingCapacity: false)
+    // Advance the generation so that any readability callback that already
+    // captured the old generation is rejected by the generation guard in
+    // processStdoutData(_:generation:) the moment it fires. Without this, a
+    // callback that read an old init/result line can run during the awaits in
+    // startProcess with the still-current generation and mutate stale state.
+    processGeneration &+= 1
   }
 
   static func defaultStateDirectory(

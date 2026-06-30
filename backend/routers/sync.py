@@ -3,9 +3,7 @@ import contextlib
 import io
 import logging
 import os
-import re
 import shutil
-import struct
 import threading
 import time
 import uuid as _uuid
@@ -20,24 +18,15 @@ import httpx
 from utils.executors import (
     critical_executor,
     db_executor,
-    postprocess_executor,
     storage_executor,
     sync_executor,
     run_blocking,
     start_background_task,
-    submit_with_context,
 )
 
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query, Header, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
-try:
-    from opuslib import Decoder
-except Exception as e:
-    Decoder = None
-    _OPUS_IMPORT_ERROR = e
-else:
-    _OPUS_IMPORT_ERROR = None
 from pydub import AudioSegment
 
 from database import conversations as conversations_db
@@ -71,19 +60,11 @@ from utils.other.storage import (
     schedule_syncing_temporal_file_deletion,
     upload_syncing_temporal_file,
     download_syncing_temporal_file,
-    download_audio_chunks_and_merge,
-    get_or_create_merged_audio,
-    get_merged_audio_signed_url,
-    download_legacy_merged_wav,
     get_playback_artifact_signed_url,
-    download_playback_artifact,
     upload_playback_artifact,
     mark_playback_unavailable,
-    is_playback_unavailable,
-    enqueue_conversation_audio_merge,
     upload_audio_chunk,
     precache_conversation_audio,
-    _PRECACHE_FILE_SEM,
 )
 
 from utils import encryption
@@ -91,20 +72,20 @@ from utils.byok import get_byok_keys, set_byok_keys, has_byok_keys
 from utils.cloud_tasks import (
     enqueue_sync_job,
     get_sync_tasks_max_attempts,
-    is_audio_merge_dispatch_enabled,
     is_cloud_tasks_dispatch_enabled,
     verify_cloud_tasks_oidc,
 )
 from utils.http_client import _get_semaphore
 from utils.log_sanitizer import sanitize
-from utils.request_validation import parse_sync_filename_timestamp
+from utils.sync import playback as sync_playback
+from utils.sync.files import decode_files_to_wav, get_timestamp_from_path, get_wav_duration, retrieve_file_paths
 from utils.stt.pre_recorded import postprocess_words, prerecorded
 from utils.stt.vad import vad_is_empty
 from utils.fair_use import (
     record_speech_ms,
     get_rolling_speech_ms,
     check_soft_caps,
-    is_hard_restricted,
+    get_hard_restriction_status,
     trigger_classifier_if_needed,
     is_dg_budget_exhausted,
     get_enforcement_stage,
@@ -131,104 +112,11 @@ _V1_DEPRECATION_HEADERS = {'Deprecation': 'true', 'Link': '</v2/sync-local-files
 router = APIRouter()
 
 
-def _get_opus_decoder_class():
-    if Decoder is None:
-        raise RuntimeError(
-            'Opus sync decoding requires opuslib and the native libopus library. '
-            'Install the OS-level Opus package before processing .opus sync files.'
-        ) from _OPUS_IMPORT_ERROR
-    return Decoder
-
-
-# **********************************************
-# ******** AUDIO FORMAT CONVERSION *************
-# **********************************************
-
-
-def pcm_to_wav(pcm_data: bytes, sample_rate: int = 16000, channels: int = 1, sample_width: int = 2) -> bytes:
-    """Convert raw PCM data to WAV format."""
-    wav_buffer = io.BytesIO()
-    with wave.open(wav_buffer, 'wb') as wav_file:
-        wav_file.setnchannels(channels)
-        wav_file.setsampwidth(sample_width)
-        wav_file.setframerate(sample_rate)
-        wav_file.writeframes(pcm_data)
-    return wav_buffer.getvalue()
-
-
-def parse_range_header(range_header: str, file_size: int) -> tuple[int, int] | None:
-    """
-    Parse HTTP Range header and return (start, end) tuple.
-    Returns None if the range is invalid.
-
-    Example: "bytes=0-1023" -> (0, 1023)
-    """
-    if not range_header:
-        return None
-
-    try:
-        # Parse "bytes=start-end" format
-        if not range_header.startswith("bytes="):
-            return None
-
-        range_spec = range_header[6:]
-        parts = range_spec.split("-")
-
-        if len(parts) != 2:
-            return None
-
-        start_str, end_str = parts
-
-        # Handle "bytes=start-" (from start to end of file)
-        if start_str and not end_str:
-            start = int(start_str)
-            end = file_size - 1
-        # Handle "bytes=-suffix" (last N bytes)
-        elif not start_str and end_str:
-            suffix_length = int(end_str)
-            start = max(0, file_size - suffix_length)
-            end = file_size - 1
-        # Handle "bytes=start-end"
-        else:
-            start = int(start_str)
-            end = int(end_str)
-
-        # RFC 7233: start must be valid, end can exceed file size and gets clamped
-        if start < 0 or start >= file_size or start > end:
-            return None
-        end = min(end, file_size - 1)
-        return (start, end)
-    except (ValueError, IndexError):
-        return None
-
-
-# **********************************************
-# ********** AUDIO PRE-CACHING *****************
-# **********************************************
-
-
-def _precache_audio_file(
-    uid: str, conversation_id: str, audio_file: dict, fill_gaps: bool = True, caller: str = 'precache_endpoint'
-):
-    """Pre-cache a single audio file."""
-    try:
-        audio_file_id = audio_file.get('id')
-        timestamps = audio_file.get('chunk_timestamps')
-        if not audio_file_id or not timestamps:
-            return
-
-        get_or_create_merged_audio(
-            uid=uid,
-            conversation_id=conversation_id,
-            audio_file_id=audio_file_id,
-            timestamps=timestamps,
-            pcm_to_wav_func=pcm_to_wav,
-            fill_gaps=fill_gaps,
-            sample_rate=AUDIO_SAMPLE_RATE,
-            caller=caller,
-        )
-    except Exception as e:
-        logger.error(f"Error pre-caching audio file {audio_file.get('id')}: {e}")
+def _hard_restriction_headers(retry_after: int | None, base_headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    headers = dict(base_headers or {})
+    if retry_after is not None:
+        headers['Retry-After'] = str(retry_after)
+    return headers
 
 
 @router.post("/v1/sync/audio/{conversation_id}/precache", tags=['v1'])
@@ -246,101 +134,7 @@ def precache_conversation_audio_endpoint(
     if conversation.get('is_locked', False):
         raise HTTPException(status_code=402, detail="A paid plan is required to access this conversation.")
 
-    audio_files = conversation.get('audio_files', [])
-    if not audio_files:
-        return {"status": "no_audio", "message": "No audio files in conversation"}
-
-    if is_audio_merge_dispatch_enabled():
-        enqueue_conversation_audio_merge(uid, conversation_id, audio_files, caller='precache_endpoint')
-        return {"status": "started", "audio_file_count": len(audio_files)}
-
-    # Start background parallel pre-caching with bounded concurrency (#7387)
-    def _precache_all_parallel():
-        logger.info(f"Pre-caching all {len(audio_files)} audio files for conversation {conversation_id} (parallel)")
-        futures = []
-        for af in audio_files:
-            _PRECACHE_FILE_SEM.acquire()
-            try:
-                f = submit_with_context(
-                    storage_executor, _precache_audio_file, uid, conversation_id, af, caller='precache_endpoint'
-                )
-                f.add_done_callback(lambda _: _PRECACHE_FILE_SEM.release())
-                futures.append(f)
-            except Exception:
-                _PRECACHE_FILE_SEM.release()
-                raise
-        for future in futures:
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Error in parallel precache: {e}")
-        logger.info(f"Completed pre-cache for conversation {conversation_id}")
-
-    submit_with_context(postprocess_executor, _precache_all_parallel)
-
-    return {"status": "started", "audio_file_count": len(audio_files)}
-
-
-AUDIO_URLS_POLL_AFTER_MS = 3000
-
-
-def _get_audio_urls_via_artifacts(uid: str, conversation_id: str, audio_files: list) -> dict:
-    """Artifact-backed /urls: a pure metadata read that never merges in-request.
-
-    Cached = a playback MP3 artifact (or legacy unexpired WAV cache) exists.
-    Everything else is reported pending and enqueued as an audio-merge task
-    (named-task deduped); the app polls until cached.
-    """
-    result = []
-    to_enqueue = []
-    for af in audio_files:
-        audio_file_id = af.get('id')
-        if not audio_file_id:
-            continue
-
-        signed_url = get_playback_artifact_signed_url(uid, conversation_id, audio_file_id)
-        content_type = 'audio/mpeg' if signed_url else None
-        if not signed_url:
-            signed_url = get_merged_audio_signed_url(uid, conversation_id, audio_file_id)
-            content_type = 'audio/wav' if signed_url else None
-
-        if signed_url:
-            result.append(
-                {
-                    "id": audio_file_id,
-                    "status": "cached",
-                    "signed_url": signed_url,
-                    "content_type": content_type,
-                    "duration": af.get('duration', 0),
-                }
-            )
-        elif is_playback_unavailable(uid, conversation_id, audio_file_id):
-            result.append(
-                {
-                    "id": audio_file_id,
-                    "status": "unavailable",
-                    "signed_url": None,
-                    "duration": af.get('duration', 0),
-                }
-            )
-        else:
-            result.append(
-                {
-                    "id": audio_file_id,
-                    "status": "pending",
-                    "signed_url": None,
-                    "duration": af.get('duration', 0),
-                }
-            )
-            to_enqueue.append(af)
-
-    if to_enqueue:
-        enqueue_conversation_audio_merge(uid, conversation_id, to_enqueue, caller='sync_urls')
-
-    return {
-        "audio_files": result,
-        "poll_after_ms": AUDIO_URLS_POLL_AFTER_MS if to_enqueue else None,
-    }
+    return sync_playback.precache_audio_files(uid, conversation_id, conversation.get('audio_files', []))
 
 
 @router.get("/v1/sync/audio/{conversation_id}/urls", tags=['v1'])
@@ -362,95 +156,7 @@ def get_audio_signed_urls_endpoint(
     if conversation.get('is_locked', False):
         raise HTTPException(status_code=402, detail="A paid plan is required to access this conversation.")
 
-    audio_files = conversation.get('audio_files', [])
-    if not audio_files:
-        return {"audio_files": []}
-
-    if is_audio_merge_dispatch_enabled():
-        return _get_audio_urls_via_artifacts(uid, conversation_id, audio_files)
-
-    result = []
-    uncached_files = []
-    first_uncached_handled = False
-
-    for af in audio_files:
-        audio_file_id = af.get('id')
-        if not audio_file_id:
-            continue
-
-        signed_url = get_merged_audio_signed_url(uid, conversation_id, audio_file_id)
-
-        if signed_url:
-            result.append(
-                {
-                    "id": audio_file_id,
-                    "status": "cached",
-                    "signed_url": signed_url,
-                    "duration": af.get('duration', 0),
-                }
-            )
-        else:
-            # First uncached file: cache synchronously for immediate playback
-            if not first_uncached_handled:
-                first_uncached_handled = True
-                _precache_audio_file(uid, conversation_id, af, caller='sync_urls_first')
-                # Get signed URL after caching
-                signed_url = get_merged_audio_signed_url(uid, conversation_id, audio_file_id)
-                if signed_url:
-                    result.append(
-                        {
-                            "id": audio_file_id,
-                            "status": "cached",
-                            "signed_url": signed_url,
-                            "duration": af.get('duration', 0),
-                        }
-                    )
-                else:
-                    # Cache failed, return pending
-                    result.append(
-                        {
-                            "id": audio_file_id,
-                            "status": "pending",
-                            "signed_url": None,
-                            "duration": af.get('duration', 0),
-                        }
-                    )
-            else:
-                result.append(
-                    {
-                        "id": audio_file_id,
-                        "status": "pending",
-                        "signed_url": None,
-                        "duration": af.get('duration', 0),
-                    }
-                )
-                uncached_files.append(af)
-
-    # Cache remaining files in background
-    if uncached_files:
-
-        def _cache_uncached_parallel():
-            futures = []
-            for af in uncached_files:
-                _PRECACHE_FILE_SEM.acquire()
-                try:
-                    f = submit_with_context(
-                        storage_executor, _precache_audio_file, uid, conversation_id, af, caller='sync_urls_bg'
-                    )
-                    f.add_done_callback(lambda _: _PRECACHE_FILE_SEM.release())
-                    futures.append(f)
-                except Exception:
-                    _PRECACHE_FILE_SEM.release()
-                    raise
-            for future in futures:
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Error in parallel cache: {e}")
-
-        submit_with_context(postprocess_executor, _cache_uncached_parallel)
-
-    return {"audio_files": result}
+    return sync_playback.get_audio_signed_urls(uid, conversation_id, conversation.get('audio_files', []))
 
 
 # **********************************************
@@ -499,312 +205,12 @@ def download_audio_file_endpoint(
     if not audio_file:
         raise HTTPException(status_code=404, detail="Audio file not found in conversation")
 
-    # Get audio data - use cache if available, otherwise merge and cache
-    try:
-        if not audio_file.get('chunk_timestamps'):
-            raise HTTPException(status_code=500, detail="Audio file has no chunk timestamps")
-
-        if format == "wav" and is_audio_merge_dispatch_enabled():
-            # Artifact-backed mode: serve only prebuilt audio, never merge
-            # in-request. On miss, enqueue the merge task and tell the client
-            # to poll /urls (old app versions hit this path uncached and get
-            # a fast 202 instead of the inline merge that used to time out).
-            audio_data = download_playback_artifact(uid, conversation_id, audio_file_id)
-            if audio_data is not None:
-                content_type = "audio/mpeg"
-                extension = "mp3"
-            else:
-                # Direct blob download — get_or_create_merged_audio would fall
-                # through to a full inline merge for cached blobs missing
-                # expires_at metadata, violating the no-merge guarantee.
-                legacy_data = None
-                if get_merged_audio_signed_url(uid, conversation_id, audio_file_id):
-                    legacy_data = download_legacy_merged_wav(uid, conversation_id, audio_file_id)
-                if legacy_data is not None:
-                    audio_data = legacy_data
-                    content_type = "audio/wav"
-                    extension = "wav"
-                else:
-                    enqueue_conversation_audio_merge(uid, conversation_id, [audio_file], caller='sync_download')
-                    return JSONResponse(
-                        status_code=202,
-                        content={"status": "pending", "poll_after_ms": AUDIO_URLS_POLL_AFTER_MS},
-                    )
-        elif format == "wav":
-            audio_data, was_cached = get_or_create_merged_audio(
-                uid=uid,
-                conversation_id=conversation_id,
-                audio_file_id=audio_file_id,
-                timestamps=audio_file['chunk_timestamps'],
-                pcm_to_wav_func=pcm_to_wav,
-                fill_gaps=True,
-                sample_rate=AUDIO_SAMPLE_RATE,
-                caller='sync_download',
-            )
-            content_type = "audio/wav"
-            extension = "wav"
-        else:
-            audio_data = download_audio_chunks_and_merge(
-                uid, conversation_id, audio_file['chunk_timestamps'], fill_gaps=True, sample_rate=AUDIO_SAMPLE_RATE
-            )
-            content_type = "application/octet-stream"
-            extension = "pcm"
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Audio chunks not found in storage")
-    except Exception as e:
-        logger.error(f"Error downloading audio file: {e}")
-        raise HTTPException(status_code=500, detail="Failed to download audio file")
-
-    # Create descriptive filename
-    filename = f"conversation_{conversation_id}_audio_{audio_file_id}.{extension}"
-    file_size = len(audio_data)
-
-    base_headers = {
-        "Content-Disposition": f"attachment; filename={filename}",
-        "Accept-Ranges": "bytes",
-        "Cache-Control": "public, max-age=3600",
-    }
-
-    range_header = request.headers.get("Range")
-
-    if range_header:
-        # Parse the range request
-        range_tuple = parse_range_header(range_header, file_size)
-
-        if range_tuple is None:
-            return Response(
-                status_code=416,
-                headers={
-                    "Content-Range": f"bytes */{file_size}",
-                    **base_headers,
-                },
-            )
-
-        start, end = range_tuple
-        content_length = end - start + 1
-
-        # Return partial content
-        return StreamingResponse(
-            io.BytesIO(audio_data[start : end + 1]),
-            status_code=206,
-            media_type=content_type,
-            headers={
-                "Content-Length": str(content_length),
-                "Content-Range": f"bytes {start}-{end}/{file_size}",
-                **base_headers,
-            },
-        )
-
-    return StreamingResponse(
-        io.BytesIO(audio_data),
-        status_code=200,
-        media_type=content_type,
-        headers={
-            "Content-Length": str(file_size),
-            **base_headers,
-        },
-    )
+    return sync_playback.download_audio_file_response(uid, conversation_id, audio_file_id, audio_file, request, format)
 
 
 # **********************************************
 # ************ SYNC LOCAL FILES ****************
 # **********************************************
-
-
-def decode_opus_file_to_wav(opus_file_path, wav_file_path, sample_rate=16000, channels=1, frame_size: int = 160):
-    """Decode an Opus file with length-prefixed frames to WAV format.
-
-    Writes directly to WAV file to avoid accumulating all PCM data in memory.
-    """
-    if not os.path.exists(opus_file_path):
-        logger.warning(f"File not found: {sanitize(opus_file_path)}")
-        return False
-
-    decoder = _get_opus_decoder_class()(sample_rate, channels)
-    frame_count = 0
-
-    try:
-        with open(opus_file_path, 'rb') as f, wave.open(wav_file_path, 'wb') as wav_file:
-            wav_file.setnchannels(channels)
-            wav_file.setsampwidth(2)  # 16-bit audio
-            wav_file.setframerate(sample_rate)
-
-            while True:
-                length_bytes = f.read(4)
-                if not length_bytes:
-                    logger.info("End of file reached.")
-                    break
-                if len(length_bytes) < 4:
-                    logger.info("Incomplete length prefix at the end of the file.")
-                    break
-
-                frame_length = struct.unpack('<I', length_bytes)[0]
-                opus_data = f.read(frame_length)
-                if len(opus_data) < frame_length:
-                    logger.error(f"Unexpected end of file at frame {frame_count}.")
-                    break
-                try:
-                    pcm_frame = decoder.decode(opus_data, frame_size=frame_size)
-                    wav_file.writeframes(pcm_frame)  # Write directly to file
-                    frame_count += 1
-                except Exception as e:
-                    logger.error(f"Error decoding frame {frame_count}: {e}")
-                    # Skip this frame instead of breaking the entire decode loop
-                    continue
-
-        if frame_count > 0:
-            logger.info(f"Decoded audio saved to {sanitize(wav_file_path)}")
-            return True
-        else:
-            logger.info("No PCM data was decoded.")
-            # Clean up empty/invalid wav file
-            if os.path.exists(wav_file_path):
-                os.remove(wav_file_path)
-            return False
-    except Exception as e:
-        logger.error(f"Error during decode: {e}")
-        # Clean up on error
-        if os.path.exists(wav_file_path):
-            os.remove(wav_file_path)
-        return False
-
-
-def get_timestamp_from_path(path: str):
-    return parse_sync_filename_timestamp(path)
-
-
-def retrieve_file_paths(files: List[UploadFile], uid: str):
-    directory = f'syncing/{uid}/'
-    os.makedirs(directory, exist_ok=True)
-    paths = []
-    for file in files:
-        filename = file.filename
-        # Validate the file is .bin and contains a _$timestamp.bin, if not, 400 bad request
-        if not filename:
-            raise HTTPException(status_code=400, detail='Uploaded file is missing a filename')
-        if not filename.endswith('.bin'):
-            raise HTTPException(status_code=400, detail=f"Invalid file format {filename}")
-        if '_' not in filename:
-            raise HTTPException(status_code=400, detail=f"Invalid file format {filename}, missing timestamp")
-        try:
-            timestamp = get_timestamp_from_path(filename)
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid file format {filename}, invalid timestamp")
-
-        path = f"{directory}{filename}"
-        try:
-            with open(path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            paths.append(path)
-        except Exception as e:
-            if os.path.exists(path):
-                os.remove(path)
-            raise HTTPException(status_code=500, detail=f"Failed to write file {filename}: {str(e)}")
-    return paths
-
-
-def get_wav_duration(wav_path: str) -> float:
-    """Get WAV file duration without loading entire file into memory."""
-    try:
-        with wave.open(wav_path, 'rb') as wav_file:
-            frames = wav_file.getnframes()
-            rate = wav_file.getframerate()
-            return frames / float(rate)
-    except Exception as e:
-        logger.error(f"Error reading WAV duration: {e}")
-        return 0.0
-
-
-def decode_pcm_file_to_wav(pcm_file_path, wav_file_path, sample_rate=16000, channels=1, sample_width=2):
-    """Decode a length-prefixed PCM .bin file to WAV.
-
-    The file format is: [4-byte uint32 frame_length][frame_bytes] repeated.
-    Each frame contains raw PCM samples (no encoding).
-    sample_width: 2 for pcm16, 1 for pcm8.
-    """
-    try:
-        pcm_data = bytearray()
-        with open(pcm_file_path, 'rb') as f:
-            while True:
-                length_bytes = f.read(4)
-                if not length_bytes or len(length_bytes) < 4:
-                    break
-                frame_length = struct.unpack('<I', length_bytes)[0]
-                if frame_length == 0 or frame_length > 65536:
-                    logger.warning(f"PCM decode: suspicious frame length {frame_length}, skipping rest")
-                    break
-                frame_data = f.read(frame_length)
-                if len(frame_data) < frame_length:
-                    break
-                pcm_data.extend(frame_data)
-
-        if not pcm_data:
-            logger.info(f"PCM decode: no data in {pcm_file_path}")
-            return False
-
-        wav_data = pcm_to_wav(bytes(pcm_data), sample_rate=sample_rate, channels=channels, sample_width=sample_width)
-        with open(wav_file_path, 'wb') as f:
-            f.write(wav_data)
-        return True
-    except Exception as e:
-        logger.error(f"PCM decode failed for {pcm_file_path}: {e}")
-        return False
-
-
-def _is_pcm_codec(filename: str) -> bool:
-    """Check if the filename indicates a PCM codec (pcm8 or pcm16)."""
-    return '_pcm16_' in filename or '_pcm8_' in filename
-
-
-def decode_files_to_wav(files_path: List[str]):
-    wav_files = []
-    for path in files_path:
-        wav_path = path.replace('.bin', '.wav')
-        filename = os.path.basename(path)
-        frame_size = 160  # Default frame size
-        match = re.search(r'_fs(\d+)', filename)
-        if match:
-            try:
-                frame_size = int(match.group(1))
-                logger.info(f"Found frame size {frame_size} in filename: {filename}")
-            except ValueError:
-                logger.error(f"Invalid frame size format in filename: {filename}, using default {frame_size}")
-
-        # Detect codec from filename: PCM files need different decoding than Opus
-        if _is_pcm_codec(filename):
-            # Parse sample rate from filename: audio_{device}_{codec}_{sampleRate}_{channel}_...
-            sample_rate_match = re.search(r'_pcm(?:8|16)_(\d+)_', filename)
-            sample_rate = (
-                int(sample_rate_match.group(1)) if sample_rate_match else (16000 if '_pcm16_' in filename else 8000)
-            )
-            sample_width = 1 if '_pcm8_' in filename else 2
-            success = decode_pcm_file_to_wav(path, wav_path, sample_rate=sample_rate, sample_width=sample_width)
-        else:
-            success = decode_opus_file_to_wav(path, wav_path, frame_size=frame_size)
-
-        if not success:
-            # Clean up .bin file even on decode failure
-            if os.path.exists(path):
-                os.remove(path)
-            continue
-
-        # Always remove .bin file after decode attempt
-        if os.path.exists(path):
-            os.remove(path)
-
-        # Check duration without loading entire file into memory
-        duration = get_wav_duration(wav_path)
-        if duration == 0:
-            # Invalid WAV file
-            if os.path.exists(wav_path):
-                os.remove(wav_path)
-            raise HTTPException(status_code=400, detail=f"Invalid file format {path}")
-
-        if duration < 1:
-            os.remove(wav_path)
-            continue
-        wav_files.append(wav_path)
-    return wav_files
 
 
 # Max length of a single VAD segment / STT transcribe request. Bounds GPU memory on the
@@ -1232,6 +638,7 @@ def process_segment(
                 transcript_segments=transcript_segments,
                 source=source,
                 is_locked=is_locked,
+                private_cloud_sync_enabled=private_cloud_sync_enabled,
             )
             created = process_conversation(uid, language, create_memory)
             with lock:
@@ -1419,11 +826,12 @@ async def sync_local_files(
     response.headers.update(_V1_DEPRECATION_HEADERS)
 
     # Pre-check gates (#5854)
-    if is_hard_restricted(uid):
+    hard_restricted, retry_after = get_hard_restriction_status(uid)
+    if hard_restricted:
         raise HTTPException(
             status_code=429,
             detail="Account temporarily restricted due to fair-use policy",
-            headers=_V1_DEPRECATION_HEADERS,
+            headers=_hard_restriction_headers(retry_after, _V1_DEPRECATION_HEADERS),
         )
 
     # Check credits: if exhausted, still process but lock the conversation so user can pay to unlock
@@ -1518,6 +926,14 @@ async def sync_local_files(
 
         # Fetch user transcription preferences once before spawning threads
         transcription_prefs = await run_blocking(db_executor, users_db.get_user_transcription_preferences, uid)
+        private_cloud_sync_enabled = bool(
+            await run_blocking(db_executor, users_db.get_user_private_cloud_sync_enabled, uid)
+        )
+        data_protection_level = (
+            await run_blocking(db_executor, users_db.get_data_protection_level, uid)
+            if private_cloud_sync_enabled
+            else None
+        )
 
         # Build speaker embeddings cache once for all segments (voice + text identification)
         try:
@@ -1549,12 +965,16 @@ async def sync_local_files(
                     person_embeddings_cache,
                     conversation_id,
                     assignment_turnstile,
+                    private_cloud_sync_enabled=private_cloud_sync_enabled,
+                    data_protection_level=data_protection_level,
                 )
                 for path in ordered_paths
             ]
         )
 
         await run_blocking(sync_executor, _reprocess_merged_conversations, uid, response)
+        if private_cloud_sync_enabled:
+            await run_blocking(sync_executor, _finalize_sync_audio_files, uid, response)
 
         # Record DG usage after successful processing (not before, to avoid charging on retries)
         if fair_use_restrict_dg:
@@ -1825,8 +1245,8 @@ async def _run_full_pipeline_background_async(
             # --- Phase 4: Fetch prefs & embeddings ---
             transcription_prefs = await run_blocking(db_executor, users_db.get_user_transcription_preferences, uid)
             # Mirror realtime: store conversation audio only when private cloud sync is on.
-            private_cloud_sync_enabled = await run_blocking(
-                db_executor, users_db.get_user_private_cloud_sync_enabled, uid
+            private_cloud_sync_enabled = bool(
+                await run_blocking(db_executor, users_db.get_user_private_cloud_sync_enabled, uid)
             )
             data_protection_level = (
                 await run_blocking(db_executor, users_db.get_data_protection_level, uid)
@@ -1881,8 +1301,8 @@ async def _run_full_pipeline_background_async(
                     person_embeddings_cache,
                     target_conversation_id,
                     assignment_turnstile,
-                    private_cloud_sync_enabled,
-                    data_protection_level,
+                    private_cloud_sync_enabled=private_cloud_sync_enabled,
+                    data_protection_level=data_protection_level,
                 )
                 if ok and task_mode:
                     add_processed_segment(job_id, path)
@@ -2038,8 +1458,14 @@ async def sync_local_files_v2(
     an async background task. The app polls GET /v2/sync-local-files/{job_id}.
     """
     # Pre-check gates (same as v1)
-    if await run_blocking(critical_executor, is_hard_restricted, uid):
-        raise HTTPException(status_code=429, detail="Account temporarily restricted due to fair-use policy")
+    hard_restricted, retry_after = await run_blocking(critical_executor, get_hard_restriction_status, uid)
+    if hard_restricted:
+        headers = _hard_restriction_headers(retry_after)
+        raise HTTPException(
+            status_code=429,
+            detail="Account temporarily restricted due to fair-use policy",
+            headers=headers,
+        )
 
     should_lock = not await run_blocking(critical_executor, has_transcription_credits, uid)
 
@@ -2249,20 +1675,6 @@ async def run_sync_job(request: Request, task_retry_count: int = Depends(verify_
         await run_blocking(db_executor, release_job_run_lock, job_id, lock_token)
 
 
-def _build_playback_artifact(uid: str, conversation_id: str, timestamps: list) -> bytes:
-    """Merge chunks (download → decrypt → decode → gap-fill) and encode MP3 ~48kbps mono."""
-    pcm_data = download_audio_chunks_and_merge(
-        uid, conversation_id, timestamps, fill_gaps=True, sample_rate=AUDIO_SAMPLE_RATE
-    )
-    if not pcm_data:
-        return b''
-    segment = AudioSegment(data=pcm_data, sample_width=2, frame_rate=AUDIO_SAMPLE_RATE, channels=1)
-    del pcm_data
-    buf = io.BytesIO()
-    segment.export(buf, format='mp3', bitrate='48k')
-    return buf.getvalue()
-
-
 @router.post("/v2/audio-merge-jobs/run", include_in_schema=False)
 async def run_audio_merge_job(request: Request, task_retry_count: int = Depends(verify_cloud_tasks_oidc)):
     """Cloud Tasks handler: build one playback MP3 artifact inside the request.
@@ -2295,7 +1707,9 @@ async def run_audio_merge_job(request: Request, task_retry_count: int = Depends(
             return JSONResponse(status_code=200, content={'status': 'exists'})
 
         try:
-            mp3_data = await run_blocking(sync_executor, _build_playback_artifact, uid, conversation_id, timestamps)
+            mp3_data = await run_blocking(
+                sync_executor, sync_playback.build_playback_artifact, uid, conversation_id, timestamps
+            )
         except FileNotFoundError:
             logger.warning(f'audio_merge: chunks missing conv={conversation_id} file={audio_file_id}, dropping')
             # Persist the verdict or /urls reports pending forever and clients

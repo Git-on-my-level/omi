@@ -215,7 +215,7 @@ struct AppsPage: View {
                             // Featured section (apps marked as is_popular in backend)
                             if !appProvider.popularApps.isEmpty {
                                 AppGridSection(
-                                    title: "Featured",
+                                    title: "Other",
                                     apps: Array(appProvider.popularApps.prefix(6)),
                                     appProvider: appProvider,
                                     onSelectApp: { selectedApp = $0 },
@@ -920,12 +920,6 @@ struct ImportsSection: View {
                     }
                 }
             }
-            .background(OmiColors.backgroundPrimary)
-            .cornerRadius(12)
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(OmiColors.backgroundTertiary, lineWidth: 1)
-            )
         }
     }
 }
@@ -1595,13 +1589,13 @@ struct ImportConnectorSheet: View {
     private var primaryActionTitle: String {
         switch connector.id {
         case "calendar":
-            return model.isRunning ? "Importing…" : "Connect Calendar"
+            return model.isRunning ? "Importing…" : (snapshot.isConnected ? "Sync now" : "Connect Calendar")
         case "email":
-            return model.isRunning ? "Importing…" : "Connect Gmail"
+            return model.isRunning ? "Importing…" : (snapshot.isConnected ? "Sync now" : "Connect Gmail")
         case "apple-notes":
-            return model.isRunning ? "Importing…" : "Connect Apple Notes"
+            return model.isRunning ? "Importing…" : (snapshot.isConnected ? "Sync now" : "Connect Apple Notes")
         case "x":
-            return model.isRunning ? "Connecting…" : "Connect X"
+            return model.isRunning ? "Connecting…" : (snapshot.isConnected ? "Sync now" : "Connect X")
         case "local-files":
             return model.isRunning ? "Reindexing…" : "Reindex Local Files"
         default:
@@ -2093,12 +2087,8 @@ struct AppCard: View {
                 }
             }
             .padding(14)
-            .background(isHovering ? OmiColors.backgroundSecondary : OmiColors.backgroundPrimary)
+            .background(isHovering ? OmiColors.backgroundTertiary : OmiColors.backgroundSecondary)
             .cornerRadius(12)
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(OmiColors.backgroundTertiary, lineWidth: 1)
-            )
         }
         .buttonStyle(.plain)
         .onHover { hovering in
