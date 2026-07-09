@@ -4552,6 +4552,36 @@ BROWSER TABS: when you use the browser (Playwright), on your FIRST browser actio
             toolUseId: toolUseId,
             toolName: name
         )
+        projectSpawnedAgentPillIfNeeded(toolName: name, output: output)
+    }
+
+    /// Kernel `spawn_agent` returns JSON via tool_result_display and never goes through
+    /// ChatToolExecutor's upsert path. Project the floating pill into the agent menu here.
+    private func projectSpawnedAgentPillIfNeeded(toolName: String, output: String) {
+        let cleanName: String
+        if toolName.hasPrefix("mcp__") {
+            cleanName = String(toolName.split(separator: "__").last ?? Substring(toolName))
+        } else {
+            cleanName = toolName
+        }
+        guard cleanName == "spawn_agent",
+              let parsed = SpawnAgentToolResult.parse(from: output),
+              parsed.hasProjectionIdentity
+        else { return }
+
+        let title = (parsed.title?.isEmpty == false) ? (parsed.title ?? "Background agent") : "Background agent"
+        let query = (parsed.query?.isEmpty == false) ? (parsed.query ?? title) : title
+        AgentPillsManager.shared.upsertSpawnedPill(
+            id: parsed.pillId,
+            query: query,
+            title: title,
+            sessionId: parsed.sessionId,
+            runId: parsed.runId,
+            attemptId: parsed.attemptId
+        )
+        Task { @MainActor in
+            await AgentPillsManager.shared.refreshProjectedPillsFromKernel()
+        }
     }
 
     /// When `spawn_agent` completes, append a structured `.agentSpawn` block so
@@ -4603,16 +4633,21 @@ BROWSER TABS: when you use the browser (Playwright), on your FIRST browser actio
         }
         guard !alreadyPresent else { return }
 
-        let titleFromOutput = ChatContentBlock.labeledSpawnValue(
-            in: spawnSource,
-            keys: ["title"]
-        )
+        let parsed = spawnSource.spawnAgentToolResult
+        let titleFromOutput = parsed?.title
+            ?? ChatContentBlock.labeledSpawnValue(in: spawnSource, keys: ["title"])
         let title = (titleFromOutput?.isEmpty == false)
             ? (titleFromOutput ?? "Background agent")
             : (input?.summary.isEmpty == false ? input!.summary : "Background agent")
-        let objective = (input?.details?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-            ? (input?.details ?? "")
-            : (input?.summary ?? "")
+        let objectiveFromOutput = parsed?.query
+        let objective: String
+        if let details = input?.details?.trimmingCharacters(in: .whitespacesAndNewlines), !details.isEmpty {
+            objective = details
+        } else if let objectiveFromOutput, !objectiveFromOutput.isEmpty {
+            objective = objectiveFromOutput
+        } else {
+            objective = input?.summary ?? ""
+        }
 
         let spawnBlock = ChatContentBlock.agentSpawn(
             id: UUID().uuidString,
