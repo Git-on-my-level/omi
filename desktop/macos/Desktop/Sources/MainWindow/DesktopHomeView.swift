@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import OmiTheme
 
 // MARK: - NSHostingView sizingOptions access
 
@@ -17,11 +18,11 @@ struct DesktopHomeView: View {
   private let minimumWindowHeight: CGFloat = 680
   private static let pageNavigationAnimation = Animation.easeOut(duration: 0.08)
 
-  @StateObject private var appState = AppState()
+  @EnvironmentObject private var appState: AppState
   @StateObject private var viewModelContainer = ViewModelContainer()
   @ObservedObject private var authState = AuthState.shared
   @ObservedObject private var apiKeyService = APIKeyService.shared
-  @ObservedObject private var usageLimiter = FloatingBarUsageLimiter.shared
+  @ObservedObject private var updatePolicyManager = DesktopUpdatePolicyManager.shared
   @State private var selectedIndex: Int = {
     if OMIApp.launchMode == .rewind { return SidebarNavItem.rewind.rawValue }
     let tier = UserDefaults.standard.integer(forKey: "currentTierLevel")
@@ -40,8 +41,14 @@ struct DesktopHomeView: View {
   @State private var previousIndexBeforeSettings: Int = 0
   @State private var logoPulse = false
   @State private var lastActivationRefresh = Date.distantPast
-  // Dismiss state for the Neo "no desktop access" banner (resets each launch).
-  @State private var neoDesktopBannerDismissed = false
+  @State private var didScheduleAgentVMProvisioning = false
+  @State private var proactiveMonitoringStartGate = RetryableDelayedStartGate()
+  // Anchor for the proactive-monitoring warmup budget. Captured at view
+  // creation (≈ launch) so the delay is spent once per session, not once per
+  // trigger — see StartupWarmupPolicy.remainingProactiveAssistantsStartDelay.
+  @State private var proactiveMonitoringWarmupAnchor = Date()
+  @State private var didScheduleConversationWarmup = false
+  @State private var initialFileIndexingBackfill = DelayedFileIndexingBackfillState()
 
   // Pre-loaded hero logo to avoid NSImage init crashes during SwiftUI body evaluation
   private static let heroLogoImage: NSImage? = {
@@ -135,22 +142,33 @@ struct DesktopHomeView: View {
                 )
               }
             }
+            .overlay(alignment: .top) {
+              if let policy = updatePolicyManager.visiblePolicy, !policy.isRequired {
+                DesktopUpdatePolicyBanner(
+                  policy: policy,
+                  onDownload: { updatePolicyManager.openDownload(policy) },
+                  onDismiss: { updatePolicyManager.dismiss(policy) }
+                )
+                .padding(.top, 12)
+                .padding(.horizontal, 20)
+                .transition(.move(edge: .top).combined(with: .opacity))
+              }
+            }
             .onReceive(NotificationCenter.default.publisher(for: .showUsageLimitPopup)) { notification in
               let reason = notification.userInfo?["reason"] as? String ?? ""
               appState.triggerUsageLimitPopup(reason: reason)
             }
             .onAppear {
               log("DesktopHomeView: Showing mainContent (signed in and onboarded)")
+              updatePolicyManager.refresh(force: true)
               // Check all permissions on launch
               appState.checkAllPermissions()
 
               // For existing users who haven't indexed files yet, run a background scan
-              if !UserDefaults.standard.bool(forKey: "hasCompletedFileIndexing") {
-                UserDefaults.standard.set(true, forKey: "hasCompletedFileIndexing")
-                Task {
-                  log("DesktopHomeView: Running background file scan for existing user")
-                  await FileIndexerService.shared.backgroundRescan()
-                }
+              if !AppBuild.usesLazyDevPermissions
+                && !UserDefaults.standard.bool(forKey: "hasCompletedFileIndexing")
+              {
+                scheduleInitialFileIndexing()
               }
 
               let settings = AssistantSettings.shared
@@ -163,6 +181,7 @@ struct DesktopHomeView: View {
                   appState.startTranscription()
                 } else {
                   log("DesktopHomeView: Deferring transcription — API keys not yet loaded")
+                  Task { await APIKeyService.shared.waitForKeys() }
                 }
               } else if !settings.transcriptionEnabled {
                 log("DesktopHomeView: Transcription disabled in settings, skipping auto-start")
@@ -189,15 +208,7 @@ struct DesktopHomeView: View {
               // If API keys aren't loaded yet, this may fail — onChange below retries.
               if settings.screenAnalysisEnabled {
                 if APIKeyService.keysAvailable {
-                  ProactiveAssistantsPlugin.shared.startMonitoring { success, error in
-                    if success {
-                      log("DesktopHomeView: Screen analysis started")
-                    } else {
-                      log(
-                        "DesktopHomeView: Screen analysis failed to start: \(error ?? "unknown") — setting remains enabled for next launch"
-                      )
-                    }
-                  }
+                  scheduleProactiveMonitoringStart(reason: "launch")
                 } else {
                   log(
                     "DesktopHomeView: Deferring screen analysis — API keys not yet loaded"
@@ -207,15 +218,18 @@ struct DesktopHomeView: View {
                 log("DesktopHomeView: Screen analysis disabled in settings, skipping auto-start")
               }
 
-              // Start Crisp chat in background for notifications
-              CrispManager.shared.start()
+              // Start Crisp chat in background for notifications, scoped to the signed-in user
+              CrispManager.shared.start(
+                initialPollDelay: StartupWarmupPolicy.crispInitialPollDelay,
+                sessionUserId: UserDefaults.standard.string(forKey: "auth_userId")
+              )
 
-              // Set up floating control bar (only show if user hasn't disabled it)
+              // Set up floating control bar. Product invariant: normal signed-in
+              // launches must show the enabled bar immediately; hide-until-PTT is
+              // only for explicit onboarding/demo/minimal-mode contexts.
               FloatingControlBarManager.shared.setup(
                 appState: appState, chatProvider: viewModelContainer.chatProvider)
-              if FloatingControlBarManager.shared.isEnabled {
-                FloatingControlBarManager.shared.show()
-              }
+              FloatingControlBarManager.shared.presentForLaunch(context: .normalSignedInDesktop)
 
               // Set up push-to-talk voice input
               if let barState = FloatingControlBarManager.shared.barState {
@@ -224,14 +238,9 @@ struct DesktopHomeView: View {
             }
             .task {
               // Trigger eager data loading when main content appears
-              // Load conversations/folders in parallel with other data
-              async let vmLoad: Void = viewModelContainer.loadAllData()
-              async let conversations: Void = appState.loadConversations()
-              async let folders: Void = appState.loadFolders()
-              _ = await (vmLoad, conversations, folders)
-
-              // Backend-based check: ensure user has a cloud agent VM
-              await AgentVMService.shared.ensureProvisioned()
+              await viewModelContainer.loadAllData()
+              scheduleConversationWarmup()
+              scheduleAgentVMProvisioning()
             }
             // Refresh conversations when app becomes active (e.g. switching back from another app)
             .onReceive(
@@ -243,6 +252,7 @@ struct DesktopHomeView: View {
                 lastActivationRefresh = now
                 Task { await appState.refreshConversations() }
               }
+              updatePolicyManager.refresh()
               // Auto-start monitoring when returning to app if screen analysis is enabled
               // but monitoring is not running. Handles the case where the user granted
               // screen recording permission in System Settings and switched back.
@@ -250,12 +260,12 @@ struct DesktopHomeView: View {
               if AssistantSettings.shared.screenAnalysisEnabled && !plugin.isMonitoring {
                 plugin.refreshScreenRecordingPermission()
                 if plugin.hasScreenRecordingPermission {
-                  log("DesktopHomeView: Permission available on app active — starting monitoring")
-                  plugin.startMonitoring { _, _ in }
+                  log("DesktopHomeView: Permission available on app active — scheduling monitoring")
+                  scheduleProactiveMonitoringStart(reason: "app active")
                 }
               }
             }
-            .onChange(of: apiKeyService.isLoaded) { loaded in
+            .onChange(of: apiKeyService.isLoaded) { _, loaded in
               guard loaded else { return }
               log("DesktopHomeView: API keys loaded — retrying deferred services")
               // Retry transcription
@@ -266,15 +276,7 @@ struct DesktopHomeView: View {
               // Retry screen analysis
               let plugin = ProactiveAssistantsPlugin.shared
               if AssistantSettings.shared.screenAnalysisEnabled && !plugin.isMonitoring {
-                plugin.startMonitoring { success, error in
-                  if success {
-                    log("DesktopHomeView: Screen analysis started (after key load)")
-                  } else {
-                    log(
-                      "DesktopHomeView: Screen analysis retry failed: \(error ?? "unknown")"
-                    )
-                  }
-                }
+                scheduleProactiveMonitoringStart(reason: "key load")
               }
             }
             // Cmd+R: refresh all data (conversations, chat, tasks, memories)
@@ -290,6 +292,16 @@ struct DesktopHomeView: View {
               log(
                 "DesktopHomeView: userDidSignOut — resetting hasCompletedOnboarding and stopping transcription"
               )
+              resetSessionScopedStartupWarmups(preserveCrispReadState: false)
+              appState.conversations = []
+              appState.folders = []
+              appState.selectedFolderId = nil
+              appState.selectedDateFilter = nil
+              appState.showStarredOnly = false
+              appState.totalConversationsCount = nil
+              appState.conversationsError = nil
+              appState.isLoadingConversations = false
+              appState.isLoadingFolders = false
               appState.hasCompletedOnboarding = false
               appState.stopTranscription()
             }
@@ -297,10 +309,15 @@ struct DesktopHomeView: View {
               log(
                 "DesktopHomeView: resetOnboardingRequested — clearing live onboarding state for current app"
               )
+              resetSessionScopedStartupWarmups(preserveCrispReadState: false)
               appState.hasCompletedOnboarding = false
               onboardingStep = 0
               onboardingJustCompleted = false
               appState.stopTranscription()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+              log("DesktopHomeView: app terminating — cancelling startup warmups")
+              resetSessionScopedStartupWarmups(preserveCrispReadState: true)
             }
             // Handle transcription toggle from menu bar
             .onReceive(NotificationCenter.default.publisher(for: .toggleTranscriptionRequested)) {
@@ -319,6 +336,7 @@ struct DesktopHomeView: View {
               while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(3 * 60 * 60))
                 guard !Task.isCancelled else { break }
+                guard !AppBuild.usesLazyDevPermissions else { continue }
                 guard UserDefaults.standard.bool(forKey: "hasCompletedFileIndexing") else {
                   continue
                 }
@@ -363,6 +381,17 @@ struct DesktopHomeView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(OmiColors.backgroundPrimary)
             .transition(.opacity.animation(.easeOut(duration: 0.3)))
+          }
+
+          if let policy = updatePolicyManager.visiblePolicy, policy.isRequired {
+            Color.black.opacity(0.62)
+              .ignoresSafeArea()
+              .zIndex(20)
+            DesktopRequiredUpdatePrompt(
+              policy: policy,
+              onDownload: { updatePolicyManager.openDownload(policy) }
+            )
+            .zIndex(21)
           }
         }
       }
@@ -546,6 +575,8 @@ struct DesktopHomeView: View {
     let currentWindow = NSApp.windows.first(where: {
       $0.title.lowercased().hasPrefix("omi") && $0.isVisible
     })
+    let onDashboard = selectedIndex == SidebarNavItem.dashboard.rawValue
+    let priorHomeMode = DesktopAutomationStateStore.shared.current().homeMode
     let snapshot = DesktopAutomationSnapshot(
       bridgeEnabled: true,
       bridgePort: DesktopAutomationLaunchOptions.port,
@@ -556,6 +587,7 @@ struct DesktopHomeView: View {
       selectedSettingsSection: isInSettings ? selectedSettingsSection.rawValue : nil,
       highlightedSettingId: highlightedSettingId,
       usesLegacyHomeDesign: useLegacyHomeDesign,
+      homeMode: onDashboard && !useLegacyHomeDesign ? (priorHomeMode ?? "hub") : nil,
       showsPrimarySidebar: showsPrimarySidebar,
       isSidebarCollapsed: isSidebarCollapsed,
       hasCompletedOnboarding: appState.hasCompletedOnboarding,
@@ -567,6 +599,9 @@ struct DesktopHomeView: View {
       askOmiOpen: FloatingControlBarManager.shared.automationState.isAskOmiOpen,
       askOmiFocused: FloatingControlBarManager.shared.automationState.isAskOmiFocused,
       floatingBarFrame: FloatingControlBarManager.shared.automationState.frame,
+      floatingBarVoiceListening: FloatingControlBarManager.shared.automationState.isVoiceListening,
+      floatingBarVoiceResponseActive: FloatingControlBarManager.shared.automationState.isVoiceResponseActive,
+      floatingBarUsesNotchIsland: FloatingControlBarManager.shared.automationState.usesNotchIsland,
       updatedAt: ISO8601DateFormatter().string(from: Date())
     )
 
@@ -588,10 +623,15 @@ struct DesktopHomeView: View {
       }
     }
 
-    if let sectionRaw = settingsSectionRaw,
-      let section = SettingsContentView.SettingsSection(rawValue: sectionRaw)
-    {
-      selectedSettingsSection = section
+    if let sectionRaw = settingsSectionRaw {
+      // Tolerant match (SET-01): omi-ctl sends the caller's casing verbatim (docs use
+      // lowercase, raw values are Title Case), so a strict rawValue init silently left
+      // navigation on General for every sub-section command.
+      if let section = SettingsContentView.SettingsSection.automationMatch(sectionRaw) {
+        selectedSettingsSection = section
+      } else {
+        log("AutomationNavigation: unknown settings section '\(sectionRaw)'")
+      }
     }
     highlightedSettingId = settingId
 
@@ -652,6 +692,129 @@ struct DesktopHomeView: View {
       frame.size.width = saved
       window.setFrame(frame, display: true)
     }
+  }
+
+  private func resetSessionScopedStartupWarmups(preserveCrispReadState: Bool) {
+    viewModelContainer.resetStartupState()
+    didScheduleConversationWarmup = false
+    didScheduleAgentVMProvisioning = false
+    proactiveMonitoringStartGate.finishAttempt()
+    initialFileIndexingBackfill.releaseReservation()
+    CrispManager.shared.stop(preserveReadState: preserveCrispReadState)
+  }
+
+  private func scheduleAgentVMProvisioning() {
+    guard !didScheduleAgentVMProvisioning else { return }
+    didScheduleAgentVMProvisioning = true
+
+    let scheduled = viewModelContainer.scheduleSessionWarmup(
+      id: .agentVMProvisioning,
+      delay: StartupWarmupPolicy.agentVMProvisioningDelay,
+      onCancel: { didScheduleAgentVMProvisioning = false }
+    ) {
+      await AgentVMService.shared.ensureProvisioned()
+    }
+    if !scheduled { didScheduleAgentVMProvisioning = false }
+  }
+
+  private func scheduleConversationWarmup() {
+    guard !didScheduleConversationWarmup else { return }
+    didScheduleConversationWarmup = true
+
+    let scheduled = viewModelContainer.scheduleSessionWarmup(
+      id: .conversationWarmup,
+      delay: StartupWarmupPolicy.conversationWarmupDelay,
+      onCancel: { didScheduleConversationWarmup = false }
+    ) {
+      async let conversations: Void = loadConversationsIfNeeded()
+      async let folders: Void = loadFoldersIfNeeded()
+      _ = await (conversations, folders)
+    }
+    if !scheduled { didScheduleConversationWarmup = false }
+  }
+
+  private func loadConversationsIfNeeded() async {
+    guard appState.conversations.isEmpty else { return }
+    await appState.loadConversations()
+  }
+
+  private func loadFoldersIfNeeded() async {
+    guard appState.folders.isEmpty else { return }
+    await appState.loadFolders()
+  }
+
+  private func scheduleInitialFileIndexing() {
+    guard
+      initialFileIndexingBackfill.reserveIfNeeded(
+        hasCompletedBackfill: UserDefaults.standard.bool(forKey: "hasCompletedFileIndexing"))
+    else { return }
+
+    let sessionScope = StartupWarmupSessionScope(
+      userId: UserDefaults.standard.string(forKey: "auth_userId"))
+    let scheduled = viewModelContainer.scheduleSessionWarmup(
+      id: .initialFileIndexing,
+      delay: StartupWarmupPolicy.initialFileIndexingDelay,
+      onCancel: { initialFileIndexingBackfill.releaseReservation() }
+    ) {
+      log("DesktopHomeView: Running delayed background file scan for existing user")
+      await FileIndexerService.shared.backgroundRescan()
+      guard !Task.isCancelled,
+            sessionScope.matches(
+              currentUserId: UserDefaults.standard.string(forKey: "auth_userId"),
+              isSignedIn: AuthState.shared.isSignedIn)
+      else {
+        initialFileIndexingBackfill.releaseReservation()
+        return
+      }
+      initialFileIndexingBackfill.markScanCompleted()
+      if initialFileIndexingBackfill.shouldMarkComplete {
+        UserDefaults.standard.set(true, forKey: "hasCompletedFileIndexing")
+        log(
+          "DesktopHomeView: Marked existing-user file indexing backfill complete after background scan returned"
+        )
+      }
+    }
+    if !scheduled { initialFileIndexingBackfill.releaseReservation() }
+  }
+
+  private func scheduleProactiveMonitoringStart(reason: String) {
+    guard proactiveMonitoringStartGate.reserve() else { return }
+
+    let delay = StartupWarmupPolicy.remainingProactiveAssistantsStartDelay(
+      elapsedSinceLaunch: Date().timeIntervalSince(proactiveMonitoringWarmupAnchor))
+    log(
+      "DesktopHomeView: Scheduling screen analysis start in \(String(format: "%.1f", delay))s (\(reason))"
+    )
+    let scheduled = viewModelContainer.scheduleSessionWarmup(
+      id: .proactiveAssistantsStart,
+      delay: delay,
+      onCancel: { proactiveMonitoringStartGate.finishAttempt() }
+    ) {
+      let plugin = ProactiveAssistantsPlugin.shared
+      guard AssistantSettings.shared.screenAnalysisEnabled, !plugin.isMonitoring else {
+        proactiveMonitoringStartGate.finishAttempt()
+        return
+      }
+      guard APIKeyService.keysAvailable else {
+        proactiveMonitoringStartGate.finishAttempt()
+        log("DesktopHomeView: Screen analysis still deferred after \(reason) — API keys not yet loaded")
+        return
+      }
+
+      plugin.startMonitoring { success, error in
+        Task { @MainActor in
+          proactiveMonitoringStartGate.finishAttempt()
+          if success {
+            log("DesktopHomeView: Screen analysis started (\(reason), delayed)")
+          } else {
+            log(
+              "DesktopHomeView: Screen analysis failed to start (\(reason)): \(error ?? "unknown") — setting remains enabled for next launch"
+            )
+          }
+        }
+      }
+    }
+    if !scheduled { proactiveMonitoringStartGate.finishAttempt() }
   }
 
   private func updateStoreActivity(for index: Int) {
@@ -756,27 +919,12 @@ struct DesktopHomeView: View {
             selectedTabIndex: $selectedIndex
           )
         }
+        .onExitCommand {
+          navigateHomeOnEscapeIfNeeded()
+        }
         .clipShape(RoundedRectangle(cornerRadius: OmiChrome.windowRadius, style: .continuous))
       }
       .padding(14)
-    }
-    .safeAreaInset(edge: .top, spacing: 0) {
-      if usageLimiter.neoNeedsDesktopUpgrade && !neoDesktopBannerDismissed {
-        NeoDesktopBanner(
-          onUpgrade: {
-            selectedSettingsSection = .planUsage
-            withAnimation(Self.pageNavigationAnimation) {
-              selectedIndex = SidebarNavItem.settings.rawValue
-            }
-          },
-          onDismiss: {
-            withAnimation(Self.pageNavigationAnimation) {
-              neoDesktopBannerDismissed = true
-            }
-          }
-        )
-        .transition(.move(edge: .top).combined(with: .opacity))
-      }
     }
     .overlay {
       // Goal completion celebration overlay
@@ -879,6 +1027,15 @@ struct DesktopHomeView: View {
       restorePreChatWindowWidth()
     }
   }
+
+  private func navigateHomeOnEscapeIfNeeded() {
+    guard !useLegacyHomeDesign else { return }
+    guard let item = SidebarNavItem(rawValue: selectedIndex) else { return }
+    guard [.conversations, .memories, .tasks, .rewind].contains(item) else { return }
+    withAnimation(Self.pageNavigationAnimation) {
+      selectedIndex = SidebarNavItem.dashboard.rawValue
+    }
+  }
 }
 
 private struct PageChromeBar: View {
@@ -924,54 +1081,6 @@ private struct PageChromeButton: View {
     .onHover { isHovering = $0 }
     .help(title)
     .accessibilityLabel(title)
-  }
-}
-
-/// Dismissible top banner shown when a Neo (unlimited) user opens the desktop app.
-/// Neo is a mobile/web plan with no desktop access; the CTA routes to Settings →
-/// Plan & Usage where the existing Operator upgrade flow lives.
-private struct NeoDesktopBanner: View {
-  var onUpgrade: () -> Void
-  var onDismiss: () -> Void
-
-  var body: some View {
-    HStack(spacing: 12) {
-      Image(systemName: "exclamationmark.triangle.fill")
-        .scaledFont(size: 14, weight: .semibold)
-        .foregroundColor(OmiColors.warning)
-
-      Text("Neo doesn't include desktop access. Upgrade to Operator to use Omi on Mac.")
-        .scaledFont(size: 13, weight: .medium)
-        .foregroundColor(OmiColors.textPrimary)
-        .fixedSize(horizontal: false, vertical: true)
-
-      Spacer(minLength: 12)
-
-      Button(action: onUpgrade) {
-        Text("Upgrade to Operator")
-          .scaledFont(size: 13, weight: .semibold)
-          .foregroundColor(.white)
-          .padding(.horizontal, 14)
-          .padding(.vertical, 7)
-          .background(RoundedRectangle(cornerRadius: 8).fill(OmiColors.purplePrimary))
-      }
-      .buttonStyle(.plain)
-
-      Button(action: onDismiss) {
-        Image(systemName: "xmark")
-          .scaledFont(size: 12, weight: .semibold)
-          .foregroundColor(OmiColors.textSecondary)
-      }
-      .buttonStyle(.plain)
-    }
-    .padding(.horizontal, 18)
-    .padding(.vertical, 10)
-    .frame(maxWidth: .infinity)
-    .background(OmiColors.backgroundSecondary)
-    .overlay(
-      Rectangle().fill(OmiColors.border.opacity(0.4)).frame(height: 1),
-      alignment: .bottom
-    )
   }
 }
 
@@ -1053,6 +1162,9 @@ private struct ConversationsPageHost: View {
   }
 }
 
+#if canImport(PreviewsMacros)
 #Preview {
   DesktopHomeView()
+    .environmentObject(AppState())
 }
+#endif

@@ -48,6 +48,31 @@ class TasksStore: ObservableObject {
         isLoadingIncomplete || isLoadingCompleted || isLoadingDeleted
     }
 
+    func resetSessionState() {
+        incompleteTasks = []
+        completedTasks = []
+        deletedTasks = []
+        overdueTasks = []
+        todaysTasks = []
+        tasksWithoutDueDate = []
+        isLoadingIncomplete = false
+        isLoadingCompleted = false
+        isLoadingDeleted = false
+        isLoadingMore = false
+        hasMoreIncompleteTasks = true
+        hasMoreCompletedTasks = true
+        hasMoreDeletedTasks = true
+        error = nil
+        incompleteOffset = 0
+        completedOffset = 0
+        deletedOffset = 0
+        hasLoadedIncomplete = false
+        hasLoadedCompleted = false
+        hasLoadedDeleted = false
+        hasScheduledStartupMaintenance = false
+        lastReconciliationDate = nil
+    }
+
     // MARK: - Private State
 
     private var incompleteOffset = 0
@@ -57,6 +82,7 @@ class TasksStore: ObservableObject {
     private var hasLoadedIncomplete = false
     private var hasLoadedCompleted = false
     private var hasLoadedDeleted = false
+    private(set) var hasScheduledStartupMaintenance = false
     /// Whether we're currently showing all tasks (no date filter) or just recent
     private var cancellables = Set<AnyCancellable>()
     private var isRetryingUnsynced = false
@@ -157,6 +183,10 @@ class TasksStore: ObservableObject {
         }
     }
 
+    func refreshDashboardTasksFromServer() async {
+        await DashboardTaskRefreshService.refresh(store: self)
+    }
+
     var todoCount: Int {
         incompleteTasks.count
     }
@@ -195,17 +225,20 @@ class TasksStore: ObservableObject {
         refreshInvocations += 1
         // Skip if not signed in
         guard AuthService.shared.isSignedIn else { return }
-        // Skip if in auth backoff period (recent 401 errors)
-        guard !AuthBackoffTracker.shared.shouldSkipRequest() else { return }
-
         // Skip if page is not visible
         guard isActive else { return }
 
         // Skip if currently loading
         guard !isLoadingIncomplete, !isLoadingCompleted, !isLoadingDeleted, !isLoadingMore else { return }
 
-        // Only refresh if we've already loaded tasks
-        guard hasLoadedIncomplete else { return }
+        // Dashboard-only users may never open the full Tasks page, so the
+        // incomplete task list may not be hydrated. Still keep dashboard task
+        // slices fresh on app activation / Cmd+R using the scoped dashboard
+        // refresh path instead of requiring full Tasks-page hydration first.
+        guard hasLoadedIncomplete else {
+            await refreshDashboardTasksFromServer()
+            return
+        }
 
         // Silently sync and reload incomplete tasks (local-first, like Memories)
         do {
@@ -238,7 +271,7 @@ class TasksStore: ObservableObject {
             )
 
             // Merge without triggering @Published unless something actually changed
-            let merged = mergeWithoutAdding(source: mergedTasks, current: incompleteTasks)
+            let merged = Self.mergeWithoutAdding(source: mergedTasks, current: incompleteTasks)
             if merged != incompleteTasks {
                 // Log what actually changed
                 let currentIds = Set(incompleteTasks.map { $0.id })
@@ -262,11 +295,7 @@ class TasksStore: ObservableObject {
             let newHasMore = mergedTasks.count >= reloadLimit
             if hasMoreIncompleteTasks != newHasMore { hasMoreIncompleteTasks = newHasMore }
             await loadDashboardTasks()
-            AuthBackoffTracker.shared.reportSuccess()
         } catch {
-            if case APIError.unauthorized = error {
-                AuthBackoffTracker.shared.reportAuthFailure()
-            }
             // Benign sign-out race: the isSignedIn guard above passed, but the
             // token was cleared by the time the request ran. Expected, not a bug
             // — log quietly (breadcrumb only) instead of flooding Sentry.
@@ -296,7 +325,7 @@ class TasksStore: ObservableObject {
                     offset: 0,
                     completed: true
                 )
-                let merged = mergeWithoutAdding(source: mergedTasks, current: completedTasks)
+                let merged = Self.mergeWithoutAdding(source: mergedTasks, current: completedTasks)
                 if merged != completedTasks {
                     completedTasks = merged
                     completedOffset = merged.count
@@ -333,7 +362,7 @@ class TasksStore: ObservableObject {
                 )
                 // Filter to only deleted
                 let newDeleted = mergedTasks.filter { $0.deleted == true }
-                let merged = mergeWithoutAdding(source: newDeleted, current: deletedTasks)
+                let merged = Self.mergeWithoutAdding(source: newDeleted, current: deletedTasks)
                 if merged != deletedTasks {
                     deletedTasks = merged
                     deletedOffset = merged.count
@@ -410,8 +439,11 @@ class TasksStore: ObservableObject {
     /// Does NOT add new items — new tasks only appear on explicit load (initial load, tab switch).
     /// Returns a new array only if different from current (caller compares with == before assigning
     /// to @Published property, preventing unnecessary objectWillChange notifications).
-    private func mergeWithoutAdding(source: [TaskActionItem], current: [TaskActionItem]) -> [TaskActionItem] {
-        let sourceById = Dictionary(uniqueKeysWithValues: source.map { ($0.id, $0) })
+    static func mergeWithoutAdding(source: [TaskActionItem], current: [TaskActionItem]) -> [TaskActionItem] {
+        // The source list can contain duplicate ids (local sync/reconciliation races),
+        // so build the lookup with last-write-wins. `Dictionary(uniqueKeysWithValues:)`
+        // traps on a duplicate key and crashes the app (same crash class as #6506).
+        let sourceById = Dictionary(source.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
         let sourceIds = Set(source.map { $0.id })
 
         var result = current
@@ -475,13 +507,15 @@ class TasksStore: ObservableObject {
 
     /// Load incomplete tasks if not already loaded (call this on app launch)
     func loadTasksIfNeeded() async {
-        guard !hasLoadedIncomplete else { return }
-        await loadIncompleteTasks()
-        await loadDashboardTasks()
-        // Also load deleted tasks in background so the filter count is ready
-        if !hasLoadedDeleted {
-            await loadDeletedTasks()
+        if !hasLoadedIncomplete {
+            await loadIncompleteTasks()
+            await loadDashboardTasks()
+            // Also load deleted tasks in background so the filter count is ready
+            if !hasLoadedDeleted {
+                await loadDeletedTasks()
+            }
         }
+        scheduleStartupMaintenanceIfNeeded()
     }
 
     /// Legacy method - loads incomplete tasks
@@ -492,23 +526,42 @@ class TasksStore: ObservableObject {
         if !hasLoadedDeleted {
             await loadDeletedTasks()
         }
-        // Kick off one-time full sync in background (populates SQLite with all tasks)
-        // Then retry pushing any locally-created tasks that failed to sync
-        Task {
-            await performFullSyncIfNeeded()
-            await migrateAITasksToStagedIfNeeded()
-            await migrateConversationItemsToStagedIfNeeded()
-            await retryUnsyncedItems()
-        }
-        // Backfill relevance scores for unscored tasks (independent of full sync)
-        Task {
-            let userId = UserDefaults.standard.string(forKey: "auth_userId") ?? "unknown"
-            await backfillRelevanceScoresIfNeeded(userId: userId)
-        }
+        scheduleStartupMaintenanceIfNeeded()
         // Note: no startup task promotion. Promotion happens on the natural
         // cadence — when the user completes/deletes a task, or via the
         // 5-minute safety-net timer. Bursting up to 5 promotions on every
         // launch felt like spam.
+    }
+
+    func scheduleStartupMaintenanceIfNeeded(
+        fullSyncAndRetry: (@Sendable () async -> Void)? = nil,
+        relevanceBackfill: (@Sendable () async -> Void)? = nil
+    ) {
+        guard !hasScheduledStartupMaintenance else { return }
+        hasScheduledStartupMaintenance = true
+
+        // Kick off one-time full sync in background (populates SQLite with all tasks)
+        // Then retry pushing any locally-created tasks that failed to sync.
+        Task {
+            if let fullSyncAndRetry {
+                await fullSyncAndRetry()
+            } else {
+                await performFullSyncIfNeeded()
+                await migrateAITasksToStagedIfNeeded()
+                await migrateConversationItemsToStagedIfNeeded()
+                await retryUnsyncedItems()
+            }
+        }
+
+        // Backfill relevance scores for unscored tasks (independent of full sync).
+        Task {
+            if let relevanceBackfill {
+                await relevanceBackfill()
+            } else {
+                let userId = UserDefaults.standard.string(forKey: "auth_userId") ?? "unknown"
+                await backfillRelevanceScoresIfNeeded(userId: userId)
+            }
+        }
     }
 
     /// Load incomplete tasks (To Do) using local-first pattern (like Memories)
