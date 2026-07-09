@@ -1411,6 +1411,107 @@ struct ToolCallCard: View {
   }
 }
 
+/// Parsed identity from a completed `spawn_agent` tool result.
+/// Accepts both Swift labeled-text output and kernel JSON (`session`/`run`/`attempt`).
+struct SpawnAgentToolResult: Equatable {
+  let pillId: UUID
+  let sessionId: String
+  let runId: String
+  let attemptId: String?
+  let title: String?
+  let query: String?
+
+  var hasProjectionIdentity: Bool {
+    !sessionId.isEmpty && !runId.isEmpty
+  }
+
+  static func parse(from output: String) -> SpawnAgentToolResult? {
+    let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    if let fromJSON = parseKernelJSON(trimmed) {
+      return fromJSON
+    }
+    return parseLabeledText(trimmed)
+  }
+
+  private static func parseKernelJSON(_ output: String) -> SpawnAgentToolResult? {
+    guard let data = output.data(using: .utf8),
+      let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+
+    // Require a session/run shaped payload so plain JSON blobs are not treated as spawns.
+    guard root["session"] != nil || root["run"] != nil || root["ok"] as? Bool == true else {
+      return nil
+    }
+
+    let session = root["session"] as? [String: Any]
+    let run = root["run"] as? [String: Any]
+    let attempt = root["attempt"] as? [String: Any]
+    let metadata = session?["metadata"] as? [String: Any]
+    let runInput = run?["input"] as? [String: Any]
+
+    let pillRaw =
+      nonEmptyString(session?["externalRefId"])
+      ?? nonEmptyString(metadata?["pillId"])
+      ?? nonEmptyString(root["id"])
+    guard let pillRaw, let pillId = UUID(uuidString: pillRaw) else { return nil }
+
+    let sessionId = nonEmptyString(session?["sessionId"]) ?? nonEmptyString(root["sessionId"]) ?? ""
+    let runId = nonEmptyString(run?["runId"]) ?? nonEmptyString(root["runId"]) ?? ""
+    let attemptId =
+      nonEmptyString(attempt?["attemptId"])
+      ?? nonEmptyString(root["attemptId"])
+    let title = nonEmptyString(session?["title"]) ?? nonEmptyString(root["title"])
+    let query =
+      nonEmptyString(runInput?["prompt"])
+      ?? nonEmptyString(root["objective"])
+      ?? nonEmptyString(root["query"])
+
+    return SpawnAgentToolResult(
+      pillId: pillId,
+      sessionId: sessionId,
+      runId: runId,
+      attemptId: attemptId,
+      title: title,
+      query: query
+    )
+  }
+
+  private static func parseLabeledText(_ output: String) -> SpawnAgentToolResult? {
+    guard let pillRaw = labeledValue(in: output, keys: ["id"]),
+      let pillId = UUID(uuidString: pillRaw)
+    else { return nil }
+    return SpawnAgentToolResult(
+      pillId: pillId,
+      sessionId: labeledValue(in: output, keys: ["sessionid", "session_id"]) ?? "",
+      runId: labeledValue(in: output, keys: ["runid", "run_id"]) ?? "",
+      attemptId: labeledValue(in: output, keys: ["attemptid", "attempt_id"]),
+      title: labeledValue(in: output, keys: ["title"]),
+      query: labeledValue(in: output, keys: ["objective", "query", "brief"])
+    )
+  }
+
+  private static func nonEmptyString(_ value: Any?) -> String? {
+    guard let text = value as? String else { return nil }
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+
+  private static func labeledValue(in output: String, keys: [String]) -> String? {
+    let keySet = Set(keys.map { $0.lowercased() })
+    for line in output.components(separatedBy: .newlines) {
+      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard let colon = trimmed.firstIndex(of: ":") else { continue }
+      let label = String(trimmed[..<colon]).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      guard keySet.contains(label) else { continue }
+      let value = String(trimmed[trimmed.index(after: colon)...])
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      if !value.isEmpty { return value }
+    }
+    return nil
+  }
+}
+
 extension ChatContentBlock {
   var agentOpenRef: AgentTimelineRef? {
     if let ref = agentTimelineRef, ref.hasIdentity {
@@ -1431,13 +1532,7 @@ extension ChatContentBlock {
     if case .agentCompletion(_, let pillId, _, _, _, _, _, _) = self {
       return pillId
     }
-    guard case .toolCall(_, let name, let status, _, _, let output) = self,
-      Self.cleanToolName(name) == "spawn_agent",
-      !status.isInFlight,
-      let output
-    else { return nil }
-
-    return Self.labeledValue(in: output, keys: ["id"]).flatMap(UUID.init(uuidString:))
+    return spawnAgentToolResult?.pillId
   }
 
   var spawnedAgentSessionID: String? {
@@ -1447,12 +1542,8 @@ extension ChatContentBlock {
     if case .agentCompletion(_, _, let sessionId, _, _, _, _, _) = self {
       return sessionId
     }
-    guard case .toolCall(_, let name, let status, _, _, let output) = self,
-      Self.cleanToolName(name) == "spawn_agent",
-      !status.isInFlight,
-      let output
-    else { return nil }
-    return Self.labeledValue(in: output, keys: ["sessionid", "session_id"])
+    guard let sessionId = spawnAgentToolResult?.sessionId, !sessionId.isEmpty else { return nil }
+    return sessionId
   }
 
   var spawnedAgentRunID: String? {
@@ -1462,31 +1553,32 @@ extension ChatContentBlock {
     if case .agentCompletion(_, _, _, let runId, _, _, _, _) = self {
       return runId
     }
+    guard let runId = spawnAgentToolResult?.runId, !runId.isEmpty else { return nil }
+    return runId
+  }
+
+  /// Parsed spawn_agent tool output (labeled text or kernel JSON), when present.
+  var spawnAgentToolResult: SpawnAgentToolResult? {
     guard case .toolCall(_, let name, let status, _, _, let output) = self,
       Self.cleanToolName(name) == "spawn_agent",
       !status.isInFlight,
       let output
     else { return nil }
-    return Self.labeledValue(in: output, keys: ["runid", "run_id"])
+    return SpawnAgentToolResult.parse(from: output)
   }
 
-  /// Parse a labeled `key: value` line from a spawn_agent tool block's output.
+  /// Parse a labeled `key: value` line or matching kernel-JSON field from spawn_agent output.
   static func labeledSpawnValue(in block: ChatContentBlock, keys: [String]) -> String? {
-    guard case .toolCall(_, _, _, _, _, let output) = block, let output else { return nil }
-    return labeledValue(in: output, keys: keys)
-  }
-
-  private static func labeledValue(in output: String, keys: [String]) -> String? {
+    guard let parsed = block.spawnAgentToolResult else { return nil }
     let keySet = Set(keys.map { $0.lowercased() })
-    for line in output.components(separatedBy: .newlines) {
-      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard let colon = trimmed.firstIndex(of: ":") else { continue }
-      let label = String(trimmed[..<colon]).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-      guard keySet.contains(label) else { continue }
-      let value = String(trimmed[trimmed.index(after: colon)...])
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-      if !value.isEmpty { return value }
+    if keySet.contains("title") { return parsed.title }
+    if keySet.contains("objective") || keySet.contains("query") || keySet.contains("brief") {
+      return parsed.query
     }
+    if keySet.contains("id") { return parsed.pillId.uuidString }
+    if keySet.contains("sessionid") || keySet.contains("session_id") { return parsed.sessionId }
+    if keySet.contains("runid") || keySet.contains("run_id") { return parsed.runId }
+    if keySet.contains("attemptid") || keySet.contains("attempt_id") { return parsed.attemptId }
     return nil
   }
 
