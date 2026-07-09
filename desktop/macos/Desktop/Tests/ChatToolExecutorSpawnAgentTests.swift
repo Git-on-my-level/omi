@@ -48,4 +48,18 @@ final class ChatToolExecutorSpawnAgentTests: XCTestCase {
     XCTAssertTrue(source.contains("refreshProjectedPillsFromKernel"))
     XCTAssertFalse(source.contains("AgentPillsManager.shared.spawnFromUserQuery("))
   }
+
+  func testChatProviderProjectsKernelSpawnAgentIntoAgentMenu() throws {
+    let sourceURL = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .appendingPathComponent("Sources")
+      .appendingPathComponent("Providers/ChatProvider.swift")
+    let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+    XCTAssertTrue(source.contains("projectSpawnedAgentPillIfNeeded"))
+    XCTAssertTrue(source.contains("SpawnAgentToolResult.parse(from: output)"))
+    XCTAssertTrue(source.contains("AgentPillsManager.shared.upsertSpawnedPill("))
+    XCTAssertTrue(source.contains("refreshProjectedPillsFromKernel()"))
+  }
 }
