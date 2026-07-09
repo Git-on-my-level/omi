@@ -302,6 +302,104 @@ final class ChatTimelineContinuityTests: XCTestCase {
     )
   }
 
+  func testKernelJSONSpawnToolOutputParsesIdentityAndMaterializesAgentSpawn() {
+    let pillId = UUID(uuidString: "65d94b4f-10bd-4a6e-9c94-7f76cbf4381d")!
+    let jsonOutput = """
+    {"ok":true,"session":{"sessionId":"ses_84965baec2484c188ba9ef2a02065f1f","title":"Calendar check for today","status":"open","surfaceKind":"floating_bar","externalRefKind":"pill","externalRefId":"\(pillId.uuidString)","metadata":{}},"run":{"runId":"run_946c8b96ff1340d4b985bf78282b2170","sessionId":"ses_84965baec2484c188ba9ef2a02065f1f","status":"queued","input":{"prompt":"Check David's Google Calendar for today","metadata":{"visible":true}}},"attempt":null}
+    """
+
+    let parsed = SpawnAgentToolResult.parse(from: jsonOutput)
+    XCTAssertEqual(parsed?.pillId, pillId)
+    XCTAssertEqual(parsed?.sessionId, "ses_84965baec2484c188ba9ef2a02065f1f")
+    XCTAssertEqual(parsed?.runId, "run_946c8b96ff1340d4b985bf78282b2170")
+    XCTAssertEqual(parsed?.title, "Calendar check for today")
+    XCTAssertEqual(parsed?.query, "Check David's Google Calendar for today")
+    XCTAssertEqual(parsed?.hasProjectionIdentity, true)
+
+    let block = ChatContentBlock.toolCall(
+      id: "tool_json",
+      name: "spawn_agent",
+      status: .completed,
+      toolUseId: "tu-json",
+      output: jsonOutput
+    )
+    XCTAssertEqual(block.spawnedAgentID, pillId)
+    XCTAssertEqual(block.spawnedAgentSessionID, "ses_84965baec2484c188ba9ef2a02065f1f")
+    XCTAssertEqual(block.spawnedAgentRunID, "run_946c8b96ff1340d4b985bf78282b2170")
+    XCTAssertEqual(
+      ChatContentBlock.labeledSpawnValue(in: block, keys: ["title"]),
+      "Calendar check for today"
+    )
+
+    var blocks = [block]
+    ChatProvider.materializeAgentSpawnBlockIfNeeded(
+      in: &blocks,
+      toolUseId: "tu-json",
+      toolName: "spawn_agent"
+    )
+    XCTAssertEqual(blocks.count, 2)
+    guard case .agentSpawn(_, let spawnPill, let sessionId, let runId, let title, let objective) =
+      blocks[1]
+    else {
+      return XCTFail("kernel JSON spawn_agent tool result must emit .agentSpawn")
+    }
+    XCTAssertEqual(spawnPill, pillId)
+    XCTAssertEqual(sessionId, "ses_84965baec2484c188ba9ef2a02065f1f")
+    XCTAssertEqual(runId, "run_946c8b96ff1340d4b985bf78282b2170")
+    XCTAssertEqual(title, "Calendar check for today")
+    XCTAssertEqual(objective, "Check David's Google Calendar for today")
+
+    ChatProvider.materializeAgentSpawnBlockIfNeeded(
+      in: &blocks,
+      toolUseId: "tu-json",
+      toolName: "spawn_agent"
+    )
+    XCTAssertEqual(blocks.count, 2)
+  }
+
+  @MainActor
+  func testKernelJSONSpawnProjectsPillIntoAgentMenuIdempotently() {
+    let pillId = UUID(uuidString: "65d94b4f-10bd-4a6e-9c94-7f76cbf4381d")!
+    let jsonOutput = """
+    {"ok":true,"session":{"sessionId":"ses_84965baec2484c188ba9ef2a02065f1f","title":"Calendar check for today","status":"open","surfaceKind":"floating_bar","externalRefKind":"pill","externalRefId":"\(pillId.uuidString)","metadata":{}},"run":{"runId":"run_946c8b96ff1340d4b985bf78282b2170","sessionId":"ses_84965baec2484c188ba9ef2a02065f1f","status":"queued","input":{"prompt":"Check David's Google Calendar for today"}},"attempt":{"attemptId":"att_1"}}
+    """
+
+    let manager = AgentPillsManager.shared
+    let previous = manager.pills
+    defer { manager.replacePillsForTesting(previous) }
+    manager.replacePillsForTesting([])
+
+    guard let parsed = SpawnAgentToolResult.parse(from: jsonOutput), parsed.hasProjectionIdentity else {
+      return XCTFail("expected parseable kernel spawn result")
+    }
+
+    manager.upsertSpawnedPill(
+      id: parsed.pillId,
+      query: parsed.query ?? parsed.title ?? "Background agent",
+      title: parsed.title ?? "Background agent",
+      sessionId: parsed.sessionId,
+      runId: parsed.runId,
+      attemptId: parsed.attemptId
+    )
+    XCTAssertEqual(manager.pills.count, 1)
+    XCTAssertEqual(manager.pills.first?.id, pillId)
+    XCTAssertEqual(manager.pills.first?.title, "Calendar check for today")
+    XCTAssertEqual(manager.pills.first?.canonicalSessionId, "ses_84965baec2484c188ba9ef2a02065f1f")
+    XCTAssertEqual(manager.pills.first?.canonicalRunId, "run_946c8b96ff1340d4b985bf78282b2170")
+    XCTAssertEqual(manager.pills.first?.canonicalAttemptId, "att_1")
+
+    // Second upsert must merge, not duplicate.
+    manager.upsertSpawnedPill(
+      id: parsed.pillId,
+      query: parsed.query ?? parsed.title ?? "Background agent",
+      title: parsed.title ?? "Background agent",
+      sessionId: parsed.sessionId,
+      runId: parsed.runId,
+      attemptId: parsed.attemptId
+    )
+    XCTAssertEqual(manager.pills.count, 1)
+  }
+
   func testHydratePreferencePrefersRunThenSessionThenPill() {
     let pillId = UUID()
     let preference = AgentTimelineHydratePreference.make(
