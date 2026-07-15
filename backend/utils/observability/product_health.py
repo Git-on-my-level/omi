@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from threading import RLock
 from time import monotonic, time
-from prometheus_client import Counter, Histogram
+from typing import Callable, Protocol, TypeVar, cast
+
+from prometheus_client import REGISTRY, Counter, Histogram
 
 
 class ProductJourney(str, Enum):
@@ -19,23 +22,87 @@ class ProductJourneyOutcome(str, Enum):
     failed = 'failed'
 
 
-PRODUCT_JOURNEY_ACCEPTED_TOTAL = Counter(
+Metric = Counter | Histogram
+MetricT = TypeVar('MetricT', bound=Metric)
+
+_METRIC_CACHE_ATTRIBUTE = 'omi_product_health_metrics'
+_METRIC_CACHE_LOCK_ATTRIBUTE = 'omi_product_health_metrics_lock'
+
+
+class _MetricCacheLock(Protocol):
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool: ...
+
+    def release(self) -> None: ...
+
+
+def _metric_cache() -> tuple[dict[str, object], _MetricCacheLock]:
+    """Return state whose lifetime matches the public Prometheus registry."""
+
+    metrics = getattr(REGISTRY, _METRIC_CACHE_ATTRIBUTE, None)
+    if metrics is None:
+        metrics = {}
+        setattr(REGISTRY, _METRIC_CACHE_ATTRIBUTE, metrics)
+    if not isinstance(metrics, dict):
+        raise RuntimeError('Prometheus registry product-health metric cache is invalid')
+
+    lock = getattr(REGISTRY, _METRIC_CACHE_LOCK_ATTRIBUTE, None)
+    if lock is None:
+        lock = RLock()
+        setattr(REGISTRY, _METRIC_CACHE_LOCK_ATTRIBUTE, lock)
+
+    return cast(dict[str, object], metrics), cast(_MetricCacheLock, lock)
+
+
+def _registered_metric_or_create(name: str, factory: Callable[[], MetricT]) -> MetricT:
+    """Create each product-health collector once, including after module re-imports.
+
+    Isolated router tests unload this module but intentionally retain Prometheus's
+    global registry. Keeping the handles on that registry lets a later import
+    reuse the already registered collector through public APIs only.
+    """
+
+    metrics, lock = _metric_cache()
+    lock.acquire()
+    try:
+        existing = metrics.get(name)
+        if existing is not None:
+            if not isinstance(existing, (Counter, Histogram)):
+                raise RuntimeError(f'Prometheus registry product-health metric {name!r} has an invalid type')
+            return cast(MetricT, existing)
+
+        metric = factory()
+        metrics[name] = metric
+        return metric
+    finally:
+        lock.release()
+
+
+PRODUCT_JOURNEY_ACCEPTED_TOTAL = _registered_metric_or_create(
     'omi_product_journey_accepted_total',
-    'Accepted real-traffic product journeys by closed journey name',
-    ['journey'],
+    lambda: Counter(
+        'omi_product_journey_accepted_total',
+        'Accepted real-traffic product journeys by closed journey name',
+        ['journey'],
+    ),
 )
 
-PRODUCT_JOURNEY_TERMINAL_TOTAL = Counter(
+PRODUCT_JOURNEY_TERMINAL_TOTAL = _registered_metric_or_create(
     'omi_product_journey_terminal_total',
-    'Terminal real-traffic product journeys by closed journey name and outcome',
-    ['journey', 'outcome'],
+    lambda: Counter(
+        'omi_product_journey_terminal_total',
+        'Terminal real-traffic product journeys by closed journey name and outcome',
+        ['journey', 'outcome'],
+    ),
 )
 
-PRODUCT_JOURNEY_LATENCY_SECONDS = Histogram(
+PRODUCT_JOURNEY_LATENCY_SECONDS = _registered_metric_or_create(
     'omi_product_journey_latency_seconds',
-    'End-to-end latency for terminal real-traffic product journeys',
-    ['journey', 'outcome'],
-    buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 900, 3600),
+    lambda: Histogram(
+        'omi_product_journey_latency_seconds',
+        'End-to-end latency for terminal real-traffic product journeys',
+        ['journey', 'outcome'],
+        buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 900, 3600),
+    ),
 )
 
 

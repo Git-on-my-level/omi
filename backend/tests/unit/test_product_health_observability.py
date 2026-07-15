@@ -1,5 +1,7 @@
 """Behavioral contract for the real-traffic product-health metric slice."""
 
+import importlib
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -89,6 +91,24 @@ def test_metric_contract_has_only_closed_journey_and_outcome_labels():
         'realtime_pusher_session',
         'capture_finalization',
     }
+
+
+def test_metric_registration_survives_module_reimport():
+    """Router isolation may unload this module while Prometheus's registry remains."""
+    module_name = 'utils.observability.product_health'
+    original_module = sys.modules[module_name]
+    parent_module = sys.modules['utils.observability']
+
+    try:
+        del sys.modules[module_name]
+        reimported_module = importlib.import_module(module_name)
+
+        assert reimported_module.PRODUCT_JOURNEY_ACCEPTED_TOTAL is PRODUCT_JOURNEY_ACCEPTED_TOTAL
+        assert reimported_module.PRODUCT_JOURNEY_TERMINAL_TOTAL is PRODUCT_JOURNEY_TERMINAL_TOTAL
+        assert reimported_module.PRODUCT_JOURNEY_LATENCY_SECONDS is PRODUCT_JOURNEY_LATENCY_SECONDS
+    finally:
+        sys.modules[module_name] = original_module
+        parent_module.product_health = original_module
 
 
 @pytest.mark.parametrize('client_disconnect_code', (1000, 1001))
