@@ -397,4 +397,150 @@ describe("chat generation reliability", () => {
       expect(typeof row.event).toBe("string");
     }
   });
+
+  const toolLoop = (): Partial<Parameters<typeof createGatewayChatGenerationSource>[0]> => ({
+    readOnlyToolLoop: {
+      registry: createAgentToolRegistry([safeReadTool(async () => ({
+        summary: "Fixture is ready.", durationMs: 2, retryable: false,
+      }))]),
+      tool: readOnlyToolSchema,
+      agentRunEvents: seedAgentLedger(),
+      nowEpochMilliseconds: () => 2,
+    },
+  });
+
+  const toolCallDelta = (
+    id = "provider-call",
+    name = "safe_fixture_status",
+    argumentsJson = "{\"scope\":\"current\"}",
+  ) => JSON.stringify({
+    choices: [{ delta: { tool_calls: [{ index: 0, id, function: { name, arguments: argumentsJson } }] } }],
+  });
+
+  test("round-1 replay missing reasoning_content completes once the assistant turn is replayed", async () => {
+    // red-proof: dropping reasoning_content from the round-1 assistant turn
+    // makes this stub 400, the source calls onError, and the streamed answer
+    // never completes. The live DeepSeek probe returned that 400 verbatim.
+    isolateLogs();
+    const reasoning = "private-reasoning-not-for-client";
+    const answer = "Harborline is open today.";
+    const bodies: Record<string, unknown>[] = [];
+    const result = await runSource(async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      const messages = Array.isArray(body.messages) ? body.messages as Record<string, unknown>[] : [];
+      if (!messages.some((message) => message.role === "tool")) {
+        return sse(
+          JSON.stringify({ choices: [{ delta: { reasoning_content: reasoning } }] }),
+          toolCallDelta(),
+          "[DONE]",
+        );
+      }
+      const assistant = messages.find((message) => message.role === "assistant");
+      if (typeof assistant?.reasoning_content !== "string" || assistant.reasoning_content.length === 0) {
+        return new Response(JSON.stringify({
+          error: {
+            type: "invalid_request_error",
+            code: "invalid_request_error",
+            message: "The `reasoning_content` in the thinking mode must be passed back to the API.",
+          },
+        }), { status: 400 });
+      }
+      return sse(JSON.stringify({ choices: [{ delta: { content: answer } }] }), "[DONE]");
+    }, toolLoop());
+    expect(result.error).toBeNull();
+    expect(result.text).toBe(answer);
+    const replay = bodies[1]?.messages as Record<string, unknown>[] | undefined;
+    const assistant = replay?.find((message) => message.role === "assistant");
+    expect(assistant?.reasoning_content).toBe(reasoning);
+    expect(result.text).not.toContain(reasoning);
+    const raw = readFileSync(join(runDir, "logs", "chat.jsonl"), "utf8");
+    expect(raw).not.toContain(reasoning);
+    expect(readChatLog(runDir).at(-1)).toMatchObject({ event: "generation_terminal", outcome: "done" });
+  });
+
+  test("a stray round-1 tool call does not replace content already delivered", async () => {
+    // red-proof: invalidToolCall on round !== 0 fails the generation after
+    // onDelta has already forwarded the answer, which Chat then replaces with
+    // "The chat provider is unavailable."
+    isolateLogs();
+    const answer = "Let me check your current action items for you.";
+    let executions = 0;
+    const result = await runSource(async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      const messages = Array.isArray(body.messages) ? body.messages as Record<string, unknown>[] : [];
+      if (!messages.some((message) => message.role === "tool")) {
+        return sse(toolCallDelta(), "[DONE]");
+      }
+      return sse(
+        JSON.stringify({ choices: [{ delta: { content: answer } }] }),
+        toolCallDelta("stray-call"),
+        "[DONE]",
+      );
+    }, {
+      readOnlyToolLoop: {
+        registry: createAgentToolRegistry([safeReadTool(async () => {
+          executions += 1;
+          return { summary: "Fixture is ready.", durationMs: 2, retryable: false };
+        })]),
+        tool: readOnlyToolSchema,
+        agentRunEvents: seedAgentLedger(),
+        nowEpochMilliseconds: () => 2,
+      },
+    });
+    expect(result.error).toBeNull();
+    expect(result.text).toBe(answer);
+    expect(executions).toBe(1);
+    expect(readChatLog(runDir).some((row) =>
+      row.event === "tool_loop_ignored" && row.reason === "tool_call_after_tool_round")).toBe(true);
+    expect(readChatLog(runDir).at(-1)).toMatchObject({ event: "generation_terminal", outcome: "done" });
+  });
+
+  test("each tool-loop generation_provider_failed branch logs a distinct reason", async () => {
+    isolateLogs();
+    const runFailing = async (fetchImpl: typeof fetch) => {
+      const result = await runSource(fetchImpl, toolLoop());
+      expect(result.error).toEqual({ code: "generation_provider_failed", retryable: true });
+    };
+
+    await runFailing(async () => new Response("no", { status: 400 }));
+
+    await runFailing(async () => sse(
+      JSON.stringify({
+        choices: [{ delta: { tool_calls: [
+          { index: 0, id: "a", function: { name: "safe_fixture_status", arguments: "{}" } },
+          { index: 1, id: "b", function: { name: "safe_fixture_status", arguments: "{}" } },
+        ] } }],
+      }),
+      "[DONE]",
+    ));
+
+    await runFailing(async () => sse(
+      JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, function: {} }] } }] }),
+      "[DONE]",
+    ));
+
+    await runFailing(async () => sse(toolCallDelta("-bad"), "[DONE]"));
+
+    const round1ToolCallNoContent: Response[] = [
+      sse(toolCallDelta(), "[DONE]"),
+      sse(toolCallDelta("stray-call"), "[DONE]"),
+    ];
+    await runFailing(async () => round1ToolCallNoContent.shift()!);
+
+    const reasons = readChatLog(runDir)
+      .filter((row) => row.event === "tool_loop_failed")
+      .map((row) => row.reason);
+    // empty_stream and empty_content still have distinct reasons in the
+    // loop, but retryEmptyDone surfaces those shapes as gateway_stream_failed.
+    expect(reasons).toEqual([
+      "gateway_stream_failed",
+      "invalid_tool_call",
+      "empty_tool_call_fragments",
+      "unsafe_tool_call_tokens",
+      "tool_call_after_tool_round",
+    ]);
+    const raw = readFileSync(join(runDir, "logs", "chat.jsonl"), "utf8");
+    expect(logLineHasSecret(raw, [SECRET_TOKEN, PROMPT, "Bearer ", "private-reasoning"])).toBe(false);
+  });
 });

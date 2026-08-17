@@ -26,6 +26,7 @@ import {
   type ChatGenerationContextPacket,
   type ChatGenerationContextSource,
 } from "../chat/generation-context";
+import { createAgentToolRegistry, type AgentToolDefinition } from "../chat/agent-tools";
 import {
   createGatewayChatGenerationSource,
   createScriptedChatGenerationSource,
@@ -2541,6 +2542,181 @@ describe("ratified chat generation wire red proofs", () => {
     expect(scheduled.length).toBe(scheduledBefore);
     await reader.cancel();
     expect(clearCalls).toBeGreaterThan(0);
+    db.close();
+  });
+
+  const fixtureReadTool = (
+    execute: AgentToolDefinition["execute"],
+  ): AgentToolDefinition => ({
+    schemaVersion: 1,
+    name: "safe_fixture_status",
+    risk: "safe",
+    timeoutMs: 100,
+    retryable: false,
+    displaySummary: "Read fixture status",
+    validateInput: (value): boolean => value !== null && typeof value === "object"
+      && !Array.isArray(value) && Object.keys(value).length === 1
+      && (value as Record<string, unknown>).scope === "current",
+    execute,
+  });
+
+  const fixtureReadToolSchema = Object.freeze({
+    name: "safe_fixture_status",
+    description: "Read the current fixture status.",
+    parameters: Object.freeze({
+      type: "object" as const,
+      additionalProperties: false as const,
+      properties: Object.freeze({
+        scope: Object.freeze({ type: "string" as const, enum: Object.freeze(["current"]) }),
+      }),
+      required: Object.freeze(["scope"]),
+    }),
+  });
+
+  const gatewaySse = (...events: readonly string[]): Response => new Response(
+    events.map((event) => `data: ${event}\n\n`).join(""),
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  );
+
+  const gatewayToolCall = (id: string) => JSON.stringify({
+    choices: [{ delta: { tool_calls: [{
+      index: 0,
+      id,
+      function: { name: "safe_fixture_status", arguments: "{\"scope\":\"current\"}" },
+    }] } }],
+  });
+
+  test("tool-loop round 1 missing reasoning_content still completes on the generation SSE", async () => {
+    // red-proof: the generation events stream is what ChatProduction consumes.
+    // A failed terminal here is rendered as "The chat provider is unavailable."
+    // even after deltas already arrived. This stub 400s unless the round-1
+    // assistant turn replays reasoning_content; the wire to the client must
+    // stay the ratified grammar (no reasoning frames).
+    const reasoning = "private-reasoning-not-for-client";
+    const answer = "Harborline is open today.";
+    const agentStore = createInMemoryAgentRunEventStore();
+    const source = createGatewayChatGenerationSource({
+      gatewayUrl: "http://127.0.0.1:8787",
+      laneId: "omi:auto:chat-agent",
+      serviceToken: "service-secret",
+      retrySleep: async () => {},
+      readOnlyToolLoop: {
+        registry: createAgentToolRegistry([fixtureReadTool(async () => ({
+          summary: "Fixture is ready.", durationMs: 2, retryable: false,
+        }))]),
+        tool: fixtureReadToolSchema,
+        agentRunEvents: agentStore,
+        nowEpochMilliseconds: () => 2,
+      },
+      fetch: async (_url, init) => {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        const messages = Array.isArray(body.messages)
+          ? body.messages as Record<string, unknown>[]
+          : [];
+        if (!messages.some((message) => message.role === "tool")) {
+          return gatewaySse(
+            JSON.stringify({ choices: [{ delta: { reasoning_content: reasoning } }] }),
+            gatewayToolCall("provider-call"),
+            "[DONE]",
+          );
+        }
+        const assistant = messages.find((message) => message.role === "assistant");
+        if (typeof assistant?.reasoning_content !== "string"
+          || assistant.reasoning_content.length === 0) {
+          return new Response(JSON.stringify({
+            error: {
+              type: "invalid_request_error",
+              message: "The `reasoning_content` in the thinking mode must be passed back to the API.",
+            },
+          }), { status: 400 });
+        }
+        return gatewaySse(
+          JSON.stringify({ choices: [{ delta: { content: answer } }] }),
+          "[DONE]",
+        );
+      },
+    });
+    const { db, local } = boot(
+      createInMemoryLocalServiceStores(),
+      source,
+      "reasoning-tool-replay-proof",
+      createEmptyChatGenerationContextSource(),
+      undefined, undefined, undefined, undefined, agentStore,
+    );
+    const { eventsResponse } = await admitAndOpen(
+      local,
+      create("reasoning-tool-replay"),
+    );
+    const frames = parseSse(await eventsResponse.text());
+    const terminal = frames.at(-1)?.data;
+    expect(terminal).toMatchObject({
+      kind: "done",
+      message: { text: answer, generationOutcome: "completed" },
+    });
+    const body = JSON.stringify(frames);
+    expect(body).not.toContain("generation_provider_failed");
+    expect(body).not.toContain(reasoning);
+    expect(body).not.toContain("reasoning_content");
+    expect(frames.some((frame) => frame.data.kind === "delta" && frame.data.text === answer)).toBe(true);
+    const historyRows = await history(local);
+    expect(historyRows.some((row) => row.sender === "ai" && row.text === answer)).toBe(true);
+    db.close();
+  });
+
+  test("a stray round-1 tool call keeps already-streamed content on the generation SSE", async () => {
+    // red-proof: ChatProduction replaces a streaming row with
+    // "The chat provider is unavailable." when this stream ends `event: failed`
+    // after the answer delta. A stray tool_calls finish on round 1 must not
+    // take a delivered answer with it, and must not execute a second tool.
+    const answer = "Let me check your current action items for you.";
+    let executions = 0;
+    const agentStore = createInMemoryAgentRunEventStore();
+    const source = createGatewayChatGenerationSource({
+      gatewayUrl: "http://127.0.0.1:8787",
+      laneId: "omi:auto:chat-agent",
+      serviceToken: "service-secret",
+      retrySleep: async () => {},
+      readOnlyToolLoop: {
+        registry: createAgentToolRegistry([fixtureReadTool(async () => {
+          executions += 1;
+          return { summary: "Fixture is ready.", durationMs: 2, retryable: false };
+        })]),
+        tool: fixtureReadToolSchema,
+        agentRunEvents: agentStore,
+        nowEpochMilliseconds: () => 2,
+      },
+      fetch: async (_url, init) => {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        const messages = Array.isArray(body.messages)
+          ? body.messages as Record<string, unknown>[]
+          : [];
+        if (!messages.some((message) => message.role === "tool")) {
+          return gatewaySse(gatewayToolCall("provider-call"), "[DONE]");
+        }
+        return gatewaySse(
+          JSON.stringify({ choices: [{ delta: { content: answer } }] }),
+          gatewayToolCall("stray-call"),
+          "[DONE]",
+        );
+      },
+    });
+    const { db, local } = boot(
+      createInMemoryLocalServiceStores(),
+      source,
+      "stray-round1-tool-proof",
+      createEmptyChatGenerationContextSource(),
+      undefined, undefined, undefined, undefined, agentStore,
+    );
+    const { eventsResponse } = await admitAndOpen(local, create("stray-round1-tool"));
+    const frames = parseSse(await eventsResponse.text());
+    expect(frames.at(-1)?.data).toMatchObject({
+      kind: "done",
+      message: { text: answer, generationOutcome: "completed" },
+    });
+    expect(JSON.stringify(frames)).not.toContain("generation_provider_failed");
+    expect(executions).toBe(1);
+    const historyRows = await history(local);
+    expect(historyRows.some((row) => row.sender === "ai" && row.text === answer)).toBe(true);
     db.close();
   });
 });

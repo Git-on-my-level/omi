@@ -266,27 +266,51 @@ const priorOutcome = (
     summary: "The durable tool request has no terminal result.", retryable: false });
 };
 
+const REASONING_KEYS = Object.freeze(["reasoning_content", "reasoning"] as const);
+
+const captureReasoning = (
+  record: Record<string, unknown>,
+  into: { reasoning_content?: string; reasoning?: string },
+): void => {
+  const delta = gatewayDelta(record);
+  if (delta === null) return;
+  for (const key of REASONING_KEYS) {
+    const value = delta[key];
+    if (typeof value === "string" && value.length > 0) {
+      into[key] = `${into[key] ?? ""}${value}`;
+    }
+  }
+};
+
 const toolHistory = (
   call: ProviderToolCall,
   outcome: AgentToolOutcome,
-): readonly Readonly<Record<string, unknown>>[] => Object.freeze([
-  Object.freeze({
+  reasoning: Readonly<{ reasoning_content?: string; reasoning?: string }> = {},
+): readonly Readonly<Record<string, unknown>>[] => {
+  const assistant: Record<string, unknown> = {
     role: "assistant",
     content: null,
-    tool_calls: [Object.freeze({
-      id: call.id,
-      type: "function",
-      function: Object.freeze({ name: call.name, arguments: call.argumentsJson }),
-    })],
-  }),
-  Object.freeze({
-    role: "tool",
-    tool_call_id: call.id,
-    content: outcome.kind === "completed" ? outcome.summary
-      : outcome.kind === "failed" ? outcome.summary
-        : "The tool call did not complete.",
-  }),
-]);
+  };
+  for (const key of REASONING_KEYS) {
+    const value = reasoning[key];
+    if (typeof value === "string" && value.length > 0) assistant[key] = value;
+  }
+  assistant.tool_calls = [Object.freeze({
+    id: call.id,
+    type: "function",
+    function: Object.freeze({ name: call.name, arguments: call.argumentsJson }),
+  })];
+  return Object.freeze([
+    Object.freeze(assistant),
+    Object.freeze({
+      role: "tool",
+      tool_call_id: call.id,
+      content: outcome.kind === "completed" ? outcome.summary
+        : outcome.kind === "failed" ? outcome.summary
+          : "The tool call did not complete.",
+    }),
+  ]);
+};
 
 export const startGatewayReadOnlyToolLoop = (
   options: GatewayToolLoopStartOptions,
@@ -307,12 +331,26 @@ export const startGatewayReadOnlyToolLoop = (
       eventId: (runId, sequence, kind) => `${runId}:event:${sequence}:${kind}`,
     });
     let messages: readonly Readonly<Record<string, unknown>>[] = options.baseMessages;
+    const failLoop = (
+      round: number,
+      reason: string,
+      error: ReturnType<typeof gatewayFailure> = gatewayFailure("generation_provider_failed"),
+    ): void => {
+      chatLog("error", "tool_loop_failed", {
+        generationId: input.generationId,
+        attemptId,
+        round,
+        reason,
+      });
+      options.fail(error);
+    };
     for (let round = 0; round < 2 && !options.isCancelled(); round += 1) {
       let callId = "";
       let toolName = "";
       let argumentsJson = "";
       let sawToolCallFragment = false;
       let invalidToolCall = false;
+      const reasoning: { reasoning_content?: string; reasoning?: string } = {};
       const liveness = { signaledReasoning: false };
       const stream = await runGatewaySseRequest({
         fetch: options.fetch,
@@ -339,6 +377,7 @@ export const startGatewayReadOnlyToolLoop = (
         isCancelled: options.isCancelled,
         onRecord: (record) => {
           if (invalidToolCall) return;
+          captureReasoning(record, reasoning);
           if (gatewayDeltaReasoning(record) !== null && !liveness.signaledReasoning) {
             liveness.signaledReasoning = true;
             input.onDelta("");
@@ -349,7 +388,11 @@ export const startGatewayReadOnlyToolLoop = (
           const calls = delta?.tool_calls;
           if (calls !== undefined) {
             sawToolCallFragment = true;
-            if (!Array.isArray(calls) || calls.length !== 1 || round !== 0) {
+            // Round 1 asked for no tools. Do not execute a stray call, and do
+            // not set invalidToolCall: that would drop content already on the
+            // wire. The post-stream path completes if content arrived.
+            if (round !== 0) return;
+            if (!Array.isArray(calls) || calls.length !== 1) {
               invalidToolCall = true;
               return;
             }
@@ -386,12 +429,16 @@ export const startGatewayReadOnlyToolLoop = (
         retryEmptyDone: true,
       });
       if (options.isCancelled() || stream.kind === "cancelled") return;
-      if (stream.kind === "failed" || invalidToolCall) {
-        options.fail(stream.kind === "failed" ? stream.error : gatewayFailure("generation_provider_failed"));
+      if (stream.kind === "failed") {
+        failLoop(round, "gateway_stream_failed", stream.error);
+        return;
+      }
+      if (invalidToolCall) {
+        failLoop(round, "invalid_tool_call");
         return;
       }
       if (!stream.stats.sawDone && !stream.stats.sawContent && !sawToolCallFragment) {
-        options.fail(gatewayFailure("generation_provider_failed"));
+        failLoop(round, "empty_stream");
         return;
       }
       if (!stream.stats.sawDone) {
@@ -402,20 +449,36 @@ export const startGatewayReadOnlyToolLoop = (
           sawContent: stream.stats.sawContent,
         });
       }
+      if (round !== 0) {
+        if (stream.stats.sawContent) {
+          if (sawToolCallFragment) {
+            chatLog("warn", "tool_loop_ignored", {
+              generationId: input.generationId,
+              attemptId,
+              round,
+              reason: "tool_call_after_tool_round",
+            });
+          }
+          options.complete();
+          return;
+        }
+        failLoop(round, sawToolCallFragment ? "tool_call_after_tool_round" : "empty_content");
+        return;
+      }
       if (sawToolCallFragment && callId.length === 0 && toolName.length === 0 && argumentsJson.length === 0) {
-        options.fail(gatewayFailure("generation_provider_failed"));
+        failLoop(round, "empty_tool_call_fragments");
         return;
       }
       if (callId.length === 0 && toolName.length === 0 && argumentsJson.length === 0) {
         if (!stream.stats.sawContent) {
-          options.fail(gatewayFailure("generation_provider_failed"));
+          failLoop(round, "empty_content");
           return;
         }
         options.complete();
         return;
       }
-      if (round !== 0 || !SAFE_TOKEN.test(callId) || !SAFE_TOKEN.test(toolName)) {
-        options.fail(gatewayFailure("generation_provider_failed"));
+      if (!SAFE_TOKEN.test(callId) || !SAFE_TOKEN.test(toolName)) {
+        failLoop(round, "unsafe_tool_call_tokens");
         return;
       }
       const canonicalCallId = stableCallId(input);
@@ -430,10 +493,12 @@ export const startGatewayReadOnlyToolLoop = (
           outcome = appendSyntheticFailure(ledger, input, canonicalCallId, toolName, idem,
             "tool_invalid_input", "The tool request is invalid.");
         } catch {
-          options.fail(gatewayFailure("generation_provider_failed"));
+          failLoop(round, "tool_ledger_failed");
           return;
         }
-        messages = Object.freeze([...messages, ...toolHistory({ id: callId, name: toolName, argumentsJson }, outcome)]);
+        messages = Object.freeze([...messages, ...toolHistory(
+          { id: callId, name: toolName, argumentsJson }, outcome, reasoning,
+        )]);
         continue;
       }
       const idem = inputKey(toolName, parsedInput);
@@ -446,7 +511,7 @@ export const startGatewayReadOnlyToolLoop = (
           outcome = appendSyntheticFailure(ledger, input, canonicalCallId, toolName, idem,
             "tool_unknown", "The requested tool is unavailable.");
         } catch {
-          options.fail(gatewayFailure("generation_provider_failed"));
+          failLoop(round, "tool_ledger_failed");
           return;
         }
       } else {
@@ -457,7 +522,7 @@ export const startGatewayReadOnlyToolLoop = (
             outcome = appendSyntheticFailure(ledger, input, canonicalCallId, toolName, idem,
               "tool_unknown", "The requested tool is unavailable.");
           } catch {
-            options.fail(gatewayFailure("generation_provider_failed"));
+            failLoop(round, "tool_ledger_failed");
             return;
           }
         } else if (!validatesAgainstToolSchema(advertised, parsedInput)) {
@@ -465,13 +530,13 @@ export const startGatewayReadOnlyToolLoop = (
             outcome = appendSyntheticFailure(ledger, input, canonicalCallId, toolName, idem,
               "tool_invalid_input", "The tool request is invalid.");
           } catch {
-            options.fail(gatewayFailure("generation_provider_failed"));
+            failLoop(round, "tool_ledger_failed");
             return;
           }
         } else if (definition.risk === "approval-required") {
           const coordinator = options.loop.approvalCoordinator;
           if (coordinator === undefined) {
-            options.fail(gatewayFailure("generation_provider_failed"));
+            failLoop(round, "tool_approval_missing");
             return;
           }
           activeApprovalRunId = input.generationId;
@@ -497,7 +562,7 @@ export const startGatewayReadOnlyToolLoop = (
           activeApprovalRunId = null;
           if (options.isCancelled()) return;
           if (outcome.kind === "cancelled") {
-            options.fail(gatewayFailure("generation_provider_failed"));
+            failLoop(round, "tool_approval_cancelled");
             return;
           }
         } else {
@@ -507,7 +572,7 @@ export const startGatewayReadOnlyToolLoop = (
               toolName, timeoutMs: definition.timeoutMs, idempotencyKey: idem,
             });
           } catch {
-            options.fail(gatewayFailure("generation_provider_failed"));
+            failLoop(round, "tool_ledger_failed");
             return;
           }
           let ledgerError = false;
@@ -557,14 +622,16 @@ export const startGatewayReadOnlyToolLoop = (
             } catch { ledgerError = true; }
           }
           if (ledgerError || outcome.kind === "pending_approval" || outcome.kind === "cancelled") {
-            options.fail(gatewayFailure("generation_provider_failed"));
+            failLoop(round, ledgerError ? "tool_ledger_failed" : "tool_approval_cancelled");
             return;
           }
         }
       }
-      messages = Object.freeze([...messages, ...toolHistory({ id: callId, name: toolName, argumentsJson }, outcome)]);
+      messages = Object.freeze([...messages, ...toolHistory(
+        { id: callId, name: toolName, argumentsJson }, outcome, reasoning,
+      )]);
     }
-    if (!options.isCancelled()) options.fail(gatewayFailure("generation_provider_failed"));
+    if (!options.isCancelled()) failLoop(2, "tool_loop_exhausted");
   })();
 
   return Object.freeze({
