@@ -2719,4 +2719,94 @@ describe("ratified chat generation wire red proofs", () => {
     expect(historyRows.some((row) => row.sender === "ai" && row.text === answer)).toBe(true);
     db.close();
   });
+
+  test("OpenCode cost trailer after [DONE] still completes on the generation SSE", async () => {
+    // red-proof: ChatProduction consumes this stream. Live deepseek-v4-flash
+    // through zen/go delivered one character then terminated
+    // `generation_provider_failed` because the service reader rejected the
+    // post-DONE `{"choices":[],"cost":"0"}` trailer the gateway observer
+    // accepted. Stub replays that shape. Reasoning stays off the client wire.
+    const reasoning = "private-reasoning-not-for-client";
+    const answer = "Hey there!";
+    const agentStore = createInMemoryAgentRunEventStore();
+    const source = createGatewayChatGenerationSource({
+      gatewayUrl: "http://127.0.0.1:8787",
+      laneId: "omi:auto:chat-agent",
+      serviceToken: "service-secret",
+      retrySleep: async () => {},
+      readOnlyToolLoop: {
+        registry: createAgentToolRegistry([fixtureReadTool(async () => ({
+          summary: "Fixture is ready.", durationMs: 2, retryable: false,
+        }))]),
+        tool: fixtureReadToolSchema,
+        agentRunEvents: agentStore,
+        nowEpochMilliseconds: () => 2,
+      },
+      fetch: async () => {
+        const events = [
+          JSON.stringify({
+            choices: [{
+              index: 0,
+              delta: { role: "assistant", content: null, reasoning_content: reasoning },
+              finish_reason: null,
+            }],
+            usage: null,
+          }),
+          JSON.stringify({
+            choices: [{ index: 0, delta: { content: answer }, finish_reason: null }],
+            usage: null,
+          }),
+          JSON.stringify({
+            choices: [{ index: 0, delta: { content: null }, finish_reason: "stop" }],
+            usage: null,
+          }),
+          JSON.stringify({
+            choices: [],
+            usage: { prompt_tokens: 965, completion_tokens: 19, total_tokens: 984 },
+          }),
+          "[DONE]",
+          JSON.stringify({ choices: [], cost: "0" }),
+        ];
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            async start(controller) {
+              // Live Chat was already subscribed: it saw one content character
+              // then the terminal. Hold the first byte so this stream opens
+              // before the stub finishes.
+              await Bun.sleep(5);
+              for (const event of events) {
+                controller.enqueue(new TextEncoder().encode(`data: ${event}\n\n`));
+              }
+              controller.close();
+            },
+          }),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    });
+    const { db, local } = boot(
+      createInMemoryLocalServiceStores(),
+      source,
+      "opencode-done-trailer-proof",
+      createEmptyChatGenerationContextSource(),
+      undefined, undefined, undefined, undefined, agentStore,
+    );
+    const { eventsResponse } = await admitAndOpen(
+      local,
+      create("opencode-done-trailer", "say hi in three words"),
+    );
+    const frames = parseSse(await eventsResponse.text());
+    expect(frames.at(-1)?.data).toMatchObject({
+      kind: "done",
+      message: { text: answer, generationOutcome: "completed" },
+    });
+    const body = JSON.stringify(frames);
+    expect(body).not.toContain("generation_provider_failed");
+    expect(body).not.toContain(reasoning);
+    expect(body).not.toContain("reasoning_content");
+    expect(frames.some((frame) => frame.data.kind === "delta" && frame.data.text === answer)).toBe(true);
+    const historyRows = await history(local);
+    expect(historyRows.some((row) => row.sender === "ai" && row.text === answer)).toBe(true);
+    db.close();
+  });
 });

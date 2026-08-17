@@ -259,36 +259,93 @@ describe("gateway chat generation source", () => {
     expect(backing.list("generation-1").filter((event) => event.kind === "tool_request")).toHaveLength(0);
   });
 
-  test("rejects gateway data after the terminal SSE marker", async () => {
-    let completed = 0;
+  test("ignores gateway data after the terminal SSE marker and keeps pre-DONE content", async () => {
+    // GUARD CHANGED: OpenCode zen/go appends a valid-JSON trailer after
+    // [DONE]. The reader must complete rather than classify the 200 as
+    // invalid. Late frames are still not applied — "late" must not appear.
+    let executed = 0;
     const store = seedAgentLedger();
     const source = createGatewayChatGenerationSource({
       gatewayUrl: "https://gateway.internal",
       laneId: "omi:auto:chat-agent",
       serviceToken: "service-secret",
+      retrySleep: async () => {},
       readOnlyToolLoop: {
-        registry: createAgentToolRegistry([safeReadTool(async () => ({
-          summary: "must not run", durationMs: 1, retryable: false,
-        }))]),
+        registry: createAgentToolRegistry([safeReadTool(async () => {
+          executed += 1;
+          return { summary: "must not run", durationMs: 1, retryable: false };
+        })]),
         tool: readOnlyToolSchema,
         agentRunEvents: store,
         nowEpochMilliseconds: () => 2,
       },
-      fetch: async () => stream("[DONE]", JSON.stringify({ choices: [{ delta: { content: "late" } }] })),
+      fetch: async () => stream(
+        JSON.stringify({ choices: [{ delta: { content: "Hey there!" } }] }),
+        "[DONE]",
+        JSON.stringify({ choices: [{ delta: { content: "late" } }] }),
+      ),
     });
-    const failure = await new Promise<unknown>((resolve) => source.start(input({
-      onComplete: () => { completed += 1; }, onError: resolve,
-    })));
-    expect(failure).toEqual({ code: "generation_provider_failed", retryable: true });
-    expect(completed).toBe(0);
+    const answer = await new Promise<string>((resolve, reject) => {
+      const text: string[] = [];
+      source.start(input({
+        onDelta: (delta) => { if (delta.length > 0) text.push(delta); },
+        onComplete: () => resolve(text.join("")),
+        onError: reject,
+      }));
+    });
+    expect(answer).toBe("Hey there!");
+    expect(answer).not.toContain("late");
+    expect(executed).toBe(0);
   });
 
-  test("rejects an unterminated gateway fragment after the terminal SSE marker", async () => {
+  test("does not execute tool_calls that arrive after the terminal SSE marker", async () => {
+    let executed = 0;
     const store = seedAgentLedger();
     const source = createGatewayChatGenerationSource({
       gatewayUrl: "https://gateway.internal",
       laneId: "omi:auto:chat-agent",
       serviceToken: "service-secret",
+      retrySleep: async () => {},
+      readOnlyToolLoop: {
+        registry: createAgentToolRegistry([safeReadTool(async () => {
+          executed += 1;
+          return { summary: "must not run", durationMs: 1, retryable: false };
+        })]),
+        tool: readOnlyToolSchema,
+        agentRunEvents: store,
+        nowEpochMilliseconds: () => 2,
+      },
+      fetch: async () => stream(
+        JSON.stringify({ choices: [{ delta: { content: "Hey there!" } }] }),
+        "[DONE]",
+        JSON.stringify({
+          choices: [{ delta: { tool_calls: [{
+            index: 0, id: "late-call",
+            function: { name: "safe_fixture_status", arguments: "{\"scope\":\"current\"}" },
+          }] } }],
+        }),
+      ),
+    });
+    const answer = await new Promise<string>((resolve, reject) => {
+      const text: string[] = [];
+      source.start(input({
+        onDelta: (delta) => { if (delta.length > 0) text.push(delta); },
+        onComplete: () => resolve(text.join("")),
+        onError: reject,
+      }));
+    });
+    expect(answer).toBe("Hey there!");
+    expect(executed).toBe(0);
+    expect(store.list("generation-1").filter((event) => event.kind === "tool_request")).toHaveLength(0);
+  });
+
+  test("ignores an unterminated gateway fragment after the terminal SSE marker", async () => {
+    const store = seedAgentLedger();
+    const source = createGatewayChatGenerationSource({
+      gatewayUrl: "https://gateway.internal",
+      laneId: "omi:auto:chat-agent",
+      serviceToken: "service-secret",
+      retrySleep: async () => {},
       readOnlyToolLoop: {
         registry: createAgentToolRegistry([safeReadTool(async () => ({
           summary: "must not run", durationMs: 1, retryable: false,
@@ -297,10 +354,19 @@ describe("gateway chat generation source", () => {
         agentRunEvents: store,
         nowEpochMilliseconds: () => 2,
       },
-      fetch: async () => new Response("data: [DONE]\n\ndata: {\"choices\":[]}"),
+      fetch: async () => new Response(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hey there!\"}}]}\n\ndata: [DONE]\n\ndata: {\"choices\":[]}",
+      ),
     });
-    const failure = await new Promise<unknown>((resolve) => source.start(input({ onError: resolve })));
-    expect(failure).toEqual({ code: "generation_provider_failed", retryable: true });
+    const answer = await new Promise<string>((resolve, reject) => {
+      const text: string[] = [];
+      source.start(input({
+        onDelta: (delta) => { if (delta.length > 0) text.push(delta); },
+        onComplete: () => resolve(text.join("")),
+        onError: reject,
+      }));
+    });
+    expect(answer).toBe("Hey there!");
   });
 
   test("cancellation aborts a hanging safe tool and timeout records one terminal error", async () => {

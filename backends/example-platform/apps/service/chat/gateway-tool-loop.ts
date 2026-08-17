@@ -427,6 +427,13 @@ export const startGatewayReadOnlyToolLoop = (
         attemptId,
         sleep: options.retrySleep,
         retryEmptyDone: true,
+        // OpenCode zen/go (deepseek-v4-flash) appends a valid-JSON trailer
+        // after [DONE] (`{"choices":[],"cost":"0"}` or `event: ping`). The
+        // gateway observer counts those frames and still succeeds; without
+        // this flag the service reader classifies the same 200 as invalid.
+        // Post-DONE records are not applied (no extra content, no extra
+        // tool_calls). Same flag as the non-tool generation path.
+        allowDataAfterDone: true,
       });
       if (options.isCancelled() || stream.kind === "cancelled") return;
       if (stream.kind === "failed") {
@@ -437,6 +444,10 @@ export const startGatewayReadOnlyToolLoop = (
         failLoop(round, "invalid_tool_call");
         return;
       }
+      // Unreachable while retryEmptyDone is true: that retry converts a
+      // 200/[DONE] with no content and no tool calls into
+      // gateway_stream_failed before this branch. Kept so turning the retry
+      // off still names the invariant.
       if (!stream.stats.sawDone && !stream.stats.sawContent && !sawToolCallFragment) {
         failLoop(round, "empty_stream");
         return;
@@ -462,6 +473,10 @@ export const startGatewayReadOnlyToolLoop = (
           options.complete();
           return;
         }
+        // empty_content here is also unreachable while retryEmptyDone is
+        // true: no content and no tool calls already failed as
+        // gateway_stream_failed. A stray tool call with no content uses
+        // tool_call_after_tool_round instead.
         failLoop(round, sawToolCallFragment ? "tool_call_after_tool_round" : "empty_content");
         return;
       }
@@ -470,6 +485,10 @@ export const startGatewayReadOnlyToolLoop = (
         return;
       }
       if (callId.length === 0 && toolName.length === 0 && argumentsJson.length === 0) {
+        // Unreachable while retryEmptyDone is true: no content and no tool
+        // calls already failed as gateway_stream_failed after empty_done
+        // retries. Round-0 tool fragments with empty tokens take the branch
+        // above instead.
         if (!stream.stats.sawContent) {
           failLoop(round, "empty_content");
           return;

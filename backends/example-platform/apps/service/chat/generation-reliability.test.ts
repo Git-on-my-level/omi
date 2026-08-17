@@ -531,8 +531,10 @@ describe("chat generation reliability", () => {
     const reasons = readChatLog(runDir)
       .filter((row) => row.event === "tool_loop_failed")
       .map((row) => row.reason);
-    // empty_stream and empty_content still have distinct reasons in the
-    // loop, but retryEmptyDone surfaces those shapes as gateway_stream_failed.
+    // empty_stream and empty_content cannot fire while retryEmptyDone is
+    // true: a 200/[DONE] with no content and no tool calls is retried and
+    // then logged as gateway_stream_failed before the loop sees those
+    // branches. Do not list them here as if they were reachable.
     expect(reasons).toEqual([
       "gateway_stream_failed",
       "invalid_tool_call",
@@ -540,7 +542,119 @@ describe("chat generation reliability", () => {
       "unsafe_tool_call_tokens",
       "tool_call_after_tool_round",
     ]);
+    expect(reasons).not.toContain("empty_stream");
+    expect(reasons).not.toContain("empty_content");
     const raw = readFileSync(join(runDir, "logs", "chat.jsonl"), "utf8");
     expect(logLineHasSecret(raw, [SECRET_TOKEN, PROMPT, "Bearer ", "private-reasoning"])).toBe(false);
+  });
+
+  const deepseekStopBody = (answer: string): readonly string[] => Object.freeze([
+    JSON.stringify({
+      id: "chatcmpl-ds",
+      object: "chat.completion.chunk",
+      choices: [{
+        index: 0,
+        delta: { role: "assistant", content: null, reasoning_content: "The user asked to say hi." },
+        finish_reason: null,
+      }],
+      usage: null,
+    }),
+    JSON.stringify({
+      choices: [{
+        index: 0,
+        delta: { content: null, reasoning_content: " Three words." },
+        finish_reason: null,
+      }],
+      usage: null,
+    }),
+    JSON.stringify({
+      choices: [{ index: 0, delta: { content: answer }, finish_reason: null }],
+      usage: null,
+    }),
+    JSON.stringify({
+      choices: [{ index: 0, delta: { content: null }, finish_reason: "stop" }],
+      usage: null,
+    }),
+    JSON.stringify({
+      choices: [],
+      usage: { prompt_tokens: 965, completion_tokens: 19, total_tokens: 984 },
+    }),
+    "[DONE]",
+    JSON.stringify({ choices: [], cost: "0" }),
+  ]);
+
+  const deepseekToolCallBody = (): readonly string[] => Object.freeze([
+    JSON.stringify({
+      choices: [{
+        index: 0,
+        delta: { role: "assistant", content: null, reasoning_content: "I should check today's actions." },
+        finish_reason: null,
+      }],
+      usage: null,
+    }),
+    toolCallDelta(),
+    JSON.stringify({
+      choices: [{ index: 0, delta: { content: null }, finish_reason: "tool_calls" }],
+      usage: null,
+    }),
+    JSON.stringify({
+      choices: [],
+      usage: { prompt_tokens: 800, completion_tokens: 40, total_tokens: 840 },
+    }),
+    "[DONE]",
+    JSON.stringify({ choices: [], cost: "0" }),
+  ]);
+
+  test("OpenCode cost trailer after [DONE] does not fail a DeepSeek stop stream", async () => {
+    // red-proof: live round 0 on deepseek-v4-flash through zen/go was a 200
+    // with sawDone and finishReason=stop, then the service logged
+    // tool_loop_failed reason=gateway_stream_failed. The gateway observer
+    // accepted the post-DONE `{"choices":[],"cost":"0"}` trailer; the
+    // service reader did not. Stub replays that shape. No provider.
+    isolateLogs();
+    const answer = "Hey there!";
+    const result = await runSource(async () => sse(...deepseekStopBody(answer)), toolLoop());
+    expect(result.error).toBeNull();
+    expect(result.text).toBe(answer);
+    expect(result.usage).toEqual([expect.objectContaining({
+      inputTokens: 965,
+      outputTokens: 19,
+      totalTokens: 984,
+    })]);
+    const events = readChatLog(runDir).map((row) => row.event);
+    expect(events).not.toContain("tool_loop_failed");
+    expect(readChatLog(runDir).at(-1)).toMatchObject({ event: "generation_terminal", outcome: "done" });
+    const raw = readFileSync(join(runDir, "logs", "chat.jsonl"), "utf8");
+    expect(raw).not.toContain("The user asked to say hi.");
+    expect(logLineHasSecret(raw, [SECRET_TOKEN, PROMPT, "Bearer "])).toBe(false);
+  });
+
+  test("OpenCode cost trailer after [DONE] does not fail a DeepSeek tool_calls stream", async () => {
+    isolateLogs();
+    const answer = "You met Maya at Harborline.";
+    const result = await runSource(async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      const messages = Array.isArray(body.messages) ? body.messages as Record<string, unknown>[] : [];
+      if (!messages.some((message) => message.role === "tool")) {
+        return sse(...deepseekToolCallBody());
+      }
+      return sse(...deepseekStopBody(answer));
+    }, toolLoop());
+    expect(result.error).toBeNull();
+    expect(result.text).toBe(answer);
+    expect(readChatLog(runDir).some((row) => row.event === "tool_loop_failed")).toBe(false);
+    expect(readChatLog(runDir).at(-1)).toMatchObject({ event: "generation_terminal", outcome: "done" });
+  });
+
+  test("empty [DONE] is gateway_stream_failed, never empty_stream or empty_content", async () => {
+    isolateLogs();
+    const result = await runSource(async () => sse("[DONE]"), toolLoop());
+    expect(result.error).toEqual({ code: "generation_provider_failed", retryable: true });
+    const reasons = readChatLog(runDir)
+      .filter((row) => row.event === "tool_loop_failed")
+      .map((row) => row.reason);
+    expect(reasons).toEqual(["gateway_stream_failed"]);
+    expect(readChatLog(runDir).filter((row) => row.event === "provider_attempt_failed")
+      .every((row) => row.reason === "empty_done")).toBe(true);
   });
 });
