@@ -17,17 +17,11 @@ struct AIResponseView: View {
   var onEscape: (() -> Void)?
   /// Typing lives in the main app now — the bar only offers a jump there.
   var onOpenMainApp: (() -> Void)?
-  var onRate: ((String, Int?, ChatFeedbackReason?) -> Void)?
+  var onRate: ((String, Int?) -> Void)?
+  var onRateReason: ((String, String) -> Void)? = nil
   var onShareLink: (() async -> String?)?
   var onOpenAgent: ((UUID, @escaping (Bool) -> Void) -> Void)?
   var onOpenAgentRef: ((AgentTimelineRef, @escaping (Bool) -> Void) -> Void)? = nil
-  /// Tapping the grounded follow-up chip sends its question as a new user turn
-  /// in this same lane. Nil leaves the chip out entirely rather than rendering
-  /// one that does nothing.
-  var onAskFollowUp: ((String) -> Void)?
-  /// The "or hold ⌥ to ask aloud" hint, named for the shortcut actually bound.
-  /// Nil where push-to-talk is off or unavailable.
-  var followUpVoiceHint: String?
 
   var body: some View {
     VStack(alignment: .leading, spacing: OmiSpacing.md) {
@@ -125,13 +119,9 @@ struct AIResponseView: View {
         return ["chatFirstConversation", id].joined(separator: "\u{1E}")
       case .memoryLink(let id, _, _):
         return ["chatFirstMemory", id].joined(separator: "\u{1E}")
-      case .memoryReviewCard(let id, _, _, let items):
-        return ["memoryReviewCard", id, String(items.count)].joined(separator: "\u{1E}")
       case .citation(let id, let reference):
         return ["citation", id, String(reference.ordinal), reference.sourceID]
           .joined(separator: "\u{1E}")
-      case .followUp(let id, let text):
-        return ["followUp", id, text].joined(separator: "\u{1E}")
       case .agentSpawn(
         let id, let pillId, let sessionId, let runId, let title, let objective, let provider
       ):
@@ -230,21 +220,8 @@ struct AIResponseView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         // The floating/notch surface never opts into rich chat-first controls.
         // Keep journaled blocks inert if an older runtime projects them here.
-        // The review card is three controls and an inline editor over stored memories — the
-        // clearest case of a rich control this passive surface does not own.
-        case .questionCard, .taskCard, .goalLink, .captureLink, .conversationLink, .memoryLink,
-          .memoryReviewCard:
+        case .questionCard, .taskCard, .goalLink, .captureLink, .conversationLink, .memoryLink:
           EmptyView()
-        case .followUp(_, let question):
-          if let onAskFollowUp {
-            FollowUpChip(
-              question: question,
-              palette: .glass,
-              voiceHint: followUpVoiceHint,
-              action: { onAskFollowUp(question) }
-            )
-            .frame(maxWidth: .infinity, alignment: .leading)
-          }
         case .agentSpawn(
           _, let pillId, let sessionId, let runId, let title, let objective, let provider
         ):
@@ -321,8 +298,11 @@ struct AIResponseView: View {
   private func messageWithHoverActions(message: ChatMessage) -> some View {
     MessageHoverOverlay(
       message: message,
-      onRate: { [id = message.id] rating, reason in
-        onRate?(id, rating, reason)
+      onRate: { [id = message.id] rating in
+        onRate?(id, rating)
+      },
+      onRateReason: { [id = message.id] reason in
+        onRateReason?(id, reason)
       }
     ) {
       contentBlocksView(for: message)
@@ -570,7 +550,8 @@ struct AIResponseView: View {
 /// Overlay that shows action buttons (thumbs up/down, copy, info) on hover over an AI message
 struct MessageHoverOverlay<Content: View>: View {
   let message: ChatMessage
-  let onRate: (Int?, ChatFeedbackReason?) -> Void
+  let onRate: (Int?) -> Void
+  var onRateReason: ((String) -> Void)? = nil
   @ViewBuilder let content: () -> Content
 
   @State private var isHovered = false
@@ -579,6 +560,7 @@ struct MessageHoverOverlay<Content: View>: View {
   @State private var showInfoPopover = false
   @State private var hideWorkItem: DispatchWorkItem?
   @State private var showRatingFeedback = false
+  @State private var showReasonChips = false
   @State private var lastSubmittedRating: Int?
 
   private var shouldShowBar: Bool {
@@ -636,10 +618,7 @@ struct MessageHoverOverlay<Content: View>: View {
             let newRating = currentRating == 1 ? nil : 1
             guard newRating != lastSubmittedRating else { return }
             lastSubmittedRating = newRating
-            // The floating bar's hover overlay is too narrow for the reason
-            // chips the main chat window shows, so a voice thumbs-down records
-            // with no reason for now (the report calls that "not captured").
-            onRate(newRating, nil)
+            onRate(newRating)
             if newRating != nil { showRatingFeedbackBriefly() }
           }) {
             Image(systemName: currentRating == 1 ? "hand.thumbsup.fill" : "hand.thumbsup")
@@ -654,11 +633,12 @@ struct MessageHoverOverlay<Content: View>: View {
             let newRating = currentRating == -1 ? nil : -1
             guard newRating != lastSubmittedRating else { return }
             lastSubmittedRating = newRating
-            // The floating bar's hover overlay is too narrow for the reason
-            // chips the main chat window shows, so a voice thumbs-down records
-            // with no reason for now (the report calls that "not captured").
-            onRate(newRating, nil)
-            if newRating != nil { showRatingFeedbackBriefly() }
+            onRate(newRating)
+            if newRating == -1 {
+              showReasonChipsBriefly()
+            } else {
+              showReasonChips = false
+            }
           }) {
             Image(systemName: currentRating == -1 ? "hand.thumbsdown.fill" : "hand.thumbsdown")
               .scaledFont(size: OmiType.caption)
@@ -701,7 +681,24 @@ struct MessageHoverOverlay<Content: View>: View {
           }
         }
 
-        if showRatingFeedback {
+        if showReasonChips {
+          HStack(spacing: OmiSpacing.xxs) {
+            ForEach(
+              ChatRatingReason.chips(
+                isProactiveNotification: ChatContinuityInvariants.isProactiveNotification(message)),
+              id: \.rawValue
+            ) { reason in
+              Button(reason.chipLabel) {
+                onRateReason?(reason.rawValue)
+                showReasonChips = false
+                showRatingFeedbackBriefly()
+              }
+              .buttonStyle(.plain)
+              .scaledFont(size: OmiType.micro)
+              .foregroundColor(.secondary)
+            }
+          }
+        } else if showRatingFeedback {
           Text("Thank you")
             .scaledFont(size: OmiType.micro)
             .foregroundColor(.secondary)
@@ -710,6 +707,7 @@ struct MessageHoverOverlay<Content: View>: View {
       }
     }
     .omiAnimation(.easeInOut(duration: 0.2), value: showRatingFeedback)
+    .omiAnimation(.easeInOut(duration: 0.2), value: showReasonChips)
     .frame(maxWidth: .infinity, alignment: .trailing)
     .onHover { hovering in
       isBarHovered = hovering
@@ -723,8 +721,17 @@ struct MessageHoverOverlay<Content: View>: View {
 
   private func showRatingFeedbackBriefly() {
     showRatingFeedback = true
+    showReasonChips = false
     DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
       showRatingFeedback = false
+    }
+  }
+
+  private func showReasonChipsBriefly() {
+    showReasonChips = true
+    showRatingFeedback = false
+    DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
+      showReasonChips = false
     }
   }
 

@@ -1550,7 +1550,6 @@ export interface DailySummaryResponse {
   id?: string | null;
   knowledge_nuggets?: Array<DailySummaryKnowledgeNugget> | null;
   locations?: Array<DailySummaryLocationPin> | null;
-  memories_learned?: Array<LearnedMemoryRef>;
   overview?: string | null;
   stats?: DailySummaryDayStats | null;
   unresolved_questions?: Array<DailySummaryUnresolvedQuestion> | null;
@@ -1990,8 +1989,6 @@ export interface FeedbackCreate {
   subject_id: string;
   subject_kind: FeedbackSubjectKind;
 }
-
-export type FeedbackReason = "too_verbose" | "incorrect_or_hallucination" | "not_helpful_or_irrelevant" | "didnt_follow_instructions" | "other";
 
 export interface FeedbackRecord {
   action: TaskIntelligenceFeedbackAction;
@@ -2529,13 +2526,6 @@ export interface KnowledgeGraphResponse {
   node_limit?: number | null;
   nodes: Array<Record<string, unknown>>;
   truncated?: boolean;
-}
-
-export interface LearnedMemoryRef {
-  captured_at?: string | null;
-  category?: string;
-  content: string;
-  memory_id: string;
 }
 
 export interface LedgerMirrorAliasEnvelope {
@@ -3351,9 +3341,8 @@ export interface QuestionOption {
 }
 
 export interface RateMessageRequest {
-  comment?: string | null;
   rating?: number | null;
-  reason?: FeedbackReason | null;
+  reason?: string | null;
 }
 
 export interface RebuildResponse {
@@ -5000,7 +4989,6 @@ export interface OmiApiSchemas {
   "FairUseUsagePctResponse": FairUseUsagePctResponse;
   "FcmTokenResponse": FcmTokenResponse;
   "FeedbackCreate": FeedbackCreate;
-  "FeedbackReason": FeedbackReason;
   "FeedbackRecord": FeedbackRecord;
   "FeedbackSubjectKind": FeedbackSubjectKind;
   "FileChat": FileChat;
@@ -5069,7 +5057,6 @@ export interface OmiApiSchemas {
   "JITTriggerSnapshotEnvelope": JITTriggerSnapshotEnvelope;
   "JITTriggerSnapshotRowEnvelope": JITTriggerSnapshotRowEnvelope;
   "KnowledgeGraphResponse": KnowledgeGraphResponse;
-  "LearnedMemoryRef": LearnedMemoryRef;
   "LedgerMirrorAliasEnvelope": LedgerMirrorAliasEnvelope;
   "LedgerMirrorRowEnvelope": LedgerMirrorRowEnvelope;
   "LedgerMirrorSnapshotEnvelope": LedgerMirrorSnapshotEnvelope;
@@ -17753,7 +17740,7 @@ export async function get_shared_chat_messages_v2_messages_shared__token__get(pa
   return _res.status === 204 ? (undefined as any) : await _res.json();
 }
 
-export async function rate_message_v2_messages__message_id__rating_patch(path: { message_id: string }, header: { authorization?: string, X_App_Platform?: string, X_Device_Id_Hash?: string, X_App_Version?: string }, body: RateMessageRequest, init?: OmiApiClientInit): Promise<ChatRatingResponse> {
+export async function rate_message_v2_messages__message_id__rating_patch(path: { message_id: string }, header: { x_app_platform?: string | null, authorization?: string, X_App_Platform?: string, X_Device_Id_Hash?: string, X_App_Version?: string }, body: RateMessageRequest, init?: OmiApiClientInit): Promise<ChatRatingResponse> {
   const _base = init?.baseURL ?? "";
   const _path = `/v2/messages/${path.message_id}/rating`;
   const _search = "";
@@ -17763,6 +17750,7 @@ export async function rate_message_v2_messages__message_id__rating_patch(path: {
       ...(body ? { 'Content-Type': 'application/json' } : {}),
       ...(init?.token ? { Authorization: `Bearer ${init.token}` } : {}),
       ...init?.headers,
+      ...(header.x_app_platform !== undefined ? { "x-app-platform": String(header.x_app_platform) } : {}),
       ...(header.authorization !== undefined ? { "authorization": String(header.authorization) } : {}),
       ...(header.X_App_Platform !== undefined ? { "X-App-Platform": String(header.X_App_Platform) } : {}),
       ...(header.X_Device_Id_Hash !== undefined ? { "X-Device-Id-Hash": String(header.X_Device_Id_Hash) } : {}),

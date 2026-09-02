@@ -28,19 +28,14 @@ struct ChatMessageRatingQueue: Equatable {
     /// thumb still reports source=voice after sync (it must never silently
     /// default back to text at flush time).
     let surface: String
-    /// Why the user rated it down. Carried through the queue for the same
-    /// reason as `surface`: a reason picked before journal sync must reach the
-    /// backend after it, not be dropped on the way.
-    let reason: ChatFeedbackReason?
+    var reason: String?
   }
 
   private var pending: [String: Entry] = [:]
 
   var isEmpty: Bool { pending.isEmpty }
 
-  mutating func enqueue(
-    messageId: String, rating: Int?, surface: String = "text", reason: ChatFeedbackReason? = nil
-  ) {
+  mutating func enqueue(messageId: String, rating: Int?, surface: String = "text", reason: String? = nil) {
     pending.updateValue(Entry(rating: rating, surface: surface, reason: reason), forKey: messageId)
   }
 
@@ -68,8 +63,8 @@ struct ChatMessageRatingQueue: Equatable {
   /// and PATCH with the projected (remote) id so the backend row is found.
   mutating func drain(
     using messages: [ChatMessage]
-  ) -> [(messageId: String, rating: Int?, surface: String, reason: ChatFeedbackReason?)] {
-    var persist: [(messageId: String, rating: Int?, surface: String, reason: ChatFeedbackReason?)] = []
+  ) -> [(messageId: String, rating: Int?, surface: String, reason: String?)] {
+    var persist: [(messageId: String, rating: Int?, surface: String, reason: String?)] = []
     let snapshot = pending
     for (messageId, entry) in snapshot {
       guard let message = messages.first(where: { $0.id == messageId || $0.clientTurnId == messageId }) else {

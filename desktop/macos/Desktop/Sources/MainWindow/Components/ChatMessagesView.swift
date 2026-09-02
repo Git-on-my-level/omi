@@ -334,7 +334,8 @@ struct ChatMessagesView<WelcomeContent: View>: View {
   let isLoadingInitial: Bool
   let app: OmiApp?
   let onLoadMore: () async -> Void
-  let onRate: (String, Int?, ChatFeedbackReason?) -> Void
+  let onRate: (String, Int?) -> Void
+  var onRateReason: ((String, String) -> Void)? = nil
   var onCitationTap: ((Citation) -> Void)? = nil
   var onOpenInlineCitation: ((ChatCitationReference) -> Void)? = nil
   var sessionsLoadError: String? = nil
@@ -1026,8 +1027,11 @@ struct ChatMessagesView<WelcomeContent: View>: View {
           // Every Omi reply carries the identity mark — limiting it to the
           // newest reply left older answers looking unattributed.
           showsOmiMark: message.sender == .ai,
-          onRate: { rating, reason in
-            onRate(message.id, rating, reason)
+          onRate: { rating in
+            onRate(message.id, rating)
+          },
+          onRateReason: { reason in
+            onRateReason?(message.id, reason)
           },
           onCitationTap: { citation in
             onCitationTap?(citation)

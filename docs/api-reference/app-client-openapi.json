@@ -9964,13 +9964,6 @@
             ],
             "title": "Locations"
           },
-          "memories_learned": {
-            "items": {
-              "$ref": "#/components/schemas/LearnedMemoryRef"
-            },
-            "title": "Memories Learned",
-            "type": "array"
-          },
           "overview": {
             "anyOf": [
               {
@@ -12464,18 +12457,6 @@
         ],
         "title": "FeedbackCreate",
         "type": "object"
-      },
-      "FeedbackReason": {
-        "description": "Structured reason for a thumbs-down.\n\nThese five match the values the mobile client has always sent to\n`POST /v1/users/analytics/chat_message`; keeping them identical means the\nledger and the legacy `analytics` rows stay comparable.",
-        "enum": [
-          "too_verbose",
-          "incorrect_or_hallucination",
-          "not_helpful_or_irrelevant",
-          "didnt_follow_instructions",
-          "other"
-        ],
-        "title": "FeedbackReason",
-        "type": "string"
       },
       "FeedbackRecord": {
         "additionalProperties": false,
@@ -15778,42 +15759,6 @@
           "edges"
         ],
         "title": "KnowledgeGraphResponse",
-        "type": "object"
-      },
-      "LearnedMemoryRef": {
-        "description": "One memory the day actually produced, addressed by its canonical id.\n\nThis is the identity `knowledge_nuggets` never had: a client can render a\nnative review card and vote or correct through the existing memory\nendpoints. Review state (`user_review`, `edited`) is deliberately absent —\nclients read it live from the memory so a vote on one device shows on the\nother.",
-        "properties": {
-          "captured_at": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Captured At"
-          },
-          "category": {
-            "default": "",
-            "title": "Category",
-            "type": "string"
-          },
-          "content": {
-            "title": "Content",
-            "type": "string"
-          },
-          "memory_id": {
-            "title": "Memory Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "memory_id",
-          "content"
-        ],
-        "title": "LearnedMemoryRef",
         "type": "object"
       },
       "LedgerMirrorAliasEnvelope": {
@@ -20650,18 +20595,6 @@
       },
       "RateMessageRequest": {
         "properties": {
-          "comment": {
-            "anyOf": [
-              {
-                "maxLength": 1000,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Comment"
-          },
           "rating": {
             "anyOf": [
               {
@@ -20676,12 +20609,13 @@
           "reason": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/FeedbackReason"
+                "type": "string"
               },
               {
                 "type": "null"
               }
-            ]
+            ],
+            "title": "Reason"
           }
         },
         "title": "RateMessageRequest",
@@ -55582,7 +55516,7 @@
     },
     "/v1/users/analytics/chat_message": {
       "post": {
-        "description": "Submit feedback rating for a chat message.\n\nArgs:\n    message_id: ID of the message being rated\n    value: Rating value (1 = thumbs up, -1 = thumbs down, 0 = neutral/removed)\n    reason: Optional reason for thumbs down. Valid values:\n        - 'too_verbose': Response was too long or wordy\n        - 'incorrect_or_hallucination': Response contained incorrect information\n        - 'not_helpful_or_irrelevant': Response didn't address the question\n        - 'didnt_follow_instructions': Response didn't follow user instructions\n        - 'other': Other reason",
+        "description": "Submit feedback rating for a chat message.\n\nArgs:\n    message_id: ID of the message being rated\n    value: Rating value (1 = thumbs up, -1 = thumbs down, 0 = user cleared)\n    reason: Optional reason for thumbs down. Enum keys only.",
         "operationId": "set_chat_message_analytics_v1_users_analytics_chat_message_post",
         "parameters": [
           {
@@ -64395,6 +64329,22 @@
             "schema": {
               "title": "Message Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-app-platform",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-App-Platform"
             }
           },
           {
