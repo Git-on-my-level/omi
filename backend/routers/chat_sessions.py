@@ -16,6 +16,7 @@ import database.chat as chat_db
 import database.llm_usage as llm_usage_db
 from database.users import set_chat_message_rating_score
 from models.chat import Message
+from models.feedback import MAX_COMMENT_LENGTH, FeedbackReason, FeedbackSurface
 from models.chat_session import (
     ChatSessionResponse,
     DeleteMessagesResponse,
@@ -25,7 +26,8 @@ from models.chat_session import (
 )
 from models.shared import StatusResponse
 from utils.chat import initial_message_util
-from utils.chat_rating_triage import RATING_REASON_PATTERN, extract_rating_triage_fields, normalize_rating_reason
+from utils.chat_rating_triage import extract_rating_triage_fields
+from utils.feedback import record_chat_message_feedback
 from utils.llm.clients import get_llm
 from utils.llm.usage_tracker import Features, track_usage
 from utils.other import endpoints as auth
@@ -73,7 +75,11 @@ class SaveMessageRequest(BaseModel):
 class RateMessageRequest(BaseModel):
     rating: int | None = Field(None, ge=-1, le=1)
     app_version: str | None = None
-    reason: str | None = Field(None, pattern=RATING_REASON_PATTERN)
+    # `reason`/`comment` explain a thumbs-down; `surface` keeps notification
+    # ratings distinct from ordinary chat answers in the unified ledger.
+    reason: FeedbackReason | None = None
+    comment: str | None = Field(None, max_length=MAX_COMMENT_LENGTH)
+    surface: str = Field('text', pattern=r'^(text|voice|notification)$')
 
 
 class InitialMessageRequest(BaseModel):
@@ -265,14 +271,30 @@ def rate_message(
     # appear in the admin dashboard chat ratings chart.
     value = request.rating if request.rating is not None else 0
     triage = extract_rating_triage_fields(snapshot)
+    reason = request.reason.value if request.reason else None
     set_chat_message_rating_score(
         uid,
         message_id,
         value,
-        reason=normalize_rating_reason(request.reason),
+        reason=reason,
         platform='desktop',
         app_version=request.app_version,
         notification_kind=triage.get('notification_kind'),
+        app_id=triage.get('app_id'),
+    )
+    record_chat_message_feedback(
+        uid,
+        message_id,
+        value,
+        surface={
+            'text': FeedbackSurface.chat_text,
+            'voice': FeedbackSurface.chat_voice,
+            'notification': FeedbackSurface.chat_notification,
+        }.get(request.surface, FeedbackSurface.chat_text),
+        reason=reason,
+        comment=request.comment,
+        platform='desktop',
+        app_version=request.app_version,
         app_id=triage.get('app_id'),
     )
     return {'status': 'ok'}

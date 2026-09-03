@@ -68,6 +68,7 @@ from utils.llm.goals import extract_and_update_goal_progress
 from database.redis_db import try_acquire_goal_extraction_lock, check_rate_limit, store_chat_share, get_chat_share
 from database.users import set_chat_message_rating_score
 from utils.chat_rating_triage import extract_rating_triage_fields, normalize_rating_reason
+from utils.feedback import record_chat_message_feedback
 from utils.rate_limit_config import get_effective_limit, RATE_LIMIT_SHADOW
 from utils.llm.gateway_client import CHAT_AGENT_ROUTE_DIRECT, get_chat_agent_route
 from utils.subscription import enforce_chat_quota, is_trial_paywalled
@@ -2025,6 +2026,15 @@ def rate_message(
         reason=reason,
         platform=platform,
         notification_kind=triage.get('notification_kind'),
+        app_id=triage.get('app_id'),
+    )
+    record_chat_message_feedback(
+        uid,
+        message_id,
+        value,
+        reason=reason,
+        comment=data.comment,
+        platform=platform,
         app_id=triage.get('app_id'),
     )
 
