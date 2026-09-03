@@ -3790,7 +3790,7 @@ class FloatingControlBarManager {
       evaluationID: evaluation, suggestionID: stored.notificationID)
   }
 
-  func storedNotification(forContinuityKey key: String?) -> StoredNotificationMessage? {
+  private func storedNotification(forContinuityKey key: String?) -> StoredNotificationMessage? {
     guard let key, let ownerID = RuntimeOwnerIdentity.currentOwnerId() else { return nil }
     return storedNotificationMessages.values.first {
       $0.messageClientTurnId == key && $0.ownerID == ownerID
