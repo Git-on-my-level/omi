@@ -118,9 +118,13 @@ struct AIResponseView: View {
         return ["chatFirstConversation", id].joined(separator: "\u{1E}")
       case .memoryLink(let id, _, _):
         return ["chatFirstMemory", id].joined(separator: "\u{1E}")
+      case .memoryReviewCard(let id, _, _, let items):
+        return ["memoryReviewCard", id, String(items.count)].joined(separator: "\u{1E}")
       case .citation(let id, let reference):
         return ["citation", id, String(reference.ordinal), reference.sourceID]
           .joined(separator: "\u{1E}")
+      case .followUp(let id, let text):
+        return ["followUp", id, text].joined(separator: "\u{1E}")
       case .agentSpawn(
         let id, let pillId, let sessionId, let runId, let title, let objective, let provider
       ):
@@ -219,7 +223,8 @@ struct AIResponseView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         // The floating/notch surface never opts into rich chat-first controls.
         // Keep journaled blocks inert if an older runtime projects them here.
-        case .questionCard, .taskCard, .goalLink, .captureLink, .conversationLink, .memoryLink:
+        case .questionCard, .taskCard, .goalLink, .captureLink, .conversationLink, .memoryLink,
+          .memoryReviewCard, .followUp:
           EmptyView()
         case .agentSpawn(
           _, let pillId, let sessionId, let runId, let title, let objective, let provider

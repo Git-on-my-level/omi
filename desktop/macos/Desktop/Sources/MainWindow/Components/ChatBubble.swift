@@ -549,6 +549,33 @@ struct ChatBubble: View {
           navigation: chatFirstRichBlockContext.navigation
         )
       )
+    case .memoryReviewCard(_, let summaryID, let date, let items):
+      return AnyView(MemoryReviewCardView(summaryID: summaryID, date: date, items: items))
+    case .followUp(_, let question):
+      guard let chatFirstRichBlockContext else { return AnyView(EmptyView()) }
+      let provider = chatFirstRichBlockContext.chatProvider
+      return AnyView(
+        FollowUpChip(
+          question: question,
+          palette: .standard,
+          action: {
+            Task { @MainActor in
+              _ = await provider.sendMessage(
+                question,
+                surfaceRef: provider.mainChatSurfaceReference(),
+                turnOwner: .mainChat,
+                onAccepted: {
+                  AnalyticsManager.shared.questionOriginating(.followUp)
+                  AnalyticsManager.shared.chatMessageSent(
+                    messageLength: question.count,
+                    source: "follow_up_chip"
+                  )
+                }
+              )
+            }
+          }
+        )
+      )
     case .agentSpawn(
       _, let pillId, let sessionId, let runId, let title, let objective, let provider
     ):
@@ -1147,6 +1174,8 @@ enum ContentBlockGroup: Identifiable {
     recommendedActionItems: [ConversationLinkActionItem]
   )
   case memoryLink(id: String, memoryID: String, summary: String)
+  case memoryReviewCard(id: String, summaryID: String, date: String, items: [MemoryReviewItem])
+  case followUp(id: String, question: String)
   case agentSpawn(
     id: String,
     pillId: UUID?,
@@ -1180,6 +1209,8 @@ enum ContentBlockGroup: Identifiable {
     case .captureLink(let id, _, _, _): return id
     case .conversationLink(let id, _, _, _): return id
     case .memoryLink(let id, _, _): return id
+    case .memoryReviewCard(let id, _, _, _): return id
+    case .followUp(let id, _): return id
     case .agentSpawn(let id, _, _, _, _, _, _): return id
     case .agentCompletion(let id, _, _, _, _, _, _, _): return id
     }
@@ -1251,6 +1282,13 @@ enum ContentBlockGroup: Identifiable {
         flushToolCalls()
         guard richBlockRenderingEnabled else { continue }
         groups.append(.memoryLink(id: id, memoryID: memoryID, summary: summary))
+      case .memoryReviewCard(let id, let summaryID, let date, let items):
+        flushToolCalls()
+        guard !items.isEmpty else { continue }
+        groups.append(.memoryReviewCard(id: id, summaryID: summaryID, date: date, items: items))
+      case .followUp(let id, let question):
+        flushToolCalls()
+        groups.append(.followUp(id: id, question: question))
       case .citation:
         // Answer-level provenance is rendered by OmiMarkdown at the inline marker.
         continue
@@ -1355,6 +1393,10 @@ enum ContentBlockGroup: Identifiable {
       case .discoveryCard, .questionCard, .taskCard, .goalLink, .captureLink, .conversationLink, .memoryLink,
         .agentSpawn, .agentCompletion:
         return group
+      case .memoryReviewCard:
+        return isStreaming ? nil : group
+      case .followUp:
+        return isStreaming ? nil : group
       case .thinking:
         return isStreaming ? group : nil
       case .toolCalls(let id, let calls):
