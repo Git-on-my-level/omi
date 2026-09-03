@@ -221,7 +221,7 @@ final class ChatDiscoverabilityTests: XCTestCase {
         declaredTools.insert(name)
       }
     }
-    let localApiOnlyTools: Set<String> = ["get_local_status", "get_screenshot"]
+    let localApiOnlyTools: Set<String> = ["get_local_status", "get_screenshot", "look_at_frame"]
 
     for toolName in DesktopCapabilityRegistry.desktopToolNames where !localApiOnlyTools.contains(toolName) {
       XCTAssertTrue(declaredTools.contains(toolName), "Missing agent tool declaration for \(toolName)")
