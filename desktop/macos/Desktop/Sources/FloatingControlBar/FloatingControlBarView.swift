@@ -1647,6 +1647,13 @@ struct FloatingControlBarView: View {
     FloatingControlBarManager.shared.sharedFloatingProvider
   }
 
+  @MainActor static func followUpVoiceHint(settings: ShortcutSettings = ShortcutSettings.shared) -> String? {
+    guard settings.pttEnabled else { return nil }
+    let tokens = settings.pttShortcut.displayTokens
+    guard let token = tokens.first, !token.isEmpty else { return nil }
+    return "or hold \(token) to ask aloud"
+  }
+
   private var aiResponseView: some View {
     // Re-read derived content when viewport anchors or streamed answer tokens change.
     let _ = state.chatViewport

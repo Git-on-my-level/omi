@@ -94,7 +94,7 @@ final class ChatMessageRatingPersistenceTests: XCTestCase {
     // under "not_captured" — indistinguishable from never having asked.
     var queue = ChatMessageRatingQueue()
     queue.enqueue(
-      messageId: "m1", rating: -1, surface: "text", reason: .incorrectOrHallucination)
+      messageId: "m1", rating: -1, surface: "text", reason: "incorrect_or_hallucination")
 
     let unsynced = ChatMessage(id: "m1", text: "Done.", sender: .ai, isSynced: false)
     XCTAssertTrue(queue.drain(using: [unsynced]).isEmpty)
@@ -102,7 +102,7 @@ final class ChatMessageRatingPersistenceTests: XCTestCase {
     let synced = ChatMessage(id: "m1", text: "Done.", sender: .ai, isSynced: true)
     let ready = queue.drain(using: [synced])
     XCTAssertEqual(ready.count, 1)
-    XCTAssertEqual(ready.first?.reason, .incorrectOrHallucination)
+    XCTAssertEqual(ready.first?.reason, "incorrect_or_hallucination")
     XCTAssertEqual(ready.first?.rating, -1)
   }
 

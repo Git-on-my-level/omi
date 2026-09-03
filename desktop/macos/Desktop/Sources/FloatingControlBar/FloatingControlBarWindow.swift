@@ -160,7 +160,7 @@ class FloatingControlBarWindow: NSPanel, NSWindowDelegate {
     .canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle,
   ]
   static let notchExpandedWidth: CGFloat = 382
-  private static let notificationWidth: CGFloat = 508
+  static let notificationWidth: CGFloat = 508
   private static let notificationHeight: CGFloat = 128
   private static let notificationSpacing: CGFloat = 8
   /// Vertical room for the readable PTT status banner under chrome/pill.
@@ -962,6 +962,33 @@ class FloatingControlBarWindow: NSPanel, NSWindowDelegate {
       listeningSize: listeningSize,
       thinkingSize: thinkingSize,
       idleSize: idleSize
+    )
+  }
+
+  /// The complete closed surface, including any transient PTT status banner.
+  /// Keep this compatibility seam because geometry tests and workspace
+  /// transitions use it as the single composed-size authority.
+  func closedSurfaceSize(usesNotchIsland: Bool, screen: NSScreen? = nil) -> NSSize {
+    let collapsed = collapsedChromeSurfaceSize(usesNotchIsland: usesNotchIsland, screen: screen)
+    guard !state.pttHintText.isEmpty else { return collapsed }
+    return FloatingControlBarGeometry.notificationPreservingSurfaceSize(
+      transientSize: pttHintSurfaceSize(usesNotchIsland: usesNotchIsland, screen: screen),
+      hasMountedNotification: state.currentNotification != nil,
+      notificationSize: collapsed,
+      additionalHeight: Self.pttStatusBannerBudget
+    )
+  }
+
+  private func notificationSurfaceSize(usesNotchIsland: Bool, screen: NSScreen? = nil) -> NSSize {
+    let barHeight: CGFloat
+    if usesNotchIsland {
+      barHeight = screen.map { Self.notchChromeHeight(for: $0) } ?? notchChromeHeightForCurrentScreen
+    } else {
+      barHeight = state.isHoveringBar ? Self.expandedBarSize.height : Self.minBarSize.height
+    }
+    return NSSize(
+      width: Self.notificationWidth,
+      height: barHeight + Self.notificationSpacing + Self.notificationHeight
     )
   }
 
@@ -2177,6 +2204,22 @@ class FloatingControlBarWindow: NSPanel, NSWindowDelegate {
       toSurfaceSize: expanded ? Self.voiceBarSize : Self.minBarSize,
       animated: true,
       animationDuration: 0.18
+    )
+  }
+
+  func pushToTalkSurfaceSize(expanded: Bool) -> NSSize {
+    let usesNotchIsland = notchModeEnabled
+    let voiceSize: NSSize
+    if usesNotchIsland {
+      voiceSize = expanded ? notchSize(active: true) : notchCollapsedSize
+    } else {
+      voiceSize = expanded ? Self.voiceBarSize : Self.minBarSize
+    }
+    return FloatingControlBarGeometry.notificationPreservingSurfaceSize(
+      transientSize: voiceSize,
+      hasMountedNotification: state.currentNotification != nil,
+      notificationSize: notificationSurfaceSize(usesNotchIsland: usesNotchIsland),
+      additionalHeight: state.pttHintText.isEmpty ? 0 : Self.pttStatusBannerBudget
     )
   }
   /// Size the notch to fit the "thinking" indicator (active width) while a PTT
