@@ -149,6 +149,28 @@ client_stub.get_firestore_client = MagicMock(return_value=mock_db)
 client_stub.data_plane_db = mock_db
 client_stub.get_data_plane_firestore_client = MagicMock(return_value=mock_db)
 
+# Keep this hermetic import test independent from the process-global Prometheus
+# registry. database.users now imports account_deletion_marker, which imports
+# firestore_read_metrics; importing a fresh real metrics module after another
+# collected test has registered the same counters raises a duplicate-timeseries
+# error before any migration assertion runs.
+firestore_read_metrics_stub = _stub_module("database.firestore_read_metrics")
+firestore_read_metrics_stub.FirestoreReadFamily = types.SimpleNamespace(
+    ACTION_ITEMS_LIST="action_items_list",
+    ACTION_ITEMS_VISIBLE_IDS="action_items_visible_ids",
+)
+firestore_read_metrics_stub.FirestoreReadMode = types.SimpleNamespace(UNBOUNDED="unbounded", BOUNDED="bounded")
+firestore_read_metrics_stub.FirestoreReadSite = types.SimpleNamespace(
+    USER_DELETION_WIPE_STATUS="user_deletion_wipe_status"
+)
+firestore_read_metrics_stub.FirestoreReadOutcome = types.SimpleNamespace(HIT="hit", MISS="miss")
+firestore_read_metrics_stub.record_firestore_read = MagicMock()
+firestore_read_metrics_stub.record_document_read = MagicMock()
+firestore_cache_metrics_stub = _stub_module("database.firestore_cache_metrics")
+firestore_cache_metrics_stub.record_request = MagicMock()
+firestore_cache_metrics_stub.observe_fetch = MagicMock()
+firestore_cache_metrics_stub.observe_payload = MagicMock()
+
 # Stub database.helpers (used by chat.py)
 helpers_stub = _stub_module("database.helpers")
 helpers_stub.set_data_protection_level = lambda **kw: (lambda f: f)
