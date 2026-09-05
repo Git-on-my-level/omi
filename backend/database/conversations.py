@@ -18,6 +18,7 @@ from models.conversation_enums import ConversationStatus, PostProcessingModel, P
 from models.conversation_photo import ConversationPhoto
 from models.transcript_segment import TranscriptSegment
 from utils import encryption
+from utils.conversations import typesense_index as conversation_typesense_index
 from utils.conversations.transcript_hash import (
     canonicalize_transcript_segments_for_storage,
     transcript_sha256_for_binding,
@@ -47,6 +48,11 @@ logger = logging.getLogger(__name__)
 conversations_collection = 'conversations'
 
 _LIFECYCLE_FIELDS = frozenset({'status', 'discarded'})
+# Top-level fields behind the Typesense conversation projection (see
+# utils/conversations/typesense_index.py). A generic update re-syncs the index
+# only when it touches one of these roots — segment/photo/app-result writes
+# never reach Typesense, so they must not pay for it.
+_SEARCH_INDEXED_FIELD_ROOTS = frozenset({'structured', 'created_at', 'started_at', 'finished_at', 'geolocation'})
 _PUBLIC_TRANSCRIPT_MAX_STORED_BYTES = 256 * 1024
 _PUBLIC_TRANSCRIPT_MAX_DECODED_BYTES = 512 * 1024
 _PUBLIC_TRANSCRIPT_MAX_SEGMENTS = 4096
@@ -473,6 +479,7 @@ def upsert_conversation_with_lifecycle(uid: str, conversation_data: dict):
         transaction.set(conversation_ref, write_data)
 
     _write_processing_result(transaction)
+    conversation_typesense_index.sync_conversation_index_after_write(uid, conversation_data['id'])
 
 
 @set_data_protection_level(data_arg_name='conversation_data')
@@ -544,7 +551,14 @@ def persist_processing_result_with_lifecycle(
         transaction.set(conversation_ref, write_data, merge=True)
         return True
 
-    return _persist(transaction)
+    persisted = _persist(transaction)
+    if persisted:
+        conversation_typesense_index.sync_conversation_index_after_write(uid, conversation_data['id'])
+    else:
+        # A processor result for a conversation whose owner is already gone:
+        # converge the search index to absence too.
+        conversation_typesense_index.delete_conversation_index_doc(uid, conversation_data['id'])
+    return persisted
 
 
 @set_data_protection_level(data_arg_name='conversation_data')
@@ -566,9 +580,10 @@ def create_conversation_if_absent_with_lifecycle(uid: str, conversation_data: di
     conversation_ref = user_ref.collection(conversations_collection).document(conversation_data['id'])
     try:
         conversation_ref.create(conversation_data)
-        return True
     except (AlreadyExists, Conflict):
         return False
+    conversation_typesense_index.sync_conversation_index_after_write(uid, conversation_data['id'])
+    return True
 
 
 @prepare_for_read(decrypt_func=_prepare_conversation_for_read)
@@ -939,6 +954,8 @@ def update_conversation(uid: str, conversation_id: str, update_data: dict) -> bo
         # audio sync take their designed gone-owner path (stop syncing, release
         # the audio budget) instead of logging an ERROR and retrying forever.
         return False
+    if _SEARCH_INDEXED_FIELD_ROOTS.intersection(str(key).split('.', 1)[0] for key in update_data):
+        conversation_typesense_index.sync_conversation_index_after_write(uid, conversation_id)
     return True
 
 
@@ -1076,6 +1093,7 @@ def update_conversation_title(uid: str, conversation_id: str, title: str):
         return
 
     conversation_ref.update({'structured.title': title, 'user_title': title})
+    conversation_typesense_index.sync_conversation_index_after_write(uid, conversation_id)
 
 
 def update_conversation_summary(uid: str, conversation_id: str, app_id: Optional[str], content: str) -> str:
@@ -1098,6 +1116,7 @@ def update_conversation_summary(uid: str, conversation_id: str, app_id: Optional
 
     if app_id is None:
         conversation_ref.update({'structured.overview': content})
+        conversation_typesense_index.sync_conversation_index_after_write(uid, conversation_id)
         return 'ok'
 
     raw = doc_snapshot.to_dict() or {}
@@ -1225,6 +1244,7 @@ def delete_conversation(uid, conversation_id):
     for sub in conversation_ref.collections():
         delete_collection_recursive(sub, client=db)
     conversation_ref.delete()
+    conversation_typesense_index.delete_conversation_index_doc(uid, conversation_id)
 
 
 @prepare_for_read(decrypt_func=_prepare_conversation_for_read)
@@ -1521,12 +1541,14 @@ def set_conversation_as_discarded(uid: str, conversation_id: str):
     user_ref = db.collection('users').document(uid)
     conversation_ref = user_ref.collection(conversations_collection).document(conversation_id)
     conversation_ref.update({'discarded': True})
+    conversation_typesense_index.sync_conversation_index_after_write(uid, conversation_id)
 
 
 def restore_conversation_from_discarded(uid: str, conversation_id: str):
     user_ref = db.collection('users').document(uid)
     conversation_ref = user_ref.collection(conversations_collection).document(conversation_id)
     conversation_ref.update({'discarded': False})
+    conversation_typesense_index.sync_conversation_index_after_write(uid, conversation_id)
 
 
 # *********************************
@@ -1661,6 +1683,7 @@ def update_conversation_finished_at(uid: str, conversation_id: str, finished_at:
     user_ref = db.collection('users').document(uid)
     conversation_ref = user_ref.collection(conversations_collection).document(conversation_id)
     conversation_ref.update({'finished_at': finished_at})
+    conversation_typesense_index.sync_conversation_index_after_write(uid, conversation_id)
 
 
 def _invalidate_client_processing(payload: Dict[str, Any]) -> None:

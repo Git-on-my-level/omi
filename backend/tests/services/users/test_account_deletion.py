@@ -1446,6 +1446,11 @@ def test_purge_derived_user_data_isolates_backends_and_reloads_conversation_ids(
         'purge_canonical_derived_user_data',
         MagicMock(return_value={'vector_ids': ['canonical-1', 'canonical-2']}),
     )
+    monkeypatch.setattr(
+        account_deletion,
+        'purge_user_conversation_index',
+        lambda uid, raise_on_failure=False: calls.append(('purge_typesense', uid)) or 4,
+    )
     monkeypatch.setattr(account_deletion, 'get_conversation_photos', lambda uid, conversation_id: [])
     monkeypatch.setattr(
         account_deletion.frame_requests_db, 'list_all_frame_request_storage_ids', lambda uid: ['request-object']
@@ -1478,12 +1483,14 @@ def test_purge_derived_user_data_isolates_backends_and_reloads_conversation_ids(
         ('delete_screen_vectors', 'uid1', ['s1']),
         ('recordings', 'uid1'),
         ('get_conversations', 'uid1'),
+        ('purge_typesense', 'uid1'),
     ]
     assert result == {
         'required_failures': [],
         'best_effort_failures': [],
         'vectors_deleted': 8,
         'recordings_deleted': 3,
+        'conversation_typesense_docs_deleted': 4,
     }
     delete_frame_pixels.assert_called_once_with('uid1', ['request-object', 'orphan-object', 'deferred-object'])
 
@@ -1506,6 +1513,9 @@ def test_purge_derived_user_data_continues_after_each_failure(monkeypatch):
     monkeypatch.setattr(
         account_deletion, 'purge_canonical_derived_user_data', MagicMock(side_effect=Exception('canonical down'))
     )
+    monkeypatch.setattr(
+        account_deletion, 'purge_user_conversation_index', MagicMock(side_effect=Exception('typesense down'))
+    )
 
     result = account_deletion.purge_derived_user_data('uid1')
 
@@ -1527,6 +1537,7 @@ def test_purge_derived_user_data_continues_after_each_failure(monkeypatch):
         'conversation_recordings',
         'frame_request_pixels',
         'canonical_derived_data',
+        'conversation_typesense_index',
     ]
     assert result['best_effort_failures'] == []
 

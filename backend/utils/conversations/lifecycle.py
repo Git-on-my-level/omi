@@ -34,6 +34,7 @@ from utils.conversations.finalization_decision import (
 )
 from utils.observability.fallback import record_fallback
 from utils.other.storage import delete_conversation_audio_files
+from utils.conversations.typesense_index import delete_conversation_index_doc
 from utils.journey_metrics_contract import bounded_client_kind
 from utils.observability.journeys import record_client_journey_accepted, record_journey_accepted
 
@@ -574,6 +575,10 @@ def delete_empty_recording_conversation(
         # are a subcollection and need their physical cleanup afterwards.
         conversations_db.delete_conversation_photos(uid, conversation_id)
         _discard_unreferenced_audio(uid, conversation_id, deleted_conversation)
+        # This path deletes the Firestore row in its own transaction inside
+        # recording_sessions_db, so conversations_db.delete_conversation's
+        # index cleanup never runs; converge the search index here instead.
+        delete_conversation_index_doc(uid, conversation_id)
     return deleted
 
 

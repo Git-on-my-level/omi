@@ -62,6 +62,8 @@ def users_service():
         "utils.retrieval": _pkg("utils.retrieval"),
         "utils.retrieval.frame_request_storage": AutoMockModule("utils.retrieval.frame_request_storage"),
         "utils.twilio_service": AutoMockModule("utils.twilio_service"),
+        "utils.conversations": _pkg("utils.conversations"),
+        "utils.conversations.typesense_index": AutoMockModule("utils.conversations.typesense_index"),
     }
     with stub_modules(fakes):
         module = load_module_fresh(

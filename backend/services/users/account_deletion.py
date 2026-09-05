@@ -44,6 +44,7 @@ from utils.retrieval.frame_request_storage import (
     delete_all_frame_request_pixels_for_user,
     delete_frame_request_pixels_for_user,
 )
+from utils.conversations.typesense_index import purge_user_conversation_index
 from utils.twilio_service import delete_user_caller_ids_strict as delete_user_caller_ids
 from utils.integration_telemetry import emit_posthog_event
 from services.users.agent_vm_account_cleanup import delete_agent_vm_for_account
@@ -61,6 +62,7 @@ class PurgeResult(TypedDict):
     best_effort_failures: list[PurgeFailure]
     vectors_deleted: int
     recordings_deleted: int
+    conversation_typesense_docs_deleted: int
 
 
 ACCOUNT_DELETION_WIPE_COMPLETED = 'Account Deletion Wipe Completed'
@@ -100,6 +102,7 @@ def purge_derived_user_data(uid: str) -> PurgeResult:
         'best_effort_failures': [],
         'vectors_deleted': 0,
         'recordings_deleted': 0,
+        'conversation_typesense_docs_deleted': 0,
     }
 
     def record_failure(
@@ -222,6 +225,16 @@ def purge_derived_user_data(uid: str) -> PurgeResult:
     except Exception as e:
         record_failure('required_failures', 'canonical_derived_data', e)
         logger.error(f'delete_account purge canonical vectors failed for {uid}: {sanitize(str(e))}')
+
+    try:
+        # The search index is derived PII: leaving conversation documents
+        # readable after account deletion is a privacy failure, so this purge
+        # is required, like the vector purges. It is filter-based (userId),
+        # so a failed attempt stays retryable even after the Firestore wipe.
+        result['conversation_typesense_docs_deleted'] = purge_user_conversation_index(uid, raise_on_failure=True)
+    except Exception as e:
+        record_failure('required_failures', 'conversation_typesense_index', e)
+        logger.error(f'delete_account purge conversation typesense index failed for {uid}: {sanitize(str(e))}')
 
     return result
 
