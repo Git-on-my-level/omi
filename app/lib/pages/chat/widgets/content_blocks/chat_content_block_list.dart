@@ -97,11 +97,28 @@ class ChatContentBlockList extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final children = <Widget>[];
-    for (final block in message.typedContentBlocks) {
-      final widget = _build(block) ?? (renderStructuredFallbackText ? _fallbackTextWidget(block) : null);
-      if (widget == null) continue;
+    for (var index = 0; index < message.contentBlocks.length; index++) {
+      final rawBlock = message.contentBlocks[index];
+      // Walk the raw wire array instead of only the typed projection. The
+      // decoder intentionally drops malformed blocks, but the message body
+      // still contains their canonical fallback line. Keeping this pass raw
+      // prevents a mixed turn from losing that line beside a valid card.
+      final block = ChatContentBlock.tryDecode(rawBlock);
+      final fallback = renderStructuredFallbackText ? message.structuredFallbackTextForRawBlock(rawBlock) : null;
+      final fallbackKey =
+          rawBlock['id'] is String && (rawBlock['id'] as String).isNotEmpty ? rawBlock['id'] as String : '$index';
+      final widget = block == null ? null : _build(block);
+      final child = widget ??
+          (fallback == null
+              ? null
+              : _StructuredFallbackText(
+                  key: ValueKey('chat-block-fallback-$fallbackKey'),
+                  text: fallback,
+                  onAskOmi: onAskOmi,
+                ));
+      if (child == null) continue;
       if (children.isNotEmpty) children.add(const SizedBox(height: 8));
-      children.add(widget);
+      children.add(child);
     }
     if (children.isEmpty) return const SizedBox.shrink();
 
@@ -109,16 +126,6 @@ class ChatContentBlockList extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: children,
-    );
-  }
-
-  Widget? _fallbackTextWidget(ChatContentBlock block) {
-    final fallback = message.structuredFallbackTextForBlock(block.id);
-    if (fallback == null) return null;
-    return _StructuredFallbackText(
-      key: ValueKey('chat-block-fallback-${block.id}'),
-      text: fallback,
-      onAskOmi: onAskOmi,
     );
   }
 }
@@ -144,7 +151,13 @@ class _StructuredFallbackText extends StatelessWidget {
           selectedText: selectedText,
         );
       },
-      child: getMarkdownWidget(context, text, onAskOmi: onAskOmi),
+      child: SizedBox(
+        // SelectionArea + MarkdownBody otherwise use the text's minimum
+        // intrinsic width on iOS, collapsing fallback prose to one word per
+        // line. Keep this aligned with NormalMessageWidget.
+        width: double.infinity,
+        child: getMarkdownWidget(context, text, onAskOmi: onAskOmi),
+      ),
     );
   }
 }

@@ -43,9 +43,23 @@ class AgentCompletionBlock extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final l10n = context.l10n;
+    final status = block.status.trim().toLowerCase();
+    final completed = _completed;
+    final cancelled = status == 'cancelled' || status == 'canceled' || status == 'stopped';
+    final timedOut = status == 'timed_out' || status == 'timedout' || status == 'timeout';
     return _AgentRunCard(
-      icon: _completed ? Icons.check_circle_outline : Icons.error_outline,
-      label: _completed ? l10n.statusCompleted : l10n.statusFailed,
+      icon: completed
+          ? Icons.check_circle_outline
+          : cancelled
+              ? Icons.cancel_outlined
+              : Icons.error_outline,
+      label: completed
+          ? l10n.statusCompleted
+          : cancelled
+              ? l10n.cancelled
+              : timedOut
+                  ? l10n.statusTimedOut
+                  : l10n.statusFailed,
       title: block.title,
       body: block.output,
     );
