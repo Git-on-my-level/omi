@@ -12,6 +12,7 @@ import type {
   QueryScopedOutbound,
   ResultMessage,
   WarmupMessage,
+  JitCostEvidenceProjection,
 } from "../protocol.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
 import { serializeArtifact } from "./artifact-serialization.js";
@@ -19,6 +20,7 @@ import { failureFromError, normalizeRuntimeFailure, sanitizeProcessDiagnostic, t
 import type { AgentEvent, RunMode } from "./types.js";
 import { AgentRuntimeKernel, type ExecuteAgentRunInput } from "./kernel.js";
 import { kernelSystemPolicy } from "./context-snapshot.js";
+import { stableJsonHash } from "./kernel-support.js";
 
 export type JsonlTransportSend = (message: OutboundMessageDraft) => void;
 export type JsonlTransportLog = (message: string) => void;
@@ -60,6 +62,7 @@ export type RecoverableErrorHandler = (error: unknown, adapterId: string) => Pro
 export type QueryActivityLeaseScheduler = (emit: () => void) => () => void;
 
 const QUERY_ACTIVITY_LEASE_INTERVAL_MS = 15_000;
+const JIT_SOURCE_PROJECTION_SCHEMA_VERSION = "omi.jit.proactivity.source_projection.v1";
 
 function scheduleQueryActivityLease(emit: () => void): () => void {
   const timer = setInterval(emit, QUERY_ACTIVITY_LEASE_INTERVAL_MS);
@@ -128,7 +131,53 @@ const QUERY_WIRE_FIELDS = new Set([
   "reasoningEffort",
   "jitKnowledgeToolsEnabled",
   "jitBudget",
+  "jitCostEvidenceProjection",
 ]);
+
+function admittedSourceProjection(
+  projection: JitCostEvidenceProjection | undefined,
+  snapshot: ExecuteAgentRunInput["admittedContextSnapshot"],
+  executionID: string,
+  runPrompt: string,
+): JitCostEvidenceProjection | undefined {
+  if (!projection) return undefined;
+  if (!snapshot) throw new Error("jit source projection requires an admitted context snapshot");
+  if (projection.schema_version !== JIT_SOURCE_PROJECTION_SCHEMA_VERSION) {
+    throw new Error("jit source projection schema is unsupported");
+  }
+  if (projection.owner_id !== snapshot.ownerId) {
+    throw new Error("jit source projection owner does not match admitted context");
+  }
+  if (projection.execution_id !== executionID) {
+    throw new Error("jit source projection execution does not match JIT budget");
+  }
+  if (projection.producer_lane !== "planned" && projection.producer_lane !== "ambient") {
+    throw new Error("jit source projection lane is invalid");
+  }
+  if (
+    !projection.matched_input
+    || !projection.matched_input.evaluation_time.trim()
+    || !projection.matched_input.timezone.trim()
+    || !projection.matched_input.context_id.trim()
+  ) {
+    throw new Error("jit source projection matched input is incomplete");
+  }
+  if (!projection.full.prompt.trim()) {
+    throw new Error("jit source projection full prompt is missing");
+  }
+  if (projection.full.prompt !== runPrompt) {
+    throw new Error("jit source projection full prompt does not match admitted run prompt");
+  }
+  const evidenceSHA256 = stableJsonHash(snapshot);
+  return {
+    ...projection,
+    evidence_sha256: evidenceSHA256,
+    matched_input: {
+      ...projection.matched_input,
+      evidence_sha256: evidenceSHA256,
+    },
+  };
+}
 
 export class JsonlTransport {
   private readonly kernel: AgentRuntimeKernel;
@@ -501,6 +550,9 @@ export class JsonlTransport {
       throw new Error("context_snapshot_projection_mismatch");
     }
     const mode = message.mode ?? "act";
+    if (message.jitCostEvidenceProjection && !message.jitBudget) {
+      throw new Error("jit source projection requires jitBudget");
+    }
     const cwd = profile.workingDirectory || session.defaultCwd || this.defaultCwd();
     const executionRole = session.executionRole;
 
@@ -561,6 +613,17 @@ export class JsonlTransport {
         ...(message.reasoningEffort ? { reasoningEffort: message.reasoningEffort } : {}),
         ...(message.jitKnowledgeToolsEnabled === true ? { jitKnowledgeToolsEnabled: true } : {}),
         ...(message.jitBudget ? { jitBudget: message.jitBudget } : {}),
+        ...(message.jitBudget && message.jitCostEvidenceProjection
+          ? {
+              jitCostEvidenceProjection: admittedSourceProjection(
+                message.jitCostEvidenceProjection,
+                snapshot,
+                message.jitBudget.executionID,
+                message.prompt,
+              ),
+              producerLane: message.jitCostEvidenceProjection.producer_lane,
+            }
+          : {}),
       },
     };
   }

@@ -1554,6 +1554,7 @@ actor AgentRuntimeProcess {
     expectedContext: AgentContextFreshness?,
     reasoningEffort: String? = nil,
     jitBudget: JITProactivityAgentBudget? = nil,
+    jitCostEvidenceProjection: RuntimeJSONPayloadBox? = nil,
     jitKnowledgeToolsEnabled: Bool = false
   ) -> [String: Any] {
     var message = protocolEnvelope(
@@ -1571,6 +1572,9 @@ actor AgentRuntimeProcess {
     if let producingTurnId, !producingTurnId.isEmpty { message["producingTurnId"] = producingTurnId }
     if let reasoningEffort, !reasoningEffort.isEmpty { message["reasoningEffort"] = reasoningEffort }
     if let jitBudget { message["jitBudget"] = jitBudget.wireDictionary }
+    if let jitCostEvidenceProjection {
+      message["jitCostEvidenceProjection"] = jitCostEvidenceProjection.value
+    }
     // UX gate only: the backend independently re-checks JIT entitlement on
     // every /v1/agent/execute-tool call. Omitted (not `false`) when the
     // rollout verdict isn't `enabled`, matching how the runtime treats an
@@ -2360,6 +2364,7 @@ actor AgentRuntimeProcess {
     expectedContext: AgentContextFreshness?,
     reasoningEffort: String? = nil,
     jitBudget: JITProactivityAgentBudget? = nil,
+    jitCostEvidenceProjection: RuntimeJSONPayloadBox? = nil,
     authorizationSnapshot: RuntimeOwnerAuthorizationSnapshot,
     onTextDelta: @escaping AgentBridge.TextDeltaHandler,
     onToolActivity: @escaping AgentBridge.ToolActivityHandler,
@@ -2412,6 +2417,7 @@ actor AgentRuntimeProcess {
         expectedContext: expectedContext,
         reasoningEffort: reasoningEffort,
         jitBudget: jitBudget,
+        jitCostEvidenceProjection: jitCostEvidenceProjection,
         jitKnowledgeToolsEnabled: jitKnowledgeToolsEnabled
       )
       sendJson(queryDict)
