@@ -15,10 +15,12 @@ import 'task_card_block.dart';
 /// Renders the interactable components for a message's `content_blocks`.
 ///
 /// Every block the desktop transcript draws as its own control has a component
-/// here, so a turn reads the same on both clients. text, thinking, toolCall,
-/// citation and unknown types are covered by the message body (or its
-/// synthesized fallback text) and deliberately render nothing extra — but they
-/// never hide the message.
+/// here, so a turn reads the same on both clients. Thinking, toolCall, citation
+/// and unknown types are covered by the message body (or its synthesized
+/// fallback text). A text block is rendered here only when the body is the
+/// fallback projection: that keeps prose from disappearing when the same
+/// projection also contains an interactive block, without repeating prose
+/// that already has a normal message body.
 class ChatContentBlockList extends StatelessWidget {
   const ChatContentBlockList({
     super.key,
@@ -69,6 +71,10 @@ class ChatContentBlockList extends StatelessWidget {
       case AgentCompletionContentBlock():
         return AgentCompletionBlock(block: block);
       case TextContentBlock():
+        if (message.textIsStructuredFallback && block.text.trim().isNotEmpty) {
+          return _StructuredFallbackText(text: block.text);
+        }
+        return null;
       case ThinkingContentBlock():
       case ToolCallContentBlock():
       case CitationContentBlock():
@@ -93,5 +99,16 @@ class ChatContentBlockList extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: children,
     );
+  }
+}
+
+class _StructuredFallbackText extends StatelessWidget {
+  const _StructuredFallbackText({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(text, style: Theme.of(context).textTheme.bodyMedium);
   }
 }

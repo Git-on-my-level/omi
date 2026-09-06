@@ -65,19 +65,23 @@ void main() {
     required ServerMessage message,
     void Function(String)? sendMessage,
     List<Memory> memories = const [],
+    bool preloadMemories = true,
+    VoidCallback? onFetchMemories,
   }) async {
     final conversationProvider = ConversationProvider(isSignedIn: () => false);
     addTearDown(conversationProvider.dispose);
     final memoriesProvider = MemoriesProvider(
-      fetchMemoriesRequest: ({int limit = 100, int offset = 0, bool thisDeviceOnly = false}) async =>
-          GetMemoriesResult(memories, true),
+      fetchMemoriesRequest: ({int limit = 100, int offset = 0, bool thisDeviceOnly = false}) async {
+        onFetchMemories?.call();
+        return GetMemoriesResult(memories, true);
+      },
       fetchLedgerHistoryRequest: ({int limit = 500, int offset = 0}) async =>
           const GetLedgerHistoryResult([], supported: true),
       reviewMemoryRequest: (id, value) async => true,
       editMemoryRequest: (id, value) async => const EditMemoryResult(persisted: true),
     );
     addTearDown(memoriesProvider.dispose);
-    await memoriesProvider.loadMemories();
+    if (preloadMemories) await memoriesProvider.loadMemories();
 
     await tester.pumpWidget(
       MultiProvider(
@@ -129,6 +133,84 @@ void main() {
     await tester.pump();
 
     expect(sent, ['Want the rest of what she said?']);
+  });
+
+  testWidgets('keeps prose text blocks beside cards in a structured fallback', (tester) async {
+    await pumpMessage(
+      tester,
+      message: _decodedAiMessage(
+        text: '',
+        type: 'text',
+        contentBlocks: const [
+          {'type': 'text', 'id': 'block-text', 'text': 'The deadline is Friday.'},
+          {
+            'type': 'conversationLink',
+            'id': 'block-conversation',
+            'conversationId': 'conversation-1',
+            'summary': 'Weekly planning',
+          },
+        ],
+      ),
+    );
+
+    expect(find.text('The deadline is Friday.'), findsOneWidget);
+    expect(find.byKey(const Key('chat-block-conversationLink-block-conversation')), findsOneWidget);
+  });
+
+  testWidgets('cold memory links hydrate before the Memories page is opened', (tester) async {
+    var fetches = 0;
+    final memory = Memory(
+      id: 'memory-cold',
+      uid: 'chat-block-user',
+      content: 'A cold-chat memory',
+      category: MemoryCategory.manual,
+      createdAt: DateTime(2026, 9, 1),
+      updatedAt: DateTime(2026, 9, 1),
+      visibility: MemoryVisibility.private,
+    );
+    await pumpMessage(
+      tester,
+      preloadMemories: false,
+      onFetchMemories: () => fetches++,
+      memories: [memory],
+      message: _decodedAiMessage(
+        text: '',
+        type: 'text',
+        contentBlocks: const [
+          {'type': 'memoryLink', 'id': 'block-memory', 'memoryId': 'memory-cold', 'summary': 'A cold-chat memory'},
+        ],
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    expect(fetches, 1);
+    expect(find.byKey(const Key('chat-block-memoryLink-block-memory-open')), findsOneWidget);
+  });
+
+  testWidgets('unknown agent terminal states do not render as completed', (tester) async {
+    await pumpMessage(
+      tester,
+      message: _decodedAiMessage(
+        text: '',
+        type: 'text',
+        contentBlocks: const [
+          {
+            'type': 'agentCompletion',
+            'id': 'block-agent',
+            'runId': 'run-1',
+            'sessionId': 'session-1',
+            'title': 'Run the report',
+            'output': 'The run was orphaned.',
+            'status': 'orphaned',
+          },
+        ],
+      ),
+    );
+
+    expect(find.text('Failed'), findsOneWidget);
+    expect(find.byIcon(Icons.error_outline), findsOneWidget);
+    expect(find.byIcon(Icons.check_circle_outline), findsNothing);
   });
 
   testWidgets('a day summary carrying a memoryReviewCard renders the review rows', (tester) async {
