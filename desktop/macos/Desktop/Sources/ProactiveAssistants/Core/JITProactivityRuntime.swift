@@ -1,6 +1,52 @@
 import CryptoKit
 import Foundation
 
+private func defaultJITNanoTriage(
+  context: JITAmbientRuntimeContext,
+  snapshot: RuntimeOwnerAuthorizationSnapshot
+) async -> JITAmbientNanoTriage {
+  let captureID = JITProactivityNanoCaptureStore.key(for: context)
+  let captureEnabled = JITProactivitySourceProjection.capturePermitted(ownerID: snapshot.ownerID)
+  let observer: (@Sendable (ProactiveLaneResponseObservation) async -> Void)? =
+    captureEnabled
+    ? { @Sendable (observation: ProactiveLaneResponseObservation) async -> Void in
+      await JITProactivityNanoCaptureStore.shared.record(observation, for: captureID)
+    }
+    : nil
+  do {
+    let result = try await ProactiveLaneClient.shared.complete(
+      operation: ModelQoS.Proactivity.extractionOperation,
+      prompt: JITProactivityPromptBuilder.nanoTriagePrompt(context: context),
+      imageData: nil,
+      jsonSchema: [
+        "type": "object",
+        "properties": ["approved": ["type": "boolean"]],
+        "required": ["approved"],
+        "additionalProperties": false,
+      ],
+      maxCompletionTokens: 120,
+      authorizationSnapshot: snapshot,
+      responseObserver: observer)
+    let metadata = ProactiveLaneResponseObservation.successful(statusCode: 200, result: result)
+    guard let data = result.content.data(using: String.Encoding.utf8),
+      let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let approved = object["approved"] as? Bool
+    else {
+      if captureEnabled {
+        await JITProactivityNanoCaptureStore.shared.record(
+          metadata.withFailure(
+            ProactiveLaneFailureClassification(
+              failure: "invalid_structured_output", status: 200, errorType: nil)),
+          for: captureID)
+      }
+      return .unknown
+    }
+    return approved ? .approved : .rejected
+  } catch {
+    return .unknown
+  }
+}
+
 struct JITPlannedExecution: Equatable, Sendable {
   let lane: JITProactivityLane
   let triggerID: String
@@ -23,6 +69,9 @@ struct JITPlannedExecution: Equatable, Sendable {
   /// that was actually triaged; planned turns retain the same source-owned
   /// materialization for the bounded counterfactual replay projection.
   var nanoPrompt: String? = nil
+  /// Actual transport/accounting metadata when admission dispatched nano, or
+  /// an explicit no-dispatch marker for a deterministic planned turn.
+  var nanoBillingObservation: JITProactivityNanoBillingObservation? = nil
 }
 
 struct JITAmbientNanoClaimRequest: Equatable, Sendable {
@@ -104,6 +153,7 @@ actor JITProactivityRuntime {
   private let derivedIntent: DerivedIntentResolver
   private let ambientNanoUsage: AmbientNanoUsageReader?
   private let claimAmbientNano: ClaimAmbientNano?
+  private let nanoCaptureStore: JITProactivityNanoCaptureStore
   /// Trusted evaluation clock. Production uses the process clock; tests inject
   /// a fixed value so budget-day and pacing decisions remain hermetic. This is
   /// deliberately separate from an observation's captured event time.
@@ -133,29 +183,7 @@ actor JITProactivityRuntime {
     snapshots: @escaping SnapshotResolver = { snapshot in
       try await ProactiveLaneClient.shared.fetchJITTriggerSnapshot(authorizationSnapshot: snapshot)
     },
-    nanoTriage: @escaping NanoTriage = { context, snapshot in
-      do {
-        let result = try await ProactiveLaneClient.shared.complete(
-          operation: ModelQoS.Proactivity.extractionOperation,
-          prompt: JITProactivityPromptBuilder.nanoTriagePrompt(context: context),
-          imageData: nil,
-          jsonSchema: [
-            "type": "object",
-            "properties": ["approved": ["type": "boolean"]],
-            "required": ["approved"],
-            "additionalProperties": false,
-          ],
-          maxCompletionTokens: 120,
-          authorizationSnapshot: snapshot)
-        guard let data = result.content.data(using: .utf8),
-          let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let approved = object["approved"] as? Bool
-        else { return .unknown }
-        return approved ? .approved : .rejected
-      } catch {
-        return .unknown
-      }
-    },
+    nanoTriage: @escaping NanoTriage = defaultJITNanoTriage,
     mirror: JITTriggerMirror = .shared,
     reconcileSnapshot: ReconcileSnapshot? = nil,
     compileSnapshot: CompileSnapshot? = nil,
@@ -175,12 +203,14 @@ actor JITProactivityRuntime {
     },
     ambientNanoUsage: AmbientNanoUsageReader? = nil,
     claimAmbientNano: ClaimAmbientNano? = nil,
+    nanoCaptureStore: JITProactivityNanoCaptureStore = .shared,
     evaluationNow: @escaping @Sendable () -> Date = Date.init
   ) {
     self.flags = flags
     self.derivedIntent = derivedIntent
     self.ambientNanoUsage = ambientNanoUsage
     self.claimAmbientNano = claimAmbientNano
+    self.nanoCaptureStore = nanoCaptureStore
     self.evaluationNow = evaluationNow
     self.snapshots = snapshots
     self.nanoTriage = nanoTriage
@@ -269,6 +299,8 @@ actor JITProactivityRuntime {
         return .suppressed(reason: "planned_runtime_rejected")
       }
       let winner: KnowledgeLedgerTriggerRuntimeEntryResult
+      var admittedNanoObservation: JITProactivityNanoBillingObservation? = nil
+      var plannedNanoWasDispatched = false
       switch runtimeResult.nextLane {
       case .ambientFallback:
         return await admitAmbient(
@@ -280,14 +312,18 @@ actor JITProactivityRuntime {
           evaluationTime: evaluationTime,
           authorizationSnapshot: authorizationSnapshot)
       case .boundedPlannedTriage:
-        guard let ambiguous = runtimeResult.ambiguous.first,
-          await approvePlannedAmbiguity(
-            ambiguous, observation: observation, snapshot: snapshot,
-            temporalContext: Self.temporalContext(
-              capturedAt: eventTime, evaluatedAt: evaluationTime,
-              timezoneIdentifier: snapshot.budgetTimezone),
-            authorizationSnapshot: authorizationSnapshot)
-        else { return .suppressed(reason: "planned_match_ambiguous") }
+        guard let ambiguous = runtimeResult.ambiguous.first else {
+          return .suppressed(reason: "planned_match_ambiguous")
+        }
+        let plannedNano = await approvePlannedAmbiguity(
+          ambiguous, observation: observation, snapshot: snapshot,
+          temporalContext: Self.temporalContext(
+            capturedAt: eventTime, evaluatedAt: evaluationTime,
+            timezoneIdentifier: snapshot.budgetTimezone),
+          authorizationSnapshot: authorizationSnapshot)
+        guard plannedNano.approved else { return .suppressed(reason: "planned_match_ambiguous") }
+        admittedNanoObservation = plannedNano.observation
+        plannedNanoWasDispatched = true
         winner = ambiguous
       case .none:
         if allTriggers.isEmpty {
@@ -359,6 +395,32 @@ actor JITProactivityRuntime {
         locallyRelevant: true,
         boundedEvidence: String(observation.text.prefix(8_000)),
         temporalContext: temporalContext)
+      let plannedNanoObservation = admittedNanoObservation?.withExecutionID(candidateID)
+      let nanoBillingObservation =
+        plannedNanoObservation
+        ?? (plannedNanoWasDispatched
+          ? JITProactivityNanoBillingObservation.observed(
+            lane: .planned,
+            ownerID: authorizationSnapshot.ownerID,
+            accountGeneration: snapshot.accountGeneration,
+            snapshotRevision: receipt.snapshotRevision,
+            budgetDay: day,
+            contextID: nanoContext.id,
+            candidateID: candidateID,
+            executionID: candidateID,
+            triage: .approved,
+            transport: nil)
+          : nil)
+        ?? JITProactivityNanoBillingObservation.notDispatched(
+          lane: .planned,
+          ownerID: authorizationSnapshot.ownerID,
+          accountGeneration: snapshot.accountGeneration,
+          snapshotRevision: receipt.snapshotRevision,
+          budgetDay: day,
+          contextID: nanoContext.id,
+          candidateID: candidateID,
+          executionID: candidateID)
+      await recordNanoBillingObservation(nanoBillingObservation)
       pending[continuityKey] = JITPlannedExecution(
         lane: .planned,
         triggerID: trigger.id,
@@ -372,7 +434,8 @@ actor JITProactivityRuntime {
         temporalContext: temporalContext,
         agentBudget: JITProactivityAgentBudget(
           contractVersion: resolved.budgetContractVersion, executionID: candidateID),
-        nanoPrompt: JITProactivityPromptBuilder.nanoTriagePrompt(context: nanoContext))
+        nanoPrompt: JITProactivityPromptBuilder.nanoTriagePrompt(context: nanoContext),
+        nanoBillingObservation: nanoBillingObservation)
       return .deliver(lane: .planned, id: trigger.id, continuityKey: continuityKey)
     } catch {
       return .suppressed(reason: "authoritative_snapshot_unavailable")
@@ -412,7 +475,7 @@ actor JITProactivityRuntime {
     snapshot: JITTriggerSnapshot,
     temporalContext: JITProactivityTemporalContext,
     authorizationSnapshot: RuntimeOwnerAuthorizationSnapshot
-  ) async -> Bool {
+  ) async -> (approved: Bool, observation: JITProactivityNanoBillingObservation?) {
     let opaqueFingerprint = Self.opaqueObservationFingerprint(
       ambiguous.decision.observationFingerprint)
     let candidateID = JITProactivityReservation.identifier(
@@ -425,14 +488,58 @@ actor JITProactivityRuntime {
           accountGeneration: snapshot.accountGeneration,
           triggerMemoryID: nil, triggerRevision: nil),
         authorizationSnapshot)
-    else { return false }
+    else { return (false, nil) }
     let context = JITAmbientRuntimeContext(
       id: "planned:\(ambiguous.triggerID)",
       semanticFingerprint: opaqueFingerprint,
       locallyRelevant: true,
       boundedEvidence: String(observation.text.prefix(8_000)),
       temporalContext: temporalContext)
-    return await nanoTriage(context, authorizationSnapshot) == .approved
+    let triage = await nanoTriage(context, authorizationSnapshot)
+    let observation = await finishNanoCapture(
+      lane: .planned,
+      ownerID: authorizationSnapshot.ownerID,
+      accountGeneration: snapshot.accountGeneration,
+      snapshotRevision: snapshot.snapshotRevision,
+      budgetDay: day(for: temporalContext.evaluatedAt ?? Date(), budgetTimezone: snapshot.budgetTimezone) ?? "unknown",
+      context: context,
+      candidateID: candidateID,
+      executionID: nil,
+      triage: triage)
+    return (triage == .approved, observation)
+  }
+
+  private func finishNanoCapture(
+    lane: JITProactivityLane,
+    ownerID: String,
+    accountGeneration: Int,
+    snapshotRevision: String,
+    budgetDay: String,
+    context: JITAmbientRuntimeContext,
+    candidateID: String,
+    executionID: String?,
+    triage: JITAmbientNanoTriage
+  ) async -> JITProactivityNanoBillingObservation? {
+    guard JITProactivitySourceProjection.capturePermitted(ownerID: ownerID) else { return nil }
+    let transport = await nanoCaptureStore.take(for: JITProactivityNanoCaptureStore.key(for: context))
+    let observation = JITProactivityNanoBillingObservation.observed(
+      lane: lane,
+      ownerID: ownerID,
+      accountGeneration: accountGeneration,
+      snapshotRevision: snapshotRevision,
+      budgetDay: budgetDay,
+      contextID: context.id,
+      candidateID: candidateID,
+      executionID: executionID,
+      triage: triage,
+      transport: transport)
+    await recordNanoBillingObservation(observation)
+    return observation
+  }
+
+  private func recordNanoBillingObservation(_ observation: JITProactivityNanoBillingObservation) async {
+    guard JITProactivitySourceProjection.capturePermitted(ownerID: observation.ownerID) else { return }
+    await mirror.recordNanoBillingObservation(observation)
   }
 
   private func reconcile(
@@ -579,6 +686,21 @@ actor JITProactivityRuntime {
       return .suppressed(reason: "ambient_nano_budget")
     }
     let triage = await nanoTriage(retainedContext, authorizationSnapshot)
+    // A candidate ID exists while nano admission is being evaluated, but a
+    // full-run execution does not exist until the wakeup claim succeeds.
+    // Keep the receipt candidate-joined until then; this preserves the
+    // distinction between an observed nano request and a full replay that
+    // never started.
+    let nanoBillingObservation = await finishNanoCapture(
+      lane: .ambient,
+      ownerID: authorizationSnapshot.ownerID,
+      accountGeneration: receipt.accountGeneration,
+      snapshotRevision: receipt.snapshotRevision,
+      budgetDay: day,
+      context: retainedContext,
+      candidateID: candidateID,
+      executionID: nil,
+      triage: triage)
     // Every provider attempt, including unknown/malformed, spends the bounded
     // nano budget so a flaky response cannot create an unbounded retry loop.
     guard
@@ -611,6 +733,10 @@ actor JITProactivityRuntime {
       return .suppressed(reason: "ambient_receipt_unavailable")
     }
     guard let claim = claimed else { return .suppressed(reason: "ambient_duplicate_or_budget") }
+    let admittedNanoBillingObservation = nanoBillingObservation?.withExecutionID(candidateID)
+    if let admittedNanoBillingObservation {
+      await recordNanoBillingObservation(admittedNanoBillingObservation)
+    }
     pending[continuityKey] = JITPlannedExecution(
       lane: .ambient,
       triggerID: "ambient:\(retainedContext.id)",
@@ -629,7 +755,8 @@ actor JITProactivityRuntime {
       temporalContext: temporalContext,
       agentBudget: JITProactivityAgentBudget(
         contractVersion: budgetContractVersion, executionID: candidateID),
-      nanoPrompt: JITProactivityPromptBuilder.nanoTriagePrompt(context: retainedContext))
+      nanoPrompt: JITProactivityPromptBuilder.nanoTriagePrompt(context: retainedContext),
+      nanoBillingObservation: admittedNanoBillingObservation)
     return .deliver(lane: .ambient, id: context.id, continuityKey: continuityKey)
   }
 

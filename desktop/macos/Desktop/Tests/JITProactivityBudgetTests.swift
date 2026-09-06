@@ -96,7 +96,16 @@ final class JITProactivityBudgetTests: XCTestCase {
       agentBudget: JITProactivityAgentBudget(
         contractVersion: JITProactivityAgentBudget.cloudQAContractVersion,
         executionID: executionID),
-      nanoPrompt: "nano")
+      nanoPrompt: "nano",
+      nanoBillingObservation: JITProactivityNanoBillingObservation.notDispatched(
+        lane: .ambient,
+        ownerID: JITProactivitySourceProjection.qaOwnerID,
+        accountGeneration: 1,
+        snapshotRevision: "revision",
+        budgetDay: "2026-09-05",
+        contextID: "bucket-1",
+        candidateID: executionID,
+        executionID: executionID))
 
     let makeProjection: (String, String) -> JITProactivitySourceProjection? = { bundle, owner in
       JITProactivitySourceProjection.makeIfPermitted(
@@ -126,6 +135,11 @@ final class JITProactivityBudgetTests: XCTestCase {
     XCTAssertEqual(wire["schema_version"] as? String, JITProactivitySourceProjection.schemaVersion)
     XCTAssertEqual(wire["execution_id"] as? String, executionID)
     XCTAssertEqual(wire["producer_lane"] as? String, "ambient")
+    let nanoBilling = try XCTUnwrap(wire["nano_billing"] as? [String: Any])
+    XCTAssertEqual(nanoBilling["dispatch"] as? String, "not_dispatched")
+    XCTAssertEqual(nanoBilling["outcome"] as? String, "not_dispatched")
+    XCTAssertEqual((nanoBilling["provider_attempts"] as? NSNumber)?.intValue, 0)
+    XCTAssertEqual(nanoBilling["cost_status"] as? String, "not_applicable")
     let legacy = try XCTUnwrap(wire["legacy"] as? [String: Any])
     XCTAssertEqual(legacy["projection_mode"] as? String, "director_baseline_v1")
     XCTAssertEqual(

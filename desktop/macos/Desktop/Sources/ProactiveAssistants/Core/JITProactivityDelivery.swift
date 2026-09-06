@@ -685,8 +685,8 @@ actor JITProactivityDelivery {
       EnvironmentalSpeakerAnalyzer.analyze(segments: LiveTranscriptMonitor.shared.segments)
     }
     // The legacy producer uses the host timezone for these volatile task/frame
-    // timestamps. Keep baseline builder inputs equivalent when the admitted
-    // budget timezone differs from the host timezone.
+    // timestamps. Keep the source-owned builder inputs byte-equivalent even
+    // when the admitted budget timezone differs from the host timezone.
     let timeZone = TimeZone.current
     let legacyPrompt = ContextProactivityPromptBuilder.directorStablePrompt(snapshot: snapshot)
     let legacyUncachedPrompt = ContextProactivityPromptBuilder.directorVolatilePrompt(
@@ -704,7 +704,8 @@ actor JITProactivityDelivery {
       legacyPrompt: legacyPrompt,
       legacyUncachedPrompt: legacyUncachedPrompt,
       nanoPrompt: nanoPrompt,
-      fullPrompt: fullPrompt)
+      fullPrompt: fullPrompt,
+      nanoBillingObservation: execution.nanoBillingObservation)
   }
 
   private func terminalize(
