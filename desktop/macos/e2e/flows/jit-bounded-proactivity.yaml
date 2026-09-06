@@ -8,6 +8,7 @@ description: >
 app: non-prod
 covers:
   - desktop/macos/Desktop/Sources/ProactiveAssistants/Core/JITProactivityBudget.swift
+  - desktop/macos/Desktop/Sources/ProactiveAssistants/Core/JITProactivitySourceProjection.swift
 preconditions:
   - reviewed_isolated_qa_cloud_receipt
   - signed_in_allowlisted_qa_account
@@ -20,7 +21,7 @@ steps:
     do: "In Chat, create a standing instruction tied to a synthetic document. Read it back and verify the canonical trigger exists for this account. Record the account generation and the QA rollout capability response."
   - id: S2
     name: Produce context and observe delivery
-    do: "Open the synthetic document and let the normal context capture producer observe its matching evidence. Retain the event capture time, evaluation time, profile timezone, and execution ID. Observe the actual notification; do not inject a card or reset quotas. Confirm its time-sensitive claim agrees with the captured evidence and evaluation clock."
+    do: "Open the synthetic document and let the normal context capture producer observe its matching evidence. Retain the event capture time, evaluation time, profile timezone, and execution ID. Verify the private run input contains the source owned legacy, Nano, and final prompt projection with the admitted snapshot hash, and that the content free Nano receipt records the actual request outcome. Observe the actual notification; do not inject a card or reset quotas. Confirm its time-sensitive claim agrees with the captured evidence and evaluation clock."
   - id: S3
     name: Reconcile every provider attempt
     do: "Join the execution to gateway receipts across every tool round. Confirm no more than three provider attempts, output limits of 2048 tokens per attempt, the 32768-byte UTF-8 input envelope, and no more than 50000 micro-USD of estimated provider cost. Compare the gateway attempt IDs and totals with the terminal Pi and Swift provenance. Missing usage must remain unknown and must not appear as zero cost."
