@@ -3,7 +3,7 @@ import importlib.machinery
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1334,6 +1334,49 @@ def test_background_wipe_proceeds_when_subscription_is_already_canceled(monkeypa
     account_deletion.users_db.mark_user_deletion_wipe_failed.assert_not_called()
 
 
+def test_background_wipe_purges_conversation_typesense_index_after_firestore_wipe(monkeypatch):
+    """The post-wipe Typesense conversation purge is best-effort: it runs after
+    delete_user_data and can never change the wipe outcome while the Firebase
+    extension still owns production indexing."""
+    _stub_wipe_steps_after_billing(monkeypatch)
+    monkeypatch.setattr(
+        account_deletion.users_db,
+        'get_user_subscription',
+        MagicMock(return_value=SimpleNamespace(stripe_subscription_id='sub_123')),
+    )
+    monkeypatch.setattr(account_deletion.stripe_utils, 'cancel_subscription', MagicMock(return_value=None))
+    monkeypatch.setattr(account_deletion.stripe_utils, 'is_subscription_terminal', MagicMock(return_value=True))
+
+    from utils.conversations import typesense_index
+
+    purge = MagicMock(return_value=7)
+    with patch.object(typesense_index, 'purge_user_conversation_index', purge):
+        assert account_deletion.background_wipe_user_data('uid1') is True
+
+    purge.assert_called_once_with('uid1')
+    account_deletion.users_db.delete_user_data.assert_called_once_with('uid1')
+    account_deletion.users_db.mark_user_deletion_wipe_failed.assert_not_called()
+
+
+def test_background_wipe_survives_conversation_typesense_purge_failure(monkeypatch):
+    _stub_wipe_steps_after_billing(monkeypatch)
+    monkeypatch.setattr(
+        account_deletion.users_db,
+        'get_user_subscription',
+        MagicMock(return_value=SimpleNamespace(stripe_subscription_id='sub_123')),
+    )
+    monkeypatch.setattr(account_deletion.stripe_utils, 'cancel_subscription', MagicMock(return_value=None))
+    monkeypatch.setattr(account_deletion.stripe_utils, 'is_subscription_terminal', MagicMock(return_value=True))
+
+    from utils.conversations import typesense_index
+
+    with patch.object(typesense_index, 'purge_user_conversation_index', MagicMock(side_effect=Exception('down'))):
+        assert account_deletion.background_wipe_user_data('uid1') is True
+
+    account_deletion.users_db.delete_user_data.assert_called_once_with('uid1')
+    account_deletion.users_db.mark_user_deletion_wipe_failed.assert_not_called()
+
+
 def test_background_wipe_still_fails_when_subscription_is_not_terminal(monkeypatch):
     """A cancel that failed while the subscription can still bill stays a hard failure."""
     _stub_wipe_steps_after_billing(monkeypatch)
@@ -1446,11 +1489,6 @@ def test_purge_derived_user_data_isolates_backends_and_reloads_conversation_ids(
         'purge_canonical_derived_user_data',
         MagicMock(return_value={'vector_ids': ['canonical-1', 'canonical-2']}),
     )
-    monkeypatch.setattr(
-        account_deletion,
-        'purge_user_conversation_index',
-        lambda uid, raise_on_failure=False: calls.append(('purge_typesense', uid)) or 4,
-    )
     monkeypatch.setattr(account_deletion, 'get_conversation_photos', lambda uid, conversation_id: [])
     monkeypatch.setattr(
         account_deletion.frame_requests_db, 'list_all_frame_request_storage_ids', lambda uid: ['request-object']
@@ -1483,14 +1521,12 @@ def test_purge_derived_user_data_isolates_backends_and_reloads_conversation_ids(
         ('delete_screen_vectors', 'uid1', ['s1']),
         ('recordings', 'uid1'),
         ('get_conversations', 'uid1'),
-        ('purge_typesense', 'uid1'),
     ]
     assert result == {
         'required_failures': [],
         'best_effort_failures': [],
         'vectors_deleted': 8,
         'recordings_deleted': 3,
-        'conversation_typesense_docs_deleted': 4,
     }
     delete_frame_pixels.assert_called_once_with('uid1', ['request-object', 'orphan-object', 'deferred-object'])
 
@@ -1513,9 +1549,6 @@ def test_purge_derived_user_data_continues_after_each_failure(monkeypatch):
     monkeypatch.setattr(
         account_deletion, 'purge_canonical_derived_user_data', MagicMock(side_effect=Exception('canonical down'))
     )
-    monkeypatch.setattr(
-        account_deletion, 'purge_user_conversation_index', MagicMock(side_effect=Exception('typesense down'))
-    )
 
     result = account_deletion.purge_derived_user_data('uid1')
 
@@ -1537,7 +1570,6 @@ def test_purge_derived_user_data_continues_after_each_failure(monkeypatch):
         'conversation_recordings',
         'frame_request_pixels',
         'canonical_derived_data',
-        'conversation_typesense_index',
     ]
     assert result['best_effort_failures'] == []
 

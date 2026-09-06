@@ -34,7 +34,6 @@ from utils.conversations.finalization_decision import (
 )
 from utils.observability.fallback import record_fallback
 from utils.other.storage import delete_conversation_audio_files
-from utils.conversations.typesense_index import delete_conversation_index_doc
 from utils.journey_metrics_contract import bounded_client_kind
 from utils.observability.journeys import record_client_journey_accepted, record_journey_accepted
 
@@ -354,13 +353,23 @@ def fail_and_discard_processing(uid: str, conversation_id: str) -> bool:
     processing. The compare-and-swap fences a stale worker from hiding a newer
     or already-completed generation.
     """
-    return conversations_db.claim_conversation_status(
+    claimed = conversations_db.claim_conversation_status(
         uid,
         conversation_id,
         ConversationStatus.processing,
         ConversationStatus.failed,
         extra_updates={'discarded': True},
     )
+    if claimed:
+        # This path flips `discarded` outside update_conversation /
+        # set_conversation_as_discarded, so their index hooks never run.
+        try:
+            from utils.conversations.typesense_index import sync_conversation_index_after_write
+
+            sync_conversation_index_after_write(uid, conversation_id)
+        except Exception:
+            logger.warning('failed-finalization Typesense sync failed uid=%s conversation_id=%s', uid, conversation_id)
+    return claimed
 
 
 def reacquire_deferred_processing(uid: str, conversation_id: str) -> bool:
@@ -571,14 +580,21 @@ def delete_empty_recording_conversation(
         deleted_conversation=deleted_conversation,
     )
     if deleted:
+        # Remove the search projection before photo/audio cleanup: a later
+        # cleanup failure must not leave the deleted conversation indexed.
+        # This path deletes the Firestore row in its own transaction inside
+        # recording_sessions_db, so conversations_db.delete_conversation's
+        # index cleanup never runs.
+        try:
+            from utils.conversations.typesense_index import delete_conversation_index_doc
+
+            delete_conversation_index_doc(uid, conversation_id)
+        except Exception:
+            logger.warning('empty-recording Typesense delete failed uid=%s conversation_id=%s', uid, conversation_id)
         # Parent deletion is transactionally fenced with content writes; photos
         # are a subcollection and need their physical cleanup afterwards.
         conversations_db.delete_conversation_photos(uid, conversation_id)
         _discard_unreferenced_audio(uid, conversation_id, deleted_conversation)
-        # This path deletes the Firestore row in its own transaction inside
-        # recording_sessions_db, so conversations_db.delete_conversation's
-        # index cleanup never runs; converge the search index here instead.
-        delete_conversation_index_doc(uid, conversation_id)
     return deleted
 
 

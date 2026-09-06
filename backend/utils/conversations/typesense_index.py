@@ -32,6 +32,11 @@ policy change cannot leave plaintext readable.
 Everything here is fail-open: a Typesense or Firestore read error is logged,
 counted, and swallowed. Search indexing must never fail a durable
 conversation write.
+
+No per-conversation revision CAS or sync mutex guards these writes: the
+Firebase extension still owns production indexing and already races every
+first-party write, and Typesense upserts are idempotent per document id.
+Serialization is a follow-up for when the extension is removed.
 """
 
 from __future__ import annotations
@@ -43,10 +48,38 @@ from typing import Any, Dict, Optional, cast
 
 from prometheus_client import Counter
 
-from database._client import data_plane_db as default_db_client
-from database._client import get_firestore_client
-
 logger = logging.getLogger(__name__)
+
+
+def _resolve_default_db_client() -> Any:
+    # Lazy: `database._client` pulls google-cloud-firestore (~0.6s first-import
+    # CPU) that stub-loading test harnesses and Typesense-unconfigured runtimes
+    # must not pay. Tests patch this resolver to inject their policy client.
+    from database._client import data_plane_db as client
+
+    return client
+
+
+def _resolve_firestore_client() -> Any:
+    from database._client import get_firestore_client as client
+
+    return client
+
+
+def _record_fallback_helper(component: str, *, from_mode: str, to_mode: str, reason: str) -> None:
+    # Lazy: `utils.observability.fallback` pulls fastapi via utils.metrics
+    # (~1s first-import CPU) — error paths only.
+    from utils.observability.fallback import record_fallback
+
+    record_fallback(
+        component=component,
+        from_mode=from_mode,
+        to_mode=to_mode,
+        reason=reason,
+        outcome="degraded",
+        log=logger,
+    )
+
 
 # The Typesense collection `utils.conversations.search` reads. Hardcoded on
 # purpose: an env override here would silently split reads from writes.
@@ -80,6 +113,28 @@ CONVERSATION_TYPESENSE_INDEX_EVENTS = Counter(
 
 def _count(event: str) -> None:
     CONVERSATION_TYPESENSE_INDEX_EVENTS.labels(event=event).inc()
+
+
+_TRANSIENT_ERROR_MARKERS = (
+    "timed out",
+    "timeout",
+    "connection refused",
+    "connection reset",
+    "temporarily unavailable",
+    "service unavailable",
+)
+
+
+def _record_index_fallback(exc: BaseException) -> None:
+    """Fail-open telemetry per the shared fallback contract (`.github/agent-docs/fallback-telemetry.md`)."""
+    message = str(exc).lower()
+    reason = "timeout" if any(marker in message for marker in _TRANSIENT_ERROR_MARKERS) else "other"
+    _record_fallback_helper(
+        component="other",
+        from_mode="conversation_index_dual_write",
+        to_mode="fail_open",
+        reason=reason,
+    )
 
 
 def _payload_or_empty(value: object) -> Dict[str, Any]:
@@ -142,7 +197,7 @@ def user_allows_conversation_index(uid: str, *, db_client: Any = None) -> bool:
     """
     if not uid or not uid.strip():
         return False
-    client = db_client if db_client is not None else default_db_client
+    client = db_client if db_client is not None else _resolve_default_db_client()
     user_doc: Any = client.document(f"users/{uid}").get()
     user_data = _payload_or_empty(user_doc.to_dict() if getattr(user_doc, "exists", False) else {})
     return user_data.get("data_protection_level", "enhanced") != "e2ee"
@@ -217,7 +272,7 @@ def _fetch_index_projection(
     is the bounded equivalent. Returns None when the document is gone, which
     routes the caller to an index delete (write-after-delete self-healing).
     """
-    client = firestore_client if firestore_client is not None else get_firestore_client()
+    client = firestore_client if firestore_client is not None else _resolve_firestore_client()
     snapshot = (
         client.collection("users")
         .document(uid)
@@ -228,7 +283,7 @@ def _fetch_index_projection(
     if not getattr(snapshot, "exists", False):
         return None
     data = _payload_or_empty(snapshot.to_dict())
-    data.setdefault("id", conversation_id)
+    data["id"] = conversation_id
     return data
 
 
@@ -251,6 +306,7 @@ def delete_conversation_index_doc(uid: str, conversation_id: str) -> bool:
             _count("deleted")
             return True
         _count("error")
+        _record_index_fallback(exc)
         logger.warning("conversation Typesense delete failed uid=%s conversation_id=%s: %s", uid, conversation_id, exc)
         return False
 
@@ -262,19 +318,28 @@ def _sync_conversation_index_after_write(
     firestore_client: Any = None,
     db_client: Any = None,
 ) -> bool:
-    if not conversation_index_writes_enabled():
-        _count("skipped_disabled")
+    if not typesense_configured():
+        # No shared Typesense env means no index can exist in this environment
+        # (the extension indexes the same env): skip before any Firestore or
+        # Typesense I/O. This is distinct from the kill switch below, which
+        # keeps privacy deletes flowing against an existing index.
+        _count("skipped_unconfigured")
         return False
     if not user_allows_conversation_index(uid, db_client=db_client):
         # A policy change can revoke eligibility after this conversation was
         # indexed (by this writer or by the extension). Exact deletion is
-        # therefore required; a no-op would leave the prior document readable.
+        # therefore required even when upserts are disabled: the kill switch
+        # stops indexing, not privacy cleanup.
         _count("skipped_e2ee")
         return delete_conversation_index_doc(uid, conversation_id)
+    if not conversation_index_writes_enabled():
+        _count("skipped_disabled")
+        return False
     try:
         data = _fetch_index_projection(uid, conversation_id, firestore_client=firestore_client)
     except Exception as exc:
         _count("error")
+        _record_index_fallback(exc)
         logger.warning(
             "conversation Typesense projection read failed uid=%s conversation_id=%s: %s", uid, conversation_id, exc
         )
@@ -299,6 +364,7 @@ def _sync_conversation_index_after_write(
         return True
     except Exception as exc:
         _count("error")
+        _record_index_fallback(exc)
         logger.warning("conversation Typesense upsert failed uid=%s conversation_id=%s: %s", uid, conversation_id, exc)
         return False
 
@@ -321,6 +387,7 @@ def sync_conversation_index_after_write(
         )
     except Exception as exc:
         _count("error")
+        _record_index_fallback(exc)
         logger.warning("conversation Typesense sync failed uid=%s conversation_id=%s: %s", uid, conversation_id, exc)
         return False
 
@@ -334,6 +401,10 @@ def purge_user_conversation_index(uid: str, *, raise_on_failure: bool = False) -
     if not uid:
         return 0
     if not typesense_configured():
+        # A required purge must not report silent success when it never
+        # reached the index; only best-effort callers accept the quiet 0.
+        if raise_on_failure:
+            raise RuntimeError("Typesense env is not configured; conversation index purge cannot be verified")
         return 0
     try:
         result = _payload_or_empty(
@@ -346,6 +417,7 @@ def purge_user_conversation_index(uid: str, *, raise_on_failure: bool = False) -
         return deleted
     except Exception as exc:
         _count("error")
+        _record_index_fallback(exc)
         logger.warning("purge_user_conversation_index failed uid=%s: %s", uid, exc)
         if raise_on_failure:
             raise
