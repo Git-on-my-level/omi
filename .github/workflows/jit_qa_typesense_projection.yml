@@ -150,6 +150,18 @@ jobs:
           smoke_key_raw="$RUNNER_TEMP/typesense-smoke-key.raw"
           smoke_key_normalized="$RUNNER_TEMP/typesense-smoke-key.normalized"
           smoke_env="$RUNNER_TEMP/typesense-smoke.env"
+          umask 077
+          smoke_passed=0
+          cleanup_smoke() {
+            if [[ "$smoke_passed" != 1 ]] && docker inspect "$smoke_name" >/dev/null 2>&1; then
+              echo "Typesense smoke container diagnostics:" >&2
+              docker inspect --format='status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}' "$smoke_name" >&2 || true
+              docker logs --tail 200 "$smoke_name" 2>&1 | sed "s/${smoke_key}/[redacted]/g" >&2 || true
+            fi
+            docker rm -f "$smoke_name" >/dev/null 2>&1 || true
+            rm -f "$smoke_key_raw" "$smoke_key_normalized" "$smoke_env"
+          }
+          trap cleanup_smoke EXIT
           printf '%s\n' "$smoke_key" > "$smoke_key_raw"
           # The helper intentionally returns 2 for the one repairable legacy
           # shape. Capture that status explicitly: set -e must not turn a
@@ -172,16 +184,6 @@ jobs:
             cat "$smoke_key_normalized"
             printf '\nTYPESENSE_DATA_DIR=/tmp/typesense\n'
           } > "$smoke_env"
-          smoke_passed=0
-          cleanup_smoke() {
-            if [[ "$smoke_passed" != 1 ]] && docker inspect "$smoke_name" >/dev/null 2>&1; then
-              echo "Typesense smoke container diagnostics:" >&2
-              docker inspect --format='status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}' "$smoke_name" >&2 || true
-              docker logs --tail 200 "$smoke_name" 2>&1 | sed "s/${smoke_key}/[redacted]/g" >&2 || true
-            fi
-            docker rm -f "$smoke_name" >/dev/null 2>&1 || true
-          }
-          trap cleanup_smoke EXIT
           docker run --detach --name "$smoke_name" --publish "$smoke_port:8080" \
             --env-file "$smoke_env" "$typesense_tag" >/dev/null
           smoke_url="http://127.0.0.1:${smoke_port}"
