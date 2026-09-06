@@ -684,10 +684,11 @@ actor JITProactivityDelivery {
     let environmentalSignal = await MainActor.run {
       EnvironmentalSpeakerAnalyzer.analyze(segments: LiveTranscriptMonitor.shared.segments)
     }
-    // The legacy producer uses the host timezone for these volatile task/frame
-    // timestamps. Keep the source-owned builder inputs byte-equivalent even
-    // when the admitted budget timezone differs from the host timezone.
-    let timeZone = TimeZone.current
+    // director_baseline_v1 is a matched-input comparison: both source-owned
+    // builders receive the admitted temporal clock. This preserves the exact
+    // JIT replay tuple without claiming to recreate a historical legacy run
+    // made under a different host timezone.
+    guard let timeZone = execution.temporalContext?.timeZone else { return nil }
     let legacyPrompt = ContextProactivityPromptBuilder.directorStablePrompt(snapshot: snapshot)
     let legacyUncachedPrompt = ContextProactivityPromptBuilder.directorVolatilePrompt(
       tasks: tasks,

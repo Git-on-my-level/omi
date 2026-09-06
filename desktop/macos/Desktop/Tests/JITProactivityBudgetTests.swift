@@ -221,4 +221,56 @@ final class JITProactivityBudgetTests: XCTestCase {
         bundleIdentifier: JITProactivitySourceProjection.qaBundleIdentifier,
         stateDirectory: directory))
   }
+
+  func testQAStoragePreflightAllowsFreshPrivateDirectoryOnlyBeforeDaemonCreatesDatabase() throws {
+    let directory = FileManager.default.temporaryDirectory
+      .resolvingSymlinksInPath()
+      .appendingPathComponent("jit-qa-fresh-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(
+      at: directory, withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700])
+
+    XCTAssertTrue(
+      AgentRuntimeProcess.hasPrivateJITQAStateDirectory(
+        bundleIdentifier: JITProactivitySourceProjection.qaBundleIdentifier,
+        stateDirectory: directory,
+        requireDatabase: false))
+    XCTAssertFalse(
+      AgentRuntimeProcess.hasPrivateJITQAStateDirectory(
+        bundleIdentifier: JITProactivitySourceProjection.qaBundleIdentifier,
+        stateDirectory: directory))
+
+    let database = directory.appendingPathComponent("omi-agentd.sqlite3")
+    XCTAssertTrue(
+      FileManager.default.createFile(
+        atPath: database.path, contents: Data(), attributes: [.posixPermissions: 0o600]))
+    let foreignOwner: uid_t = getuid() == 0 ? 1 : 0
+    XCTAssertFalse(
+      AgentRuntimeProcess.hasPrivateJITQAStateDirectory(
+        bundleIdentifier: JITProactivitySourceProjection.qaBundleIdentifier,
+        stateDirectory: directory,
+        attributesProvider: { path in
+          guard var attributes = try? FileManager.default.attributesOfItem(atPath: path) else {
+            return nil
+          }
+          if path == database.path {
+            attributes[.ownerAccountID] = NSNumber(value: foreignOwner)
+          }
+          return attributes
+        },
+        requireDatabase: false))
+
+    try FileManager.default.removeItem(at: database)
+    let danglingWAL = URL(fileURLWithPath: database.path + "-wal")
+    let danglingTarget = directory.appendingPathComponent("missing-wal-target")
+    try FileManager.default.createSymbolicLink(
+      at: danglingWAL, withDestinationURL: danglingTarget)
+    XCTAssertFalse(
+      AgentRuntimeProcess.hasPrivateJITQAStateDirectory(
+        bundleIdentifier: JITProactivitySourceProjection.qaBundleIdentifier,
+        stateDirectory: directory,
+        requireDatabase: false),
+      "a dangling SQLite sidecar must fail closed before daemon startup")
+  }
 }

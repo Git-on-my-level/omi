@@ -654,6 +654,11 @@ enum AgentClient {
       let authorization = authorizationSnapshot ?? RuntimeOwnerIdentity.captureAuthorizationSnapshot(),
       RuntimeOwnerIdentity.isAuthorizationCurrent(authorization)
     else { throw BridgeError.authMissing }
+    if jitSourceProjection != nil,
+      !AgentRuntimeProcess.hasPrivateJITQAStateDirectory(requireDatabase: false)
+    {
+      throw BridgeError.agentError("JIT QA source capture requires owner-only runtime state")
+    }
     let bridge = AgentClient.makeBridge(harnessMode: harnessMode)
     try await bridge.start(authorizationSnapshot: authorization)
     do {

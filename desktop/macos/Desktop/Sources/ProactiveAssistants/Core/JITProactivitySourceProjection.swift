@@ -8,7 +8,8 @@ extension AgentRuntimeProcess {
   static func hasPrivateJITQAStateDirectory(
     bundleIdentifier: String? = Bundle.main.bundleIdentifier,
     stateDirectory: URL? = nil,
-    attributesProvider: ((String) -> [FileAttributeKey: Any]?)? = nil
+    attributesProvider: ((String) -> [FileAttributeKey: Any]?)? = nil,
+    requireDatabase: Bool = true
   ) -> Bool {
     guard bundleIdentifier == JITProactivitySourceProjection.qaBundleIdentifier else { return false }
     let directory =
@@ -29,7 +30,10 @@ extension AgentRuntimeProcess {
       databaseURL.path + "-wal",
       databaseURL.path + "-shm",
     ]
-    guard fileManager.fileExists(atPath: databaseURL.path) else { return false }
+    // Before the agent daemon starts, a new QA state may not have a database
+    // yet. Still inspect every expected path first so a dangling or target
+    // symlink cannot hide behind FileManager.fileExists' follow behavior.
+    if requireDatabase && !fileManager.fileExists(atPath: databaseURL.path) { return false }
     return databasePaths.allSatisfy { path in
       guard pathHasNoSymbolicLinkComponent(path) else { return false }
       guard let attributes = attributes(atPath: path, provider: attributesProvider),
@@ -37,7 +41,10 @@ extension AgentRuntimeProcess {
       else {
         // SQLite only creates WAL/SHM files while a write is active. Missing
         // sidecars are therefore private by construction.
-        return path != databaseURL.path && !fileManager.fileExists(atPath: path)
+        if path == databaseURL.path {
+          return !requireDatabase && !fileManager.fileExists(atPath: path)
+        }
+        return !fileManager.fileExists(atPath: path)
       }
       return isOwnedByCurrentUser(attributes)
         && ((attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0) & 0o777 == 0o600
