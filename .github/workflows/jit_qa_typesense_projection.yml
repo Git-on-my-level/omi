@@ -146,7 +146,22 @@ jobs:
 
           smoke_name="jit-qa-typesense-smoke-${GITHUB_RUN_ID}"
           smoke_port=18108
-          smoke_key="jit-qa-typesense-local-smoke-key"
+          smoke_key="$(printf 'a%.0s' {1..64})"
+          smoke_key_raw="$RUNNER_TEMP/typesense-smoke-key.raw"
+          smoke_key_normalized="$RUNNER_TEMP/typesense-smoke-key.normalized"
+          smoke_env="$RUNNER_TEMP/typesense-smoke.env"
+          printf '%s\n' "$smoke_key" > "$smoke_key_raw"
+          smoke_shape="$(python3 backend/scripts/jit_qa_typesense_key_shape.py \
+            --normalize-file "$smoke_key_raw" --output "$smoke_key_normalized")"
+          [[ "$smoke_shape" == "legacy_trailing_lf" ]] || {
+            echo "Typesense auth smoke did not exercise the legacy newline shape" >&2
+            exit 1
+          }
+          {
+            printf 'TYPESENSE_API_KEY='
+            cat "$smoke_key_normalized"
+            printf '\nTYPESENSE_DATA_DIR=/tmp/typesense\n'
+          } > "$smoke_env"
           smoke_passed=0
           cleanup_smoke() {
             if [[ "$smoke_passed" != 1 ]] && docker inspect "$smoke_name" >/dev/null 2>&1; then
@@ -158,7 +173,7 @@ jobs:
           }
           trap cleanup_smoke EXIT
           docker run --detach --name "$smoke_name" --publish "$smoke_port:8080" \
-            --env "TYPESENSE_API_KEY=$smoke_key" --env TYPESENSE_DATA_DIR=/tmp/typesense "$typesense_tag" >/dev/null
+            --env-file "$smoke_env" "$typesense_tag" >/dev/null
           smoke_url="http://127.0.0.1:${smoke_port}"
           for attempt in {1..30}; do
             if curl --fail --silent --show-error "$smoke_url/health" | grep -q '"ok":true'; then
@@ -240,7 +255,12 @@ jobs:
             gcloud secrets create "$QA_TYPESENSE_SECRET" --project "$QA_PROJECT" \
               --replication-policy=user-managed --locations="$QA_REGION" \
               --labels=managed-by=github-actions,jit-qa=true --quiet
-            openssl rand -hex 32 | gcloud secrets versions add "$QA_TYPESENSE_SECRET" \
+            # Secret Manager preserves stdin bytes. Normalize the newline that
+            # openssl emits before storing the first admin key, otherwise the
+            # server receives a different key from the request-side probes.
+            openssl rand -hex 32 \
+              | python3 backend/scripts/jit_qa_typesense_key_shape.py --normalize-stdin \
+              | gcloud secrets versions add "$QA_TYPESENSE_SECRET" \
               --project "$QA_PROJECT" --data-file=- >/dev/null
           else
             metadata="$RUNNER_TEMP/typesense-secret.json"
@@ -254,6 +274,33 @@ jobs:
           PY
             state="$(gcloud secrets versions describe latest --secret "$QA_TYPESENSE_SECRET" --project "$QA_PROJECT" --format='value(state)')"
             [[ "$state" == "ENABLED" ]] || { echo "dedicated Typesense key has no enabled latest version" >&2; exit 1; }
+            key_dir="$RUNNER_TEMP/jit-qa-typesense-key"
+            install -d -m 700 "$key_dir"
+            raw_key="$key_dir/raw"
+            normalized_key="$key_dir/normalized"
+            umask 077
+            gcloud secrets versions access latest --secret "$QA_TYPESENSE_SECRET" \
+              --project "$QA_PROJECT" --out-file="$raw_key"
+            chmod 600 "$raw_key"
+            set +e
+            key_shape="$(python3 backend/scripts/jit_qa_typesense_key_shape.py \
+              --normalize-file "$raw_key" --output "$normalized_key")"
+            key_shape_status=$?
+            set -e
+            case "$key_shape_status:$key_shape" in
+              0:valid)
+                ;;
+              2:legacy_trailing_lf)
+                # Repair only the exact historical pipe-generated shape. Any
+                # other bytes fail closed rather than guessing at a credential.
+                gcloud secrets versions add "$QA_TYPESENSE_SECRET" \
+                  --project "$QA_PROJECT" --data-file="$normalized_key" >/dev/null
+                ;;
+              *)
+                echo "dedicated Typesense key has an unexpected byte shape" >&2
+                exit 1
+                ;;
+            esac
           fi
           gcloud secrets add-iam-policy-binding "$QA_TYPESENSE_SECRET" --project "$QA_PROJECT" \
             --member="serviceAccount:${QA_RUNTIME_SERVICE_ACCOUNT}" --role=roles/secretmanager.secretAccessor \

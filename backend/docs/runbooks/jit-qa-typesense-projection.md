@@ -18,6 +18,16 @@ so the secret never appears in the process argument list. No Firestore, Firebase
 customer credential, queue, Redis, or production Typesense binding is given to
 the service.
 
+The workflow stores exactly 64 lowercase hexadecimal bytes. Secret Manager
+preserves uploaded bytes, so new keys pass through
+`backend/scripts/jit_qa_typesense_key_shape.py` before upload rather than being
+piped directly from a newline-terminated command. An existing labeled QA secret
+may be repaired only when it has the one known historical shape (64 lowercase
+hex bytes followed by one LF); a valid 64-byte key is reused and every other
+shape fails closed. The build smoke runs the same legacy-shape normalization
+before starting the server, then authenticates collection and export requests
+with the normalized bytes.
+
 The rehydrate step runs the existing
 `utils.memory.atom_keyword_index.rebuild_atom_keyword_index` against the named
 `based-hardware-dev/jit-qa` Firestore database and fixed QA UID. It verifies the
