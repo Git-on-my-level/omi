@@ -65,10 +65,15 @@ Options (via environment variables):
   OMI_SKIP_TUNNEL=1        Skip Cloudflare tunnel (use OMI_DESKTOP_API_URL from .env directly)
   PORT=10201                Desktop backend port (default: 10201, never use 8080)
   OMI_APP_NAME="Omi Dev"   App name (default: "Omi Dev")
-  OMI_SKIP_AUTH_SEED=1     Do not copy auth/onboarding from Omi Dev into named bundles
-  OMI_SKIP_SETTINGS_SEED=1  Do not copy shortcuts/settings from Omi Dev into named bundles
+  OMI_SKIP_AUTH_SEED=1     Do not copy auth/onboarding from the auth seed source into named bundles
+  OMI_AUTH_DUMP_SOURCE="..."  Auth seed source bundle id (default: com.omi.desktop-dev, with a
+                           production com.omi.computer-macos fallback when that has no session)
+  OMI_SKIP_SETTINGS_SEED=1  Do not mirror shortcuts/settings into named bundles
+  OMI_SETTINGS_SEED_SOURCE="..."  Settings authority bundle id (default: resolve production
+                           com.omi.computer-macos when installed, else com.omi.desktop-dev;
+                           a named-but-missing domain fails closed)
   OMI_SKIP_REWIND_SEED=1    Do not copy the local Rewind history into a new named bundle
-  OMI_FORCE_REWIND_SEED=1   Replace an existing named-bundle Rewind history with a fresh Omi Dev snapshot
+  OMI_FORCE_REWIND_SEED=1   Replace an existing named-bundle Rewind history with a fresh snapshot
   OMI_DEV_EAGER_PERMISSIONS=1  Preserve eager mic/screen/file startup behavior in named bundles
   OMI_PYTHON_API_URL="..."  Python backend URL (explicit override; named bundles default to dev)
   OMI_JIT_QA_TARGET="..."   omi-jit-qa only: local-dev-gcp, deployed-dev, or cloud-qa atomic endpoint tuple
@@ -1577,21 +1582,34 @@ substep "Recorded reusable bundle fingerprint"
 
 reset_local_profile_keychain_state
 
+omi_seed_dumped_auth_session() {
+    # Pass the just-installed app path so seed can resolve Team ID and
+    # clear any prior CLI-written Keychain item (apple-tool: partition).
+    # Tokens are seeded into UserDefaults; the app migrates them into
+    # Keychain on launch with the correct teamid: partition (no prompt).
+    if ./scripts/omi-auth-seed.sh "$BUNDLE_ID" "$AUTH_CACHE" "$APP_PATH"; then
+        auth_debug "AFTER auth seed: auth_isSignedIn=$(defaults read "$BUNDLE_ID" auth_isSignedIn 2>&1 || true)"
+    else
+        echo "Warning: could not seed auth into $BUNDLE_ID. Launching cold."
+    fi
+}
+
 if [ "$IS_NAMED_BUNDLE" = true ] && [ "${OMI_SKIP_AUTH_SEED:-0}" != "1" ]; then
-    step "Seeding auth from Omi Dev..."
+    AUTH_SOURCE="${OMI_AUTH_DUMP_SOURCE:-com.omi.desktop-dev}"
+    step "Seeding auth from $AUTH_SOURCE..."
     if AUTH_CACHE="$(mktemp "${TMPDIR:-/tmp}/omi-desktop-auth.XXXXXX")"; then
-        if ./scripts/omi-auth-dump.sh com.omi.desktop-dev "$AUTH_CACHE"; then
-            # Pass the just-installed app path so seed can resolve Team ID and
-            # clear any prior CLI-written Keychain item (apple-tool: partition).
-            # Tokens are seeded into UserDefaults; the app migrates them into
-            # Keychain on launch with the correct teamid: partition (no prompt).
-            if ./scripts/omi-auth-seed.sh "$BUNDLE_ID" "$AUTH_CACHE" "$APP_PATH"; then
-                auth_debug "AFTER auth seed: auth_isSignedIn=$(defaults read "$BUNDLE_ID" auth_isSignedIn 2>&1 || true)"
-            else
-                echo "Warning: could not seed auth into $BUNDLE_ID. Launching cold."
-            fi
+        if ./scripts/omi-auth-dump.sh "$AUTH_SOURCE" "$AUTH_CACHE"; then
+            omi_seed_dumped_auth_session
+        elif [ -z "${OMI_AUTH_DUMP_SOURCE:-}" ] \
+            && ./scripts/omi-auth-dump.sh com.omi.computer-macos "$AUTH_CACHE"; then
+            # A rotted dev session used to mean a cold launch and a web OAuth
+            # dance for every new bundle. The production app holds the same
+            # account with daily-refreshed tokens; adopt it (with a notice)
+            # unless the operator pinned a source explicitly.
+            echo "Note: $AUTH_SOURCE had no usable session; seeded auth from com.omi.computer-macos instead."
+            omi_seed_dumped_auth_session
         else
-            echo "Warning: could not seed auth from Omi Dev. Launching cold."
+            echo "Warning: could not seed auth from $AUTH_SOURCE. Launching cold."
         fi
         rm -f "$AUTH_CACHE"
         AUTH_CACHE=""
@@ -1601,7 +1619,7 @@ if [ "$IS_NAMED_BUNDLE" = true ] && [ "${OMI_SKIP_AUTH_SEED:-0}" != "1" ]; then
 fi
 
 if [ "$IS_NAMED_BUNDLE" = true ] && [ "${OMI_SKIP_REWIND_SEED:-0}" != "1" ]; then
-    step "Seeding Rewind history from Omi Dev..."
+    step "Seeding Rewind history from the shared local profile..."
     if ! ./scripts/omi-rewind-seed.sh "$BUNDLE_ID"; then
         echo "Warning: could not seed Rewind history into $BUNDLE_ID. Launching with its existing local profile."
     fi
@@ -1611,11 +1629,12 @@ fi # full bundle path
 
 # Curated preferences are launch configuration, not bundle contents. Re-sync
 # them after both full installs and executable-only fast rebuilds so a reused
-# named bundle cannot retain hotkeys/settings that diverged from Omi Dev.
+# named bundle cannot retain hotkeys/settings that diverged from the resolved
+# settings authority (production Omi when installed, else Omi Dev).
 if [ "$IS_NAMED_BUNDLE" = true ] && [ "${OMI_SKIP_SETTINGS_SEED:-0}" != "1" ]; then
-    step "Seeding shortcuts/settings from Omi Dev..."
-    if ! ./scripts/omi-settings-seed.sh "$BUNDLE_ID" com.omi.desktop-dev; then
-        echo "ERROR: could not mirror shortcuts/settings from Omi Dev." >&2
+    step "Seeding shortcuts/settings from the resolved source app..."
+    if ! ./scripts/omi-settings-seed.sh "$BUNDLE_ID"; then
+        echo "ERROR: could not mirror shortcuts/settings into $BUNDLE_ID." >&2
         echo "Set OMI_SKIP_SETTINGS_SEED=1 only when intentionally testing bundle-local settings." >&2
         exit 1
     fi
