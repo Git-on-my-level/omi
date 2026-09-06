@@ -494,6 +494,21 @@ class ServerMessage {
     return body.isEmpty || _normalizeWhitespace(body) == _normalizeWhitespace(fallback);
   }
 
+  /// Returns the canonical body fallback for one raw block.
+  ///
+  /// A rich block can replace the ordinary message body on clients that know
+  /// how to render it. Unrecognised or display-only blocks still need their
+  /// synthesized line in that mode; otherwise a mixed turn silently loses
+  /// thinking, tool, citation, or future block content.
+  String? structuredFallbackTextForBlock(String blockId) {
+    for (final block in contentBlocks) {
+      if (block['id'] != blockId) continue;
+      final fallback = _blockFallbackText(block).trim();
+      return fallback.isEmpty ? null : fallback;
+    }
+    return null;
+  }
+
   static String _normalizeWhitespace(String value) {
     return value.split(RegExp(r'\s+')).where((part) => part.isNotEmpty).join(' ');
   }

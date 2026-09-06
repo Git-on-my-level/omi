@@ -18,11 +18,12 @@ import 'task_card_block.dart';
 ///
 /// Every block the desktop transcript draws as its own control has a component
 /// here, so a turn reads the same on both clients. Thinking, toolCall, citation
-/// and unknown types are covered by the message body (or its synthesized
-/// fallback text). A text block is rendered here only when the body is the
-/// fallback projection: that keeps prose from disappearing when the same
-/// projection also contains an interactive block, without repeating prose
-/// that already has a normal message body.
+/// and unknown types use their synthesized fallback line only when this list
+/// replaces the body; with a normal body, that text is already covered there.
+/// A text block is rendered here only when the body is the fallback projection:
+/// that keeps prose from disappearing when the same projection also contains
+/// an interactive block, without repeating prose that already has a normal
+/// message body.
 class ChatContentBlockList extends StatelessWidget {
   const ChatContentBlockList({
     super.key,
@@ -97,7 +98,7 @@ class ChatContentBlockList extends StatelessWidget {
   Widget build(BuildContext context) {
     final children = <Widget>[];
     for (final block in message.typedContentBlocks) {
-      final widget = _build(block);
+      final widget = _build(block) ?? (renderStructuredFallbackText ? _fallbackTextWidget(block) : null);
       if (widget == null) continue;
       if (children.isNotEmpty) children.add(const SizedBox(height: 8));
       children.add(widget);
@@ -108,6 +109,16 @@ class ChatContentBlockList extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: children,
+    );
+  }
+
+  Widget? _fallbackTextWidget(ChatContentBlock block) {
+    final fallback = message.structuredFallbackTextForBlock(block.id);
+    if (fallback == null) return null;
+    return _StructuredFallbackText(
+      key: ValueKey('chat-block-fallback-${block.id}'),
+      text: fallback,
+      onAskOmi: onAskOmi,
     );
   }
 }

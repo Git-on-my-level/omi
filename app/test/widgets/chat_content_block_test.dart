@@ -158,6 +158,46 @@ void main() {
     expect(find.byKey(const Key('chat-block-conversationLink-block-conversation')), findsOneWidget);
   });
 
+  testWidgets('keeps synthesized lines beside cards in a structured fallback', (tester) async {
+    await pumpMessage(
+      tester,
+      message: _decodedAiMessage(
+        text: '',
+        type: 'text',
+        contentBlocks: const [
+          {'type': 'thinking', 'id': 'block-thinking', 'text': 'Checking the latest notes.'},
+          {
+            'type': 'toolCall',
+            'id': 'block-tool',
+            'name': 'search_knowledge',
+            'output': 'Found 3 matching notes.',
+          },
+          {
+            'type': 'citation',
+            'id': 'block-citation',
+            'ordinal': 0,
+            'kind': 'conversation',
+            'sourceId': 'conversation-1',
+            'title': 'Weekly planning',
+          },
+          {'type': 'futureBlock', 'id': 'block-unknown', 'title': 'A future card'},
+          {
+            'type': 'conversationLink',
+            'id': 'block-conversation',
+            'conversationId': 'conversation-1',
+            'summary': 'Weekly planning',
+          },
+        ],
+      ),
+    );
+
+    expect(find.byKey(const ValueKey('chat-block-fallback-block-thinking')), findsOneWidget);
+    expect(find.byKey(const ValueKey('chat-block-fallback-block-tool')), findsOneWidget);
+    expect(find.byKey(const ValueKey('chat-block-fallback-block-citation')), findsOneWidget);
+    expect(find.byKey(const ValueKey('chat-block-fallback-block-unknown')), findsOneWidget);
+    expect(find.byKey(const Key('chat-block-conversationLink-block-conversation')), findsOneWidget);
+  });
+
   testWidgets('does not duplicate fallback prose in a day summary', (tester) async {
     final message = _decodedAiMessage(
       text: '',
