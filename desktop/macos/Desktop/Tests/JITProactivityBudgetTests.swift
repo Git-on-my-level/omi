@@ -137,7 +137,9 @@ final class JITProactivityBudgetTests: XCTestCase {
   }
 
   func testQAStoragePreflightRequiresOwnerOnlyDirectoryAndSQLite() throws {
-    let directory = FileManager.default.homeDirectoryForCurrentUser
+    let qaHome = FileManager.default.homeDirectoryForCurrentUser.resolvingSymlinksInPath()
+    let directory =
+      qaHome
       .appendingPathComponent("jit-qa-state-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: directory) }
     try FileManager.default.createDirectory(
@@ -191,7 +193,8 @@ final class JITProactivityBudgetTests: XCTestCase {
     try? FileManager.default.removeItem(at: danglingWAL)
 
     try FileManager.default.removeItem(at: database)
-    let outsideDatabase = FileManager.default.homeDirectoryForCurrentUser
+    let outsideDatabase =
+      qaHome
       .appendingPathComponent("jit-qa-database-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: outsideDatabase) }
     XCTAssertTrue(

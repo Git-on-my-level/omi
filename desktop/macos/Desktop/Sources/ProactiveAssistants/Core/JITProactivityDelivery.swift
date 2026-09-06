@@ -442,7 +442,6 @@ actor JITProactivityDelivery {
       ownerID: ownerID,
       snapshot: snapshot,
       currentFrame: currentFrame,
-      currentEvidence: currentEvidence,
       fullPrompt: prompt)
     guard await JITProactivityRuntime.shared.beginExecution(execution) else {
       await terminalize(deliveryID, failure: "jit_trigger_authority_changed", state: "suppressed", lane: execution.lane)
@@ -668,7 +667,6 @@ actor JITProactivityDelivery {
     ownerID: String,
     snapshot: ContextBucketSnapshot,
     currentFrame: CapturedFrame,
-    currentEvidence: String,
     fullPrompt: String
   ) async -> JITProactivitySourceProjection? {
     guard Bundle.main.bundleIdentifier == JITProactivitySourceProjection.qaBundleIdentifier,
@@ -686,7 +684,10 @@ actor JITProactivityDelivery {
     let environmentalSignal = await MainActor.run {
       EnvironmentalSpeakerAnalyzer.analyze(segments: LiveTranscriptMonitor.shared.segments)
     }
-    let timeZone = execution.temporalContext?.timeZone ?? .current
+    // The legacy producer uses the host timezone for these volatile task/frame
+    // timestamps. Keep baseline builder inputs equivalent when the admitted
+    // budget timezone differs from the host timezone.
+    let timeZone = TimeZone.current
     let legacyPrompt = ContextProactivityPromptBuilder.directorStablePrompt(snapshot: snapshot)
     let legacyUncachedPrompt = ContextProactivityPromptBuilder.directorVolatilePrompt(
       tasks: tasks,
@@ -695,15 +696,7 @@ actor JITProactivityDelivery {
       visitCount: snapshot.visitCount,
       environmentalSignal: environmentalSignal,
       timeZone: timeZone)
-    let nanoPrompt =
-      execution.nanoPrompt
-      ?? JITProactivityPromptBuilder.nanoTriagePrompt(
-        context: JITAmbientRuntimeContext(
-          id: execution.triggerID,
-          semanticFingerprint: execution.candidateID,
-          locallyRelevant: true,
-          boundedEvidence: String(currentEvidence.prefix(8_000)),
-          temporalContext: execution.temporalContext))
+    guard let nanoPrompt = execution.nanoPrompt else { return nil }
     return JITProactivitySourceProjection.makeIfPermitted(
       execution: execution,
       ownerID: ownerID,
