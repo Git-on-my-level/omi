@@ -625,13 +625,11 @@ actor ProactiveLaneClient {
       ?? (accountingUsage["input_tokens_details"] as? [String: Any])
       ?? (usage["prompt_tokens_details"] as? [String: Any])
       ?? (usage["input_tokens_details"] as? [String: Any])
-    let cachedTokens =
-      nonNegativeInt(
-        details?["cached_tokens"] ?? accountingUsage["cached_tokens"] ?? usage["cached_tokens"]) ?? 0
-    let cacheWriteTokens =
-      nonNegativeInt(
-        details?["cache_write_tokens"] ?? accountingUsage["cache_write_tokens"]
-          ?? usage["cache_write_tokens"]) ?? 0
+    // Keep the released envelope's gateway accounting in the legacy fields.
+    // Provider usage is exposed separately below so a nested response cannot
+    // silently replace the accounting already used by existing telemetry.
+    let cachedTokens = nonNegativeInt(usage["cached_tokens"]) ?? 0
+    let cacheWriteTokens = nonNegativeInt(usage["cache_write_tokens"]) ?? 0
     return ProactiveLaneResult(
       operation: operation,
       lane: lane,

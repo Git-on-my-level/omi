@@ -82,7 +82,9 @@ final class ProactiveLaneClientTests: XCTestCase {
     XCTAssertNil(parsed.usage.totalTokens)
     XCTAssertNil(parsed.usage.reportedCachedTokens)
     XCTAssertNil(parsed.usage.reportedCacheWriteTokens)
-    XCTAssertEqual(parsed.usage.cachedTokens, 0)
+    // The provider cache field is malformed, but the gateway's legacy
+    // envelope accounting remains independently valid.
+    XCTAssertEqual(parsed.usage.cachedTokens, 9)
   }
 
   func testNanoBillingObservationUsesProviderUsageAndNeverInfersCost() throws {

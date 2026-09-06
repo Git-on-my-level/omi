@@ -223,7 +223,11 @@ final class JITProactivityBudgetTests: XCTestCase {
   }
 
   func testQAStoragePreflightAllowsFreshPrivateDirectoryOnlyBeforeDaemonCreatesDatabase() throws {
-    let directory = FileManager.default.temporaryDirectory
+    // Foundation's temporaryDirectory is commonly rooted at /var, whose
+    // symlink component must be rejected by the production preflight. Use a
+    // resolved home path for a deterministic private fixture instead of
+    // weakening that boundary for tests.
+    let directory = FileManager.default.homeDirectoryForCurrentUser
       .resolvingSymlinksInPath()
       .appendingPathComponent("jit-qa-fresh-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: directory) }
