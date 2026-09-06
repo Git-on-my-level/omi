@@ -280,6 +280,50 @@ def test_gateway_resource_is_fenced_to_the_fixed_qa_uid():
     assert literals["OMI_JIT_QA_UID_ALLOWLIST"] == CONTRACT.QA_UID
 
 
+def test_gateway_resource_requires_accounting_enabled():
+    image = "gcr.io/based-hardware-dev/llm-gateway-jit-qa@sha256:" + "b" * 64
+    resource = _resource("gateway", "service", image)
+    resource["metadata"]["name"] = CONTRACT.LLM_GATEWAY_SERVICE
+    expected_environment, expected_secret_bindings = CONTRACT.resource_environment("gateway")
+    assert expected_environment["LLM_GATEWAY_ACCOUNTING_ENABLED"] == "true"
+
+    CONTRACT.validate_cloud_run_resource(
+        resource,
+        kind="service",
+        expected_image=image,
+        expected_environment=expected_environment,
+        expected_secret_bindings=expected_secret_bindings,
+        expected_name=CONTRACT.LLM_GATEWAY_SERVICE,
+    )
+
+    accounting = next(
+        entry
+        for entry in resource["spec"]["template"]["spec"]["containers"][0]["env"]
+        if entry["name"] == "LLM_GATEWAY_ACCOUNTING_ENABLED"
+    )
+    accounting["value"] = "false"
+    with pytest.raises(CONTRACT.JITQAContractError, match="unexpected value"):
+        CONTRACT.validate_cloud_run_resource(
+            resource,
+            kind="service",
+            expected_image=image,
+            expected_environment=expected_environment,
+            expected_secret_bindings=expected_secret_bindings,
+            expected_name=CONTRACT.LLM_GATEWAY_SERVICE,
+        )
+
+    resource["spec"]["template"]["spec"]["containers"][0]["env"].remove(accounting)
+    with pytest.raises(CONTRACT.JITQAContractError, match="missing required environment"):
+        CONTRACT.validate_cloud_run_resource(
+            resource,
+            kind="service",
+            expected_image=image,
+            expected_environment=expected_environment,
+            expected_secret_bindings=expected_secret_bindings,
+            expected_name=CONTRACT.LLM_GATEWAY_SERVICE,
+        )
+
+
 def _typesense_resource(image: str) -> dict:
     return {
         "metadata": {"name": CONTRACT.TYPESENSE_SERVICE},
@@ -433,6 +477,8 @@ def test_workflow_is_manual_main_only_and_cannot_reach_prod_or_scheduler():
     assert "--set-env-vars \"$drain_env\"" in text
     assert 'LLM_GATEWAY_ALLOWED_CALLERS=backend,desktop' in text
     assert 'LLM_GATEWAY_ACCOUNTING_ENABLED=true' in text
+    gateway_environment, _ = CONTRACT.resource_environment("gateway")
+    assert gateway_environment["LLM_GATEWAY_ACCOUNTING_ENABLED"] == "true"
     assert 'gcloud firestore databases describe --database "$QA_FIRESTORE_DATABASE"' in text
     assert 'gcloud redis instances describe "$QA_REDIS_INSTANCE"' in text
     assert "POSTHOG_PROJECT_API_KEY=POSTHOG_PROJECT_API_KEY:latest" in text

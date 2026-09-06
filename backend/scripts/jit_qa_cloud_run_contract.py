@@ -621,6 +621,11 @@ def resource_environment(
                 "OMI_JIT_QA_UID_ALLOWLIST": QA_UID,
                 "OMI_LLM_GATEWAY_PROD": "false",
                 "LLM_GATEWAY_ALLOWED_CALLERS": "backend,desktop",
+                # QA cost evidence reads the gateway's durable attempt ledger;
+                # keep its explicit accounting gate in the exact resource
+                # contract so post-deploy validation cannot reject it as an
+                # unapproved extra environment entry.
+                "LLM_GATEWAY_ACCOUNTING_ENABLED": "true",
                 "OMI_LLM_GATEWAY_BUILD_IDENTITY": "jit-qa",
                 "OMI_JIT_PROACTIVITY_BUDGET_CONTRACT": "jit-cloud-qa-v1",
             },
