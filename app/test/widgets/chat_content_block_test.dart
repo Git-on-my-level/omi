@@ -67,6 +67,7 @@ void main() {
     List<Memory> memories = const [],
     bool preloadMemories = true,
     VoidCallback? onFetchMemories,
+    bool displayOptions = false,
   }) async {
     final conversationProvider = ConversationProvider(isSignedIn: () => false);
     addTearDown(conversationProvider.dispose);
@@ -99,7 +100,7 @@ void main() {
               child: AIMessage(
                 message: message,
                 sendMessage: sendMessage ?? (_) {},
-                displayOptions: false,
+                displayOptions: displayOptions,
                 updateConversation: (_) {},
                 setMessageNps: (int value, {String? reason}) {},
               ),
@@ -153,8 +154,55 @@ void main() {
       ),
     );
 
-    expect(find.text('The deadline is Friday.'), findsOneWidget);
+    expect(find.byKey(const ValueKey('chat-block-text-block-text')), findsOneWidget);
     expect(find.byKey(const Key('chat-block-conversationLink-block-conversation')), findsOneWidget);
+  });
+
+  testWidgets('does not duplicate fallback prose in a day summary', (tester) async {
+    final message = _decodedAiMessage(
+      text: '',
+      type: 'day_summary',
+      contentBlocks: const [
+        {'type': 'text', 'id': 'block-text', 'text': 'The deadline is Friday.'},
+        {
+          'type': 'conversationLink',
+          'id': 'block-conversation',
+          'conversationId': 'conversation-1',
+          'summary': 'Weekly planning',
+        },
+      ],
+    );
+    expect(message.text, contains('The deadline is Friday.'));
+    await pumpMessage(
+      tester,
+      message: message,
+    );
+
+    expect(find.byKey(const ValueKey('chat-block-text-block-text')), findsNothing);
+  });
+
+  testWidgets('does not duplicate fallback prose in initial options', (tester) async {
+    final message = _decodedAiMessage(
+      text: '',
+      type: 'text',
+      contentBlocks: const [
+        {'type': 'text', 'id': 'block-text', 'text': 'The deadline is Friday.'},
+        {
+          'type': 'conversationLink',
+          'id': 'block-conversation',
+          'conversationId': 'conversation-1',
+          'summary': 'Weekly planning',
+        },
+      ],
+    );
+    expect(message.text, contains('The deadline is Friday.'));
+    await pumpMessage(
+      tester,
+      displayOptions: true,
+      message: message,
+    );
+
+    expect(find.byKey(const ValueKey('chat-block-text-block-text')), findsNothing);
   });
 
   testWidgets('cold memory links hydrate before the Memories page is opened', (tester) async {

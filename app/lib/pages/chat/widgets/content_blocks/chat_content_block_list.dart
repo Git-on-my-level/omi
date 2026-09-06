@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:omi/backend/schema/chat_content_block.dart';
 import 'package:omi/backend/schema/conversation.dart';
 import 'package:omi/backend/schema/message.dart';
+import 'package:omi/pages/chat/widgets/markdown_message_widget.dart';
+import 'package:omi/widgets/text_selection_controls.dart';
 
 import 'agent_run_blocks.dart';
 import 'conversation_link_blocks.dart';
@@ -26,11 +28,15 @@ class ChatContentBlockList extends StatelessWidget {
     super.key,
     required this.message,
     required this.sendMessage,
+    this.onAskOmi,
+    this.renderStructuredFallbackText = false,
     this.fetchConversation,
   });
 
   final ServerMessage message;
   final void Function(String) sendMessage;
+  final Function(String)? onAskOmi;
+  final bool renderStructuredFallbackText;
   final Future<ServerConversation?> Function(String id)? fetchConversation;
 
   /// True when at least one block in [message] has an interactable component.
@@ -71,8 +77,12 @@ class ChatContentBlockList extends StatelessWidget {
       case AgentCompletionContentBlock():
         return AgentCompletionBlock(block: block);
       case TextContentBlock():
-        if (message.textIsStructuredFallback && block.text.trim().isNotEmpty) {
-          return _StructuredFallbackText(text: block.text);
+        if (renderStructuredFallbackText && block.text.trim().isNotEmpty) {
+          return _StructuredFallbackText(
+            key: ValueKey('chat-block-text-${block.id}'),
+            text: block.text,
+            onAskOmi: onAskOmi,
+          );
         }
         return null;
       case ThinkingContentBlock():
@@ -103,12 +113,27 @@ class ChatContentBlockList extends StatelessWidget {
 }
 
 class _StructuredFallbackText extends StatelessWidget {
-  const _StructuredFallbackText({required this.text});
+  const _StructuredFallbackText({super.key, required this.text, this.onAskOmi});
 
   final String text;
+  final Function(String)? onAskOmi;
 
   @override
   Widget build(BuildContext context) {
-    return Text(text, style: Theme.of(context).textTheme.bodyMedium);
+    String? selectedText;
+    return SelectionArea(
+      onSelectionChanged: (selectedContent) {
+        selectedText = selectedContent?.plainText;
+      },
+      contextMenuBuilder: (context, selectableRegionState) {
+        return omiSelectionMenuBuilder(
+          context,
+          selectableRegionState,
+          (selected) => onAskOmi?.call(selected),
+          selectedText: selectedText,
+        );
+      },
+      child: getMarkdownWidget(context, text, onAskOmi: onAskOmi),
+    );
   }
 }
