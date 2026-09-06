@@ -151,14 +151,8 @@ final class JITProactivityBudgetTests: XCTestCase {
   }
 
   func testQAStoragePreflightRequiresOwnerOnlyDirectoryAndSQLite() throws {
-    let qaHome = FileManager.default.homeDirectoryForCurrentUser.resolvingSymlinksInPath()
-    let directory =
-      qaHome
-      .appendingPathComponent("jit-qa-state-\(UUID().uuidString)")
+    let directory = try makePrivateQAFixtureDirectory(prefix: "jit-qa-state")
     defer { try? FileManager.default.removeItem(at: directory) }
-    try FileManager.default.createDirectory(
-      at: directory, withIntermediateDirectories: true,
-      attributes: [.posixPermissions: 0o700])
     let database = directory.appendingPathComponent("omi-agentd.sqlite3")
     XCTAssertTrue(
       FileManager.default.createFile(
@@ -167,6 +161,13 @@ final class JITProactivityBudgetTests: XCTestCase {
       AgentRuntimeProcess.hasPrivateJITQAStateDirectory(
         bundleIdentifier: JITProactivitySourceProjection.qaBundleIdentifier,
         stateDirectory: directory))
+    let symlinkAlias = URL(fileURLWithPath: "/tmp", isDirectory: true)
+      .appendingPathComponent(directory.lastPathComponent)
+    XCTAssertFalse(
+      AgentRuntimeProcess.hasPrivateJITQAStateDirectory(
+        bundleIdentifier: JITProactivitySourceProjection.qaBundleIdentifier,
+        stateDirectory: symlinkAlias),
+      "the /tmp symlink alias must not become admissible after canonicalization")
 
     let foreignOwner: uid_t = getuid() == 0 ? 1 : 0
     XCTAssertFalse(
@@ -207,9 +208,9 @@ final class JITProactivityBudgetTests: XCTestCase {
     try? FileManager.default.removeItem(at: danglingWAL)
 
     try FileManager.default.removeItem(at: database)
-    let outsideDatabase =
-      qaHome
-      .appendingPathComponent("jit-qa-database-\(UUID().uuidString)")
+    let outsideDirectory = try makePrivateQAFixtureDirectory(prefix: "jit-qa-database")
+    let outsideDatabase = outsideDirectory.appendingPathComponent("outside.sqlite3")
+    defer { try? FileManager.default.removeItem(at: outsideDirectory) }
     defer { try? FileManager.default.removeItem(at: outsideDatabase) }
     XCTAssertTrue(
       FileManager.default.createFile(
@@ -223,17 +224,8 @@ final class JITProactivityBudgetTests: XCTestCase {
   }
 
   func testQAStoragePreflightAllowsFreshPrivateDirectoryOnlyBeforeDaemonCreatesDatabase() throws {
-    // Foundation's temporaryDirectory is commonly rooted at /var, whose
-    // symlink component must be rejected by the production preflight. Use a
-    // resolved home path for a deterministic private fixture instead of
-    // weakening that boundary for tests.
-    let directory = FileManager.default.homeDirectoryForCurrentUser
-      .resolvingSymlinksInPath()
-      .appendingPathComponent("jit-qa-fresh-\(UUID().uuidString)")
+    let directory = try makePrivateQAFixtureDirectory(prefix: "jit-qa-fresh")
     defer { try? FileManager.default.removeItem(at: directory) }
-    try FileManager.default.createDirectory(
-      at: directory, withIntermediateDirectories: true,
-      attributes: [.posixPermissions: 0o700])
 
     XCTAssertTrue(
       AgentRuntimeProcess.hasPrivateJITQAStateDirectory(
@@ -276,5 +268,18 @@ final class JITProactivityBudgetTests: XCTestCase {
         stateDirectory: directory,
         requireDatabase: false),
       "a dangling SQLite sidecar must fail closed before daemon startup")
+  }
+
+  private func makePrivateQAFixtureDirectory(prefix: String) throws -> URL {
+    // macOS exposes /var as a symlink to /private/var, and hosted runners can
+    // also virtualize the user home path. The production preflight must reject
+    // every symlink component, so use macOS's canonical physical temp root for
+    // fixtures rather than relying on a runner-specific home resolution.
+    let root = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
+    let directory = root.appendingPathComponent("\(prefix)-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(
+      at: directory, withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700])
+    return directory
   }
 }

@@ -66,7 +66,12 @@ extension AgentRuntimeProcess {
 
   private static func pathHasNoSymbolicLinkComponent(_ path: String) -> Bool {
     let fileManager = FileManager.default
-    var current = URL(fileURLWithPath: path).standardizedFileURL
+    // `standardizedFileURL` resolves existing symlinks. That turns the
+    // canonical `/private/tmp` spelling back into `/tmp` on macOS and can
+    // make a safe physical fixture look like a symlink (or make a symlink
+    // alias look physical). Keep the spelling supplied by the caller while
+    // walking each component so liveness and aliasing are checked directly.
+    var current = URL(fileURLWithPath: path)
     while current.path != "/" {
       if (try? fileManager.destinationOfSymbolicLink(atPath: current.path)) != nil {
         return false
