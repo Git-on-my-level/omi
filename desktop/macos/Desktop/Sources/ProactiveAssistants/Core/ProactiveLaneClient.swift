@@ -598,8 +598,20 @@ actor ProactiveLaneClient {
     let responseUsage = response["usage"] as? [String: Any]
     let accountingUsage = responseUsage ?? [:]
     func nonNegativeInt(_ value: Any?) -> Int? {
-      guard let number = value as? NSNumber, number.intValue >= 0 else { return nil }
-      return number.intValue
+      guard let number = value as? NSNumber,
+        CFGetTypeID(number) != CFBooleanGetTypeID(),
+        let integer = Int(exactly: number),
+        integer >= 0
+      else { return nil }
+      // JSON numbers that arrive as floating point can round a value just
+      // above Int.max down to Int.max during NSNumber bridging. Keep the
+      // accounting unknown for that overflow edge rather than recording a
+      // fabricated token count.
+      let numberType = String(cString: number.objCType)
+      if numberType == "d" || numberType == "f", number.doubleValue >= Double(Int.max) {
+        return nil
+      }
+      return integer
     }
     let inputTokens = nonNegativeInt(
       accountingUsage["prompt_tokens"] ?? accountingUsage["input_tokens"]
@@ -632,10 +644,10 @@ actor ProactiveLaneClient {
         totalTokens: totalTokens,
         reportedCachedTokens: details?["cached_tokens"] != nil
           ? nonNegativeInt(details?["cached_tokens"])
-          : nonNegativeInt(usage["cached_tokens"]),
+          : nonNegativeInt(accountingUsage["cached_tokens"] ?? usage["cached_tokens"]),
         reportedCacheWriteTokens: details?["cache_write_tokens"] != nil
           ? nonNegativeInt(details?["cache_write_tokens"])
-          : nonNegativeInt(usage["cache_write_tokens"])),
+          : nonNegativeInt(accountingUsage["cache_write_tokens"] ?? usage["cache_write_tokens"])),
       cacheWrite: root["cache_write"] as? Bool ?? false,
       fallbackClass: root["fallback_class"] as? String ?? "unknown",
       content: content,

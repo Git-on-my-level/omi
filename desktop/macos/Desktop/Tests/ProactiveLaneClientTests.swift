@@ -38,7 +38,10 @@ final class ProactiveLaneClientTests: XCTestCase {
       "response": [
         "id": "response-123",
         "choices": [["message": ["content": "{\"decision\":\"silence\"}"]]],
-        "usage": ["prompt_tokens": 80, "completion_tokens": 7, "total_tokens": 87],
+        "usage": [
+          "prompt_tokens": 80, "completion_tokens": 7, "total_tokens": 87,
+          "cached_tokens": 12, "cache_write_tokens": 4,
+        ],
       ],
     ])
     let parsed = try ProactiveLaneClient.parseEnvelope(data, requestID: "request-123")
@@ -47,6 +50,39 @@ final class ProactiveLaneClientTests: XCTestCase {
     XCTAssertEqual(parsed.content, "{\"decision\":\"silence\"}")
     XCTAssertEqual(parsed.requestID, "request-123")
     XCTAssertEqual(parsed.providerResponseID, "response-123")
+    XCTAssertEqual(parsed.usage.inputTokens, 80)
+    XCTAssertEqual(parsed.usage.outputTokens, 7)
+    XCTAssertEqual(parsed.usage.totalTokens, 87)
+    XCTAssertEqual(parsed.usage.reportedCachedTokens, 12)
+    XCTAssertEqual(parsed.usage.reportedCacheWriteTokens, 4)
+  }
+
+  func testEnvelopeParsingKeepsMalformedProviderUsageUnknown() throws {
+    let data = try JSONSerialization.data(withJSONObject: [
+      "operation": "proactive_extraction",
+      "lane": "omi:auto:desktop-proactive-extraction",
+      "provider_model": "gpt-5-nano",
+      "usage": ["cached_tokens": 9],
+      "cache_write": false,
+      "fallback_class": "unknown",
+      "response": [
+        "choices": [["message": ["content": "{\"approved\":true}"]]],
+        "usage": [
+          "prompt_tokens": true,
+          "completion_tokens": 1.5,
+          "total_tokens": NSNumber(value: UInt64.max),
+          "cached_tokens": false,
+        ],
+      ],
+    ])
+
+    let parsed = try ProactiveLaneClient.parseEnvelope(data)
+    XCTAssertNil(parsed.usage.inputTokens)
+    XCTAssertNil(parsed.usage.outputTokens)
+    XCTAssertNil(parsed.usage.totalTokens)
+    XCTAssertNil(parsed.usage.reportedCachedTokens)
+    XCTAssertNil(parsed.usage.reportedCacheWriteTokens)
+    XCTAssertEqual(parsed.usage.cachedTokens, 0)
   }
 
   func testNanoBillingObservationUsesProviderUsageAndNeverInfersCost() throws {
