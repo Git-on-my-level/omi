@@ -1050,7 +1050,7 @@ describe("JsonlTransport kernel-owned query contract", () => {
 
   it("pins the source projection hash to the exact admitted run snapshot", async () => {
     const owner = "vi7SA9ckQCe4ccobWNxlbdcNdC23";
-    const { store, session, transport } = fixture(undefined, undefined, owner);
+    const { store, adapter, session, transport } = fixture(undefined, undefined, owner);
     const projection = {
       schema_version: "omi.jit.proactivity.source_projection.v1",
       owner_id: "vi7SA9ckQCe4ccobWNxlbdcNdC23",
@@ -1085,7 +1085,9 @@ describe("JsonlTransport kernel-owned query contract", () => {
       "SELECT input_json FROM runs WHERE request_id = ?",
       ["request-projection"],
     ).input_json));
-    const persisted = input.metadata.jitCostEvidenceProjection;
+    const persisted = input.jitCostEvidenceProjection;
+    expect(input.metadata.jitCostEvidenceProjection).toBeUndefined();
+    expect(adapter.executed[0]?.metadata?.jitCostEvidenceProjection).toBeUndefined();
     const evidenceSHA256 = stableJsonHash(input.admittedContextSnapshot);
     expect(persisted.evidence_sha256).toBe(evidenceSHA256);
     expect(persisted.matched_input.evidence_sha256).toBe(evidenceSHA256);
@@ -1102,6 +1104,53 @@ describe("JsonlTransport kernel-owned query contract", () => {
     expect(persisted.producer_lane).toBe("ambient");
     expect(persisted.legacy.prompt).toBe("legacy");
     expect(input.prompt).toBe(persisted.full.prompt);
+    store.close();
+  });
+
+  it("rejects malformed source projection wire values before adapter dispatch", async () => {
+    const owner = "vi7SA9ckQCe4ccobWNxlbdcNdC23";
+    const { store, adapter, session, transport } = fixture(undefined, undefined, owner);
+    const budget = {
+      contractVersion: "jit-cloud-qa-v1",
+      executionID: "execution-projection",
+      maxProviderAttempts: 3,
+      maxOutputTokensPerAttempt: 2048,
+      maxNormalizedInputTokensPerAttempt: 32768,
+      maxEstimatedSpendMicroUSD: 50000,
+    };
+    const valid = {
+      schema_version: "omi.jit.proactivity.source_projection.v1",
+      owner_id: owner,
+      execution_id: budget.executionID,
+      producer_lane: "ambient" as const,
+      matched_input: {
+        evaluation_time: "2026-09-05T10:00:00-04:00",
+        timezone: "America/New_York",
+        context_id: "bucket-1",
+      },
+      legacy: { prompt: "legacy", uncached_prompt: "legacy-uncached" },
+      nano: { prompt: "nano" },
+      full: { prompt: "run prompt" },
+    };
+    const malformed = [
+      null,
+      [],
+      { ...valid, matched_input: [] },
+      { ...valid, nano: { prompt: 42 } },
+      { ...valid, full: { prompt: "run prompt", extra: [] }, owner_id: [] },
+    ];
+    for (const [index, projection] of malformed.entries()) {
+      await expect(transport.handleQuery(query(session.sessionId, {
+        requestId: `malformed-projection-${index}`,
+        ownerId: owner,
+        mode: "ask",
+        prompt: "run prompt",
+        jitBudget: budget,
+        jitCostEvidenceProjection: projection as never,
+      }))).rejects.toThrow(/jit source projection/);
+    }
+    expect(adapter.executed).toHaveLength(0);
+    expect(store.allRows("SELECT COUNT(*) AS count FROM runs")[0].count).toBe(0);
     store.close();
   });
 
