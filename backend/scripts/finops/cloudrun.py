@@ -111,15 +111,21 @@ def secret(name: str) -> str:
     filename = SECRET_FILES.get(name)
     if not filename:
         raise AuthError("unknown finops secret name: %r" % name)
-    path = secrets_dir() / filename
-    if not path.is_file():
-        raise AuthError(
-            "secret file missing: %s (mount FINOPS_SECRETS_DIR=%s with Secret Manager volumes)" % (path, secrets_dir())
-        )
-    value = path.read_text().strip()
-    if not value:
-        raise AuthError("secret file is empty: %s" % path)
-    return value
+    base = secrets_dir()
+    candidates = [
+        base / filename,  # flat layout: one dir, many files (single-secret volume)
+        base / filename / filename,  # per-secret volume: <prefix>/<SECRET_NAME>/<file>
+    ]
+    for path in candidates:
+        if path.is_file():
+            value = path.read_text().strip()
+            if not value:
+                raise AuthError("secret file is empty: %s" % path)
+            return value
+    raise AuthError(
+        "secret file missing for %r (looked in %s); mount FINOPS_SECRETS_DIR=%s with Secret Manager volumes"
+        % (name, ", ".join(str(p) for p in candidates), base)
+    )
 
 
 def access_token() -> str:

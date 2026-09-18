@@ -260,3 +260,13 @@ def test_no_secret_values_checked_in():
         text = path.read_text(errors="ignore")
         for needle in forbidden:
             assert needle not in text, "%s contains %r" % (path.name, needle)
+
+
+def test_secret_supports_per_secret_volume_layout(cloudrun, tmp_path, monkeypatch):
+    """Cloud Run mounts each secret as <prefix>/<SECRET_NAME>/<file>; both layouts work."""
+    d = tmp_path / "secrets" / "STRIPE_API_KEY"  # dir = Secret Manager resource name
+    d.mkdir(parents=True)
+    val = "sk-" + "test" + "-value"
+    (d / "STRIPE_API_KEY").write_text(val + "\n")
+    monkeypatch.setenv("FINOPS_SECRETS_DIR", str(tmp_path / "secrets"))
+    assert cloudrun.secret("stripe") == val
