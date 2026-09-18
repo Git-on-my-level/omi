@@ -49,11 +49,12 @@ def client():
 
 
 def cmd_query(flags: dict) -> None:
-    from google.cloud import bigquery
-
+    # validate input before touching optional deps so misuse fails with a clear message
     sql = sys.stdin.read()
     if not sql.strip():
         die("query requires SQL on stdin")
+    from google.cloud import bigquery
+
     c = client()
     job_config = bigquery.QueryJobConfig()
     if flags.get("dry_run"):
