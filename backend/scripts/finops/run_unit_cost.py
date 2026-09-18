@@ -36,6 +36,13 @@ import time
 import uuid
 
 HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+AUTH_MODE = os.environ.get("FINOPS_AUTH", "local")  # 'local' (laptop cron) | 'cloudrun'
+if AUTH_MODE == "cloudrun":
+    import cloudrun as gcpauth  # noqa: E402
+else:
+    import gcpauth  # noqa: E402
+
 RUN_ROOT = pathlib.Path(
     os.environ.get("FINOPS_RUN_ROOT", os.environ.get("SCRATCH_ROOT", "/Volumes/scratch") + "/finops-runs")
 )
