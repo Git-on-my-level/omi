@@ -81,11 +81,31 @@ def runtime_project() -> str:
 
 
 def runtime_identity() -> str:
-    """The SA email ADC authenticates as (metadata server on Cloud Run)."""
+    """The SA email ADC authenticates as (metadata server on Cloud Run).
+
+    Some google-auth metadata credential flavours leave service_account_email unset;
+    fall back to resolving the identity from a live token via tokeninfo.
+    """
     creds, _ = _credentials()
     email = getattr(creds, "service_account_email", None)
+    if email:
+        return email
+    import json as _json
+    import urllib.request
+
+    import google.auth.transport.requests
+
+    if not creds.valid:
+        creds.refresh(google.auth.transport.requests.Request())
+    token = creds.token or ""
+    if not token:
+        raise AuthError("ADC produced an empty token; cannot resolve runtime identity")
+    req = urllib.request.Request("https://oauth2.googleapis.com/tokeninfo?access_token=" + token)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        info = _json.load(resp)
+    email = (info.get("email") or "").strip()
     if not email:
-        raise AuthError("ADC credentials carry no service_account_email; refusing to run")
+        raise AuthError("tokeninfo returned no email; cannot resolve runtime identity")
     return email
 
 
