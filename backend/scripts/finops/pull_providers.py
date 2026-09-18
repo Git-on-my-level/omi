@@ -22,10 +22,16 @@ import pathlib
 import subprocess
 import sys
 
-OPENAI = pathlib.Path.home() / ".hermes/skills/openai-platform-admin/scripts/openai_admin.py"
-ANTHROPIC = (
-    pathlib.Path.home() / ".hermes/skills/openai-platform-admin/anthropic-platform/scripts/anthropic_platform.py"
-)
+HERE = pathlib.Path(__file__).resolve().parent
+if os.environ.get("FINOPS_AUTH") == "cloudrun":
+    # vendored copies ship inside the producer image (no ~/.hermes there)
+    OPENAI = HERE / "vendor" / "openai_admin.py"
+    ANTHROPIC = HERE / "vendor" / "anthropic-platform" / "anthropic_platform.py"
+else:
+    OPENAI = pathlib.Path.home() / ".hermes/skills/openai-platform-admin/scripts/openai_admin.py"
+    ANTHROPIC = (
+        pathlib.Path.home() / ".hermes/skills/openai-platform-admin/anthropic-platform/scripts/anthropic_platform.py"
+    )
 
 
 CLOUDRUN = os.environ.get("FINOPS_AUTH") == "cloudrun"
