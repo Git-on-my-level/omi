@@ -88,24 +88,22 @@ def runtime_identity() -> str:
     """
     creds, _ = _credentials()
     email = getattr(creds, "service_account_email", None)
-    if email:
+    if email and email != "default":
         return email
-    import json as _json
+    # compute_engine credentials report 'default' until refreshed; resolve via metadata server
     import urllib.request
 
-    import google.auth.transport.requests
-
-    if not creds.valid:
-        creds.refresh(google.auth.transport.requests.Request())
-    token = creds.token or ""
-    if not token:
-        raise AuthError("ADC produced an empty token; cannot resolve runtime identity")
-    req = urllib.request.Request("https://oauth2.googleapis.com/tokeninfo?access_token=" + token)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        info = _json.load(resp)
-    email = (info.get("email") or "").strip()
-    if not email:
-        raise AuthError("tokeninfo returned no email; cannot resolve runtime identity")
+    req = urllib.request.Request(
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
+        headers={"Metadata-Flavor": "Google"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            email = resp.read().decode().strip()
+    except Exception as e:
+        raise AuthError("could not resolve runtime identity from metadata server: %s" % e)
+    if not email or "@" not in email:
+        raise AuthError("metadata server returned no usable service account email")
     return email
 
 
