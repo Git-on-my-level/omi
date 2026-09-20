@@ -1904,7 +1904,7 @@ def upload_file_chat(
 
             filechat = FileChat(
                 id=str(uuid.uuid4()),
-                name=result.get("file_name", ""),
+                name=safe_suffix,
                 mime_type=result.get("mime_type", ""),
                 openai_file_id=result.get("file_id", ""),
                 created_at=datetime.now(timezone.utc),
@@ -1976,7 +1976,7 @@ def upload_file_chat_v1(
 
             filechat = FileChat(
                 id=str(uuid.uuid4()),
-                name=result.get("file_name", ""),
+                name=safe_suffix,
                 mime_type=result.get("mime_type", ""),
                 openai_file_id=result.get("file_id", ""),
                 created_at=datetime.now(timezone.utc),
