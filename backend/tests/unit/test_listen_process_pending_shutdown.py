@@ -238,10 +238,17 @@ class _ResumeHost:
         self.client_conversation_id = None
         self.recording_session_id = 'session-1'
         self.is_multi_channel = False
+        self.conversation_creation_timeout = 120
         self.state = SimpleNamespace(current_conversation_id=None)
         self.recording_session_ids_by_conversation = {}
         self.persistence = SimpleNamespace(call=self._call)
         self.calls: list[tuple] = []
+        if existing_conversation is not None:
+            # Resume-grade provenance: the coordinator's resumable_continuation
+            # gate requires matching source/device and a fresh finished_at.
+            existing_conversation.setdefault('source', 'omi')
+            existing_conversation.setdefault('client_device_id', 'dev-1')
+            existing_conversation.setdefault('finished_at', datetime.now(timezone.utc))
         self._existing = existing_conversation
 
     async def _call(self, fn, *_args, **_kwargs):
@@ -329,10 +336,16 @@ class _CreateConversationHost:
         self.client_conversation_id = client_conversation_id
         self.recording_session_id = 'session-1'
         self.is_multi_channel = False
+        self.conversation_creation_timeout = 120
         self.state = SimpleNamespace(current_conversation_id=None)
         self.recording_session_ids_by_conversation = {}
         self.persistence = SimpleNamespace(call=self._call)
         self.calls: list[tuple] = []
+        if existing_conversation is not None:
+            # Resume-grade provenance for the resumable_continuation gate.
+            existing_conversation.setdefault('source', 'omi')
+            existing_conversation.setdefault('client_device_id', 'dev-1')
+            existing_conversation.setdefault('finished_at', datetime.now(timezone.utc))
         self._existing = existing_conversation
         self._conversation_snapshot = conversation_snapshot
         self._conversation_snapshot_known = conversation_snapshot_known
