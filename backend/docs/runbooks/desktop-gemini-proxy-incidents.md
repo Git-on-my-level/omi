@@ -70,6 +70,7 @@ Legacy text logs do not provide equivalent phase attribution. Do not infer a Goo
 | `outcome=provider_timeout`, HTTP 504 | Provider returned 408/504 | upstream status and provider status page |
 | `outcome=provider_unavailable`, HTTP 502 | Provider returned another 5xx | upstream status class and provider route |
 | `outcome=client_cancelled`, HTTP 499 | Caller disconnected; upstream work was cancelled | client lifecycle and request correlation |
+| `phase=screen_task_gate`, HTTP 409 | Flagged screen-task extraction refused before dispatch: feature stopped or build below floor | `SCREEN_TASK_STOP`, macOS build floor, screen-task admission metrics |
 | `phase=validation` or `metering` | Request rejected before provider work | allowlist, size/complexity, quota |
 
 Compare Cloud Run request count, latency, container CPU, memory, concurrent requests, instance count, startup latency, and 5xx by exact revision. Saturation plus `pool` outcomes indicates local concurrency pressure; normal service metrics plus provider-phase outcomes indicates the stall is beyond local dispatch. Treat this as attribution, not proof of a vendor-wide incident.

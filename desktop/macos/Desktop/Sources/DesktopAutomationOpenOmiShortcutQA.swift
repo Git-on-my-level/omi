@@ -31,7 +31,8 @@ extension DesktopAutomationActionRegistry {
           "proactivity_base_url": ProactiveLaneClient.backendBaseURL,
           "gemini_helper_sample_lane": geminiRequest.value(forHTTPHeaderField: "X-Omi-Lane") ?? "",
           "gemini_helper_sample_workload": geminiRequest.value(forHTTPHeaderField: "X-Omi-Workload") ?? "",
-          "gemini_helper_sample_client_platform": geminiRequest.value(forHTTPHeaderField: "X-App-Platform") ?? "",
+          "gemini_helper_sample_client_platform": geminiRequest.value(forHTTPHeaderField: "X-Omi-Client-Platform")
+            ?? "",
         ]
       }
 

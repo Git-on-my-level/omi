@@ -411,6 +411,66 @@ def test_auth_rejection_emits_one_terminal(monkeypatch, capsys):
     assert events[0]['client_platform'] == 'macos'
 
 
+def test_screen_task_stop_keeps_typed_outcome(client_app, capsys, monkeypatch):
+    monkeypatch.setenv('SCREEN_TASK_STOP', 'true')
+    response = TestClient(client_app).post(
+        '/v1/proxy/gemini/models/gemini-2.5-flash:generateContent',
+        content=_body(),
+        headers=_success_headers(**{'x-omi-screen-task-gate': 'passed'}),
+    )
+    assert response.status_code == 409
+    assert response.json()['detail'] == {'error': 'screen_task_stopped'}
+    events = _events(capsys)
+    assert len(events) == 1
+    assert events[0]['outcome'] == 'screen_task_stopped'
+    assert events[0]['phase'] == 'screen_task_gate'
+    assert events[0]['gate_outcome'] == 'passed'
+    assert events[0]['audit_sample'] is False
+    assert events[0]['status_code'] == 409
+
+
+def test_screen_task_build_floor_keeps_typed_outcome(client_app, capsys, monkeypatch):
+    monkeypatch.setenv('SCREEN_TASK_MIN_MACOS_BUILD', '13000')
+    response = TestClient(client_app).post(
+        '/v1/proxy/gemini/models/gemini-2.5-flash:generateContent',
+        content=_body(),
+        headers=_success_headers(
+            **{
+                'x-omi-screen-task-gate': 'rejected',
+                'x-omi-screen-task-audit': 'true',
+                'x-app-platform': 'macos',
+                'x-app-build': '12400',
+                'x-app-version': '0.12.400',
+            }
+        ),
+    )
+    assert response.status_code == 409
+    assert response.json()['detail'] == {'error': 'screen_task_build_below_floor'}
+    events = _events(capsys)
+    assert len(events) == 1
+    assert events[0]['outcome'] == 'screen_task_build_below_floor'
+    assert events[0]['phase'] == 'screen_task_gate'
+    assert events[0]['gate_outcome'] == 'rejected'
+    assert events[0]['audit_sample'] is True
+    assert events[0]['status_code'] == 409
+
+
+def test_terminal_keeps_screen_task_gate_dimensions(client_app, capsys):
+    response = TestClient(client_app).post(
+        '/v1/proxy/gemini/models/gemini-2.5-flash:generateContent',
+        content=_body(),
+        headers=_success_headers(**{'x-omi-screen-task-gate': 'fail_open', 'x-omi-screen-task-audit': 'true'}),
+    )
+    assert response.status_code == 200
+    events = _events(capsys)
+    assert len(events) == 1
+    assert events[0]['outcome'] == 'success'
+    assert events[0]['gate_outcome'] == 'fail_open'
+    # audit_sample is only true for a rejected outcome; the header alone is
+    # not an audited rejection.
+    assert events[0]['audit_sample'] is False
+
+
 def _metering_failure(retryable: bool):
     async def metered(*_args, **_kwargs):
         raise desktop_proxy._GeminiRateLimitExceeded(

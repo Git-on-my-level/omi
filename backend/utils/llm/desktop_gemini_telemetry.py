@@ -28,6 +28,7 @@ from llm_gateway.gateway.accounting import ProviderResponseMetadata, vertex_usag
 from llm_gateway.gateway.request_context import resolve_request_id
 from utils.journey_metrics_contract import resolve_client_kind_from_headers
 from utils.llm import desktop_gemini_gateway, vertex_pt_routing as ptr
+from utils.llm import vertex_direct_attempt
 from utils.llm.managed_spend_ledger import DESKTOP_PROXY_CALLER, ManagedAttempt, schedule_managed_attempt
 
 ALLOWED_ACTIONS = frozenset({'generateContent', 'streamGenerateContent', 'embedContent', 'batchEmbedContents'})
@@ -120,6 +121,9 @@ class ProxyTelemetry:
         self.lane = supplied_lane if supplied_lane in GEMINI_LANES else 'unknown'
         supplied_workload = request.headers.get('x-omi-workload', '').strip().lower()
         self.workload_class = supplied_workload if supplied_workload in _ALLOWED_WORKLOADS else 'unknown'
+        # Screen-task admission dimensions the terminal event has carried since
+        # before this module existed; dropped during extraction, restored here.
+        self.gate_fields = vertex_direct_attempt.gate_fields(request.headers)
         platform_header = request.headers.get('x-omi-client-platform')
         if platform_header is not None:
             platform = platform_header.strip().lower()
@@ -208,6 +212,7 @@ class ProxyTelemetry:
             'lane': self.lane if self.lane in GEMINI_LANES else 'unknown',
             'client_platform': self.client_platform if self.client_platform in GEMINI_CLIENT_PLATFORMS else 'unknown',
             'workload_class': self.workload_class,
+            **self.gate_fields,
             'traffic_type': self.traffic_type,
             'attempt': 1,
             'phase': phase,
@@ -312,6 +317,23 @@ def _dependency_outcome(exc: HTTPException) -> str:
     return 'authorization_rejected'
 
 
+# Typed non-retryable 409s raised by the screen-task admission check before the
+# proxy body runs. Their detail token is already the bounded outcome; keeping it
+# (instead of the catch-all auth attribution) preserves the operational/build-
+# policy distinction for these rejections.
+_SCREEN_TASK_REJECTIONS = frozenset({'screen_task_stopped', 'screen_task_build_below_floor'})
+
+
+def _screen_task_rejection(exc: HTTPException) -> str | None:
+    detail = exc.detail
+    if exc.status_code != 409 or not isinstance(detail, dict):
+        return None
+    error = detail.get('error')
+    if error in _SCREEN_TASK_REJECTIONS:
+        return str(error)
+    return None
+
+
 async def _terminal_stream_guard(source: AsyncIterable[Any], telemetry: ProxyTelemetry) -> AsyncIterator[Any]:
     iterator = source.__aiter__()
     try:
@@ -347,12 +369,24 @@ class DesktopGeminiProxyRoute(APIRoute):
             try:
                 response = await original(request)
             except HTTPException as exc:
-                telemetry.complete(
-                    outcome=_dependency_outcome(exc),
-                    status_code=exc.status_code,
-                    retryable=exc.status_code == 429,
-                    phase='authorization',
-                )
+                # A typed screen-task 409 is an operational/build-policy
+                # rejection, not an auth failure; keep its own outcome and the
+                # pre-dispatch phase instead of the auth attribution.
+                rejection = _screen_task_rejection(exc)
+                if rejection is not None:
+                    telemetry.complete(
+                        outcome=rejection,
+                        status_code=exc.status_code,
+                        retryable=False,
+                        phase='screen_task_gate',
+                    )
+                else:
+                    telemetry.complete(
+                        outcome=_dependency_outcome(exc),
+                        status_code=exc.status_code,
+                        retryable=exc.status_code == 429,
+                        phase='authorization',
+                    )
                 raise
             except asyncio.CancelledError:
                 telemetry.complete(
