@@ -4517,7 +4517,7 @@ routes:
         placement: dependency
         scopes: []
       byok: not_applicable
-        rate_limit:
+      rate_limit:
           policy_name: client_telemetry:batches
           key_subject: uid
           enforcement: fail_closed
@@ -4540,7 +4540,7 @@ routes:
         placement: handler
         scopes: []
       byok: not_applicable
-        rate_limit:
+      rate_limit:
           policy_name: none
           key_subject: none
           enforcement: none
@@ -4563,7 +4563,7 @@ routes:
         placement: handler
         scopes: []
       byok: not_applicable
-        rate_limit:
+      rate_limit:
           policy_name: none
           key_subject: none
           enforcement: none
@@ -4586,7 +4586,7 @@ routes:
         placement: handler
         scopes: []
       byok: not_applicable
-        rate_limit:
+      rate_limit:
           policy_name: none
           key_subject: none
           enforcement: none
@@ -4609,7 +4609,7 @@ routes:
         placement: handler
         scopes: []
       byok: not_applicable
-        rate_limit:
+      rate_limit:
           policy_name: none
           key_subject: none
           enforcement: none
