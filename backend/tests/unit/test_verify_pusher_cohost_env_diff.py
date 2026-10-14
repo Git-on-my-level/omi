@@ -206,3 +206,20 @@ def test_deploy_workflows_invoke_the_gate() -> None:
     for workflow in WORKFLOWS:
         text = workflow.read_text(encoding="utf-8")
         assert "backend/scripts/verify_pusher_cohost_env_diff.py" in text, workflow
+
+
+@pytest.mark.parametrize(
+    'name,value',
+    [
+        ('TRANSCRIPTION_FINAL_PASS_UID_ALLOWLIST', 'synthetic-outsider'),
+        ('TRANSCRIPTION_FINAL_PASS_PERCENT', '1'),
+        ('TRANSCRIPTION_FINAL_PASS_AUTHORITATIVE', 'true'),
+        ('TRANSCRIPTION_FINAL_PASS_SYNC_ENABLED', 'true'),
+        ('HOSTED_DIARIZATION_API_URL', 'http://diarizer.omi.me:80'),
+    ],
+)
+def test_batch_cohort_rejects_scope_or_route_drift(gate, chart_fixture, name, value):
+    path = chart_fixture / 'backend/charts/pusher/prod_omi_pusher_values.yaml'
+    expected = gate.PROD_FINAL_PASS_SHADOW_VALUES[name][0]
+    replace_once(path, f'  - name: {name}\n    value: "{expected}"\n', f'  - name: {name}\n    value: "{value}"\n')
+    assert any(f'shadow scope {name}' in error for error in gate.validate_preflight(chart_fixture))

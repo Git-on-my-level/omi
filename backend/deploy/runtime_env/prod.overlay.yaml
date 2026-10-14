@@ -285,6 +285,27 @@ overlay:
           category: rollout
     pusher:
       env:
+        HOSTED_DIARIZATION_API_URL:
+          value: http://diarizer-batch.omi.me:80
+          category: service_discovery
+        TRANSCRIPTION_FINAL_PASS_DIARIZER:
+          value: pyannote_shadow
+          category: rollout
+        TRANSCRIPTION_FINAL_PASS_BACKEND:
+          value: pyannote
+          category: rollout
+        TRANSCRIPTION_FINAL_PASS_UID_ALLOWLIST:
+          value: vi7SA9ckQCe4ccobWNxlbdcNdC23
+          category: rollout
+        TRANSCRIPTION_FINAL_PASS_PERCENT:
+          value: '0'
+          category: rollout
+        TRANSCRIPTION_FINAL_PASS_AUTHORITATIVE:
+          value: 'false'
+          category: rollout
+        TRANSCRIPTION_FINAL_PASS_SYNC_ENABLED:
+          value: 'false'
+          category: rollout
         DREAM_AGENT_MODE: {value: 'on', category: rollout}
         DREAM_AGENT_UID_ALLOWLIST: {value: '9OqYLlKJv4hmeYpIhwJcHBR975i2,vi7SA9ckQCe4ccobWNxlbdcNdC23', category: rollout}
         CONVERSATION_SMART_MERGE_WALLCLOCK_GAP_MODE: {value: 'shadow', category: rollout}
@@ -543,6 +564,42 @@ overlay:
             secret: SCREEN_FRAME_SIGNING_SECRET
             version: latest
         env:
+          HOSTED_DIARIZATION_API_URL:
+            value: http://diarizer-batch.omi.me:80
+            category: service_discovery
+          TRANSCRIPTION_FINAL_PASS_DIARIZER:
+            value: pyannote_shadow
+            category: rollout
+          TRANSCRIPTION_FINAL_PASS_BACKEND:
+            value: pyannote
+            category: rollout
+          TRANSCRIPTION_FINAL_PASS_UID_ALLOWLIST:
+            value: vi7SA9ckQCe4ccobWNxlbdcNdC23
+            category: rollout
+          TRANSCRIPTION_FINAL_PASS_PERCENT:
+            value: '0'
+            category: rollout
+          TRANSCRIPTION_FINAL_PASS_AUTHORITATIVE:
+            value: 'false'
+            category: rollout
+          TRANSCRIPTION_FINAL_PASS_SYNC_ENABLED:
+            value: 'false'
+            category: rollout
+          TRANSCRIPTION_SHADOW_ENABLED:
+            value: 'true'
+            category: rollout
+          TRANSCRIPTION_SHADOW_KILL_SWITCH:
+            value: 'false'
+            category: rollout
+          TRANSCRIPTION_SHADOW_UID_ALLOWLIST:
+            value: vi7SA9ckQCe4ccobWNxlbdcNdC23
+            category: rollout
+          TRANSCRIPTION_SHADOW_PERCENT:
+            value: '0'
+            category: rollout
+          TRANSCRIPTION_SHADOW_DAILY_AUDIO_HOURS:
+            value: '1'
+            category: rollout
           # David-only channel launch; recovery runs inside this backend process.
           OMI_MESSAGING_CHANNELS: {value: 'on', category: rollout}
           OMI_MESSAGING_CHANNELS_UIDS: {value: 'vi7SA9ckQCe4ccobWNxlbdcNdC23', category: rollout}
@@ -764,6 +821,42 @@ overlay:
         - BASIC_TIER_INSIGHTS_GAINED_LIMIT_PER_MONTH
         - BASIC_TIER_MEMORIES_CREATED_LIMIT_PER_MONTH
         env:
+          HOSTED_DIARIZATION_API_URL:
+            value: http://diarizer-batch.omi.me:80
+            category: service_discovery
+          TRANSCRIPTION_FINAL_PASS_DIARIZER:
+            value: pyannote_shadow
+            category: rollout
+          TRANSCRIPTION_FINAL_PASS_BACKEND:
+            value: pyannote
+            category: rollout
+          TRANSCRIPTION_FINAL_PASS_UID_ALLOWLIST:
+            value: vi7SA9ckQCe4ccobWNxlbdcNdC23
+            category: rollout
+          TRANSCRIPTION_FINAL_PASS_PERCENT:
+            value: '0'
+            category: rollout
+          TRANSCRIPTION_FINAL_PASS_AUTHORITATIVE:
+            value: 'false'
+            category: rollout
+          TRANSCRIPTION_FINAL_PASS_SYNC_ENABLED:
+            value: 'false'
+            category: rollout
+          TRANSCRIPTION_SHADOW_ENABLED:
+            value: 'true'
+            category: rollout
+          TRANSCRIPTION_SHADOW_KILL_SWITCH:
+            value: 'false'
+            category: rollout
+          TRANSCRIPTION_SHADOW_UID_ALLOWLIST:
+            value: vi7SA9ckQCe4ccobWNxlbdcNdC23
+            category: rollout
+          TRANSCRIPTION_SHADOW_PERCENT:
+            value: '0'
+            category: rollout
+          TRANSCRIPTION_SHADOW_DAILY_AUDIO_HOURS:
+            value: '1'
+            category: rollout
           OMI_SHAPED_AGENT_MODE:
             value: 'on'
             category: rollout

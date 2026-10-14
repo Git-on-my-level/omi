@@ -270,6 +270,19 @@ LISTEN_ONLY_ALLOWED: dict[str, frozenset[str]] = {
     | _REVIEW_SURFACE_LISTEN_ONLY,
 }
 
+# Pusher owns the process-local final-pass worker; backend-listen dispatches
+# finalization and must not widen this batch-only David experiment. Validate
+# exact literals below as well as names, rather than exempting arbitrary values.
+PROD_FINAL_PASS_SHADOW_VALUES = {
+    "HOSTED_DIARIZATION_API_URL": ("http://diarizer-batch.omi.me:80", None),
+    "TRANSCRIPTION_FINAL_PASS_DIARIZER": ("pyannote_shadow", None),
+    "TRANSCRIPTION_FINAL_PASS_BACKEND": ("pyannote", None),
+    "TRANSCRIPTION_FINAL_PASS_UID_ALLOWLIST": ("vi7SA9ckQCe4ccobWNxlbdcNdC23", None),
+    "TRANSCRIPTION_FINAL_PASS_PERCENT": ("0", None),
+    "TRANSCRIPTION_FINAL_PASS_AUTHORITATIVE": ("false", None),
+    "TRANSCRIPTION_FINAL_PASS_SYNC_ENABLED": ("false", None),
+}
+
 PUSHER_ONLY_ALLOWED: dict[str, frozenset[str]] = {
     "dev": frozenset({"GOOGLE_CLIENT_ID", "REDIS_DB_HOST", "TYPESENSE_HOST"}),
     # DEEPGRAM_API_KEY: pusher reaches self-hosted dg.omi.me with it; the
@@ -290,7 +303,8 @@ PUSHER_ONLY_ALLOWED: dict[str, frozenset[str]] = {
             "TRANSCRIPTION_SHADOW_PERCENT",
             "TRANSCRIPTION_SHADOW_DAILY_AUDIO_HOURS",
         }
-    ),
+    )
+    | frozenset(PROD_FINAL_PASS_SHADOW_VALUES),
 }
 
 # Shared keys whose *literal* values are allowed to differ. Name-only diffs
@@ -491,7 +505,7 @@ def validate_preflight(root: Path = ROOT) -> list[str]:
         allowed_value_diff = SHARED_VALUE_DIFF_ALLOWED[env]
         shared = set(pusher_env) & set(listen_env)
         for name, (expected_pusher, expected_listen) in (
-            DEV_SHADOW_VALUES if env == "dev" else PROD_SHADOW_VALUES
+            DEV_SHADOW_VALUES if env == "dev" else {**PROD_SHADOW_VALUES, **PROD_FINAL_PASS_SHADOW_VALUES}
         ).items():
             actual_pusher = pusher_env[name].value if name in pusher_env else None
             actual_listen = listen_env[name].value if name in listen_env else None
