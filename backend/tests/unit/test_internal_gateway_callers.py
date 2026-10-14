@@ -13,8 +13,8 @@ def _chart(chart, env):
     return {entry['name']: entry.get('value') for entry in yaml.load(path.read_text(), Loader=yaml.CSafeLoader)['env']}
 
 
-@pytest.mark.parametrize('env,ip,domain', [('dev', '172.16.48.49', 'omiapi.com'), ('prod', '172.16.160.20', 'omi.me')])
-def test_gateway_caller_bindings_cover_all_speaker_id_hosts(env, ip, domain):
+@pytest.mark.parametrize('env,ip', [('dev', '172.16.48.49'), ('prod', '172.16.160.20')])
+def test_gateway_caller_bindings_cover_all_speaker_id_hosts(env, ip):
     manifest = yaml.load((ROOT / 'backend/deploy/runtime_env.yaml').read_text(), Loader=yaml.CSafeLoader)[
         'environments'
     ][env]
@@ -28,14 +28,14 @@ def test_gateway_caller_bindings_cover_all_speaker_id_hosts(env, ip, domain):
         for host in ('backend', 'backend-sync', 'backend-sync-backfill', 'backend-integration'):
             values = source['cloud_run']['services'][host]['env']
             assert values['HOSTED_SPEAKER_EMBEDDING_API_URL']['value'] == embedding_url
-            assert values['HOSTED_PARAKEET_API_URL']['value'] == f'http://parakeet.{domain}'
+            assert values['HOSTED_PARAKEET_API_URL']['value'] == f'http://{ip}/parakeet'
         listen = source['gke']['backend-listen']['env']
         assert listen['HOSTED_TRANSLATION_API_URL']['value'] == f'http://{ip}/nllb'
-        assert listen['HOSTED_PARAKEET_API_URL']['value'] == f'http://parakeet.{domain}'
+        assert listen['HOSTED_PARAKEET_API_URL']['value'] == f'http://{ip}/parakeet'
     for chart in ('backend-listen', 'pusher', 'parakeet'):
         assert _chart(chart, env)['HOSTED_SPEAKER_EMBEDDING_API_URL'] == embedding_url
     listen_chart = _chart('backend-listen', env)
     assert listen_chart['HOSTED_TRANSLATION_API_URL'] == f'http://{ip}/nllb'
     assert listen_chart['HOSTED_VAD_API_URL'] == f'http://{ip}/vad/v1/vad'
-    assert listen_chart['HOSTED_PARAKEET_API_URL'] == f'http://parakeet.{domain}'
-    assert _chart('pusher', env)['HOSTED_PARAKEET_API_URL'] == f'http://parakeet.{domain}'
+    assert listen_chart['HOSTED_PARAKEET_API_URL'] == f'http://{ip}/parakeet'
+    assert _chart('pusher', env)['HOSTED_PARAKEET_API_URL'] == f'http://{ip}/parakeet'

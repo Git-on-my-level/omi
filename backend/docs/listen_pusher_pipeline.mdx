@@ -4651,10 +4651,13 @@ ramp: [mobile Standard batch](../../app/docs/mobile-standard-batch.md).
 
 ### Shared Gateway caller routes
 
-NLLB, VAD and every speaker-embedding host (including Parakeet fallback) use
-the environment-specific shared Gateway paths. Parakeet STT retains its legacy
-hostname. Dev uses `172.16.48.49`; prod uses `172.16.160.20`. Qualify Gateway
-programming and caller reachability before deploying.
+NLLB, VAD, every speaker-embedding host (including Parakeet fallback), and
+Parakeet STT use the environment-specific shared Gateway paths. Parakeet callers
+retain `/parakeet` when appending `/v1/transcribe`, `/v2/transcribe` or `/v3/stream`.
+Dev uses `172.16.48.49`; prod uses `172.16.160.20`. Qualify Gateway programming,
+bidirectional audio and caller reachability before deploying Parakeet last.
+Self-hosted Deepgram retirement leaves cloud/BYOK code and credentials untouched.
+Capacity, session-drain and retirement gates: [audio fleet qualification PR](https://github.com/BasedHardware/omi/pull/21486).
 
 Caller deploy order, route requirements and independent rollback are documented
 in [the Gateway caller runbook](internal-gateway-callers.md).

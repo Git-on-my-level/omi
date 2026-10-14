@@ -1,8 +1,8 @@
 # Shared Gateway caller migration
 
-A separate commit in the same PR migrates NLLB, VAD and speaker embeddings in
-both environments. Parakeet STT stays on its existing hostname; only Parakeet's
-speaker-embedding fallback moves. A read-only refresh on 2026-10-14 found dev's
+NLLB, VAD and speaker embeddings migrate together in both environments.
+Parakeet STT moves in a separate caller PR, opened only after dev and prod
+route/capacity qualification; its speaker-embedding fallback already uses the Gateway. A read-only refresh on 2026-10-14 found dev's
 newly reserved `dev-ml-gateway-ilb-ip` at `172.16.48.49`; prod uses
 `172.16.160.20`. Both environments now bind concrete IPs. Reservation alone does
 not prove Gateway programming, health or caller reachability. Qualify every
@@ -24,9 +24,15 @@ Deploy order (dev first, then prod):
    releases; if listen deploys all three URLs at once, qualify all routes first
    and require separate NLLB/VAD metric readouts before the embedding cohort.
 4. Independently qualify/deploy the batch cohort A and its subsequent stages.
-   Do not switch `HOSTED_PARAKEET_API_URL` during this rollout.
+   Keep Parakeet deployment last, after the batch cohort is stable.
+5. Qualify Parakeet `/v1/transcribe`, `/v2/transcribe` and bidirectional
+   `/v3/stream` from GKE and Cloud Run, then deploy the separate Parakeet caller commit
+   across listen, pusher and all four Cloud Run services. All bind
+   `http://<environment-ip>/parakeet`. Preserve legacy Ingress/IP/DNS for seven
+   days and observe at least 30 minutes. The [fleet qualification PR](https://github.com/BasedHardware/omi/pull/21486)
+   owns capacity, WebSocket qualification and rollback gates.
 
-Rollback the caller commit alone and redeploy **all** affected hosts, including
+Rollback the NLLB/VAD/embedding caller commit alone and redeploy **all** affected hosts, including
 Parakeet's chart. It restores dev/prod NLLB to `http://nllb.omiapi.com` /
 `http://nllb.omi.me`, VAD to `http://vad.omiapi.com:80/v1/vad` /
 `http://vad.omi.me:80/v1/vad`, and embeddings to
@@ -45,3 +51,9 @@ the cohort commit, resolve it by running
 `backend/.venv/bin/python backend/deploy/compose_runtime_env.py`, stage the generated
 file and continue the revert. Do not restore the generated manifest from before
 both commits: that would undo the independently retained caller migration.
+
+Parakeet STT rollback is independent: revert the separate Parakeet caller commit and
+redeploy all six caller hosts to `http://parakeet.omiapi.com` (dev) or
+`http://parakeet.omi.me` (prod). Preserve the earlier embedding and batch cohort
+bindings; regenerate the manifest from the surviving overlays. Restore callers
+and verify audio before rolling back only the Parakeet route revision.

@@ -174,7 +174,7 @@ overlay:
         BASIC_PLAN_GATE_EAGER_EXTRACTION_ENABLED:
           value: 'false'
         HOSTED_PARAKEET_API_URL:
-          value: http://parakeet.omi.me
+          value: http://172.16.160.20/parakeet
         HOSTED_SPEAKER_EMBEDDING_API_URL:
           value: http://172.16.160.20/diarizer
         OMI_FIRESTORE_DATA_PLANE_PROJECT:
@@ -623,7 +623,7 @@ overlay:
             value: '1'
             category: rollout
           HOSTED_PARAKEET_API_URL:
-            value: http://parakeet.omi.me
+            value: http://172.16.160.20/parakeet
           HOSTED_SPEAKER_EMBEDDING_API_URL:
             value: http://172.16.160.20/diarizer
           MEMORY_BELIEF_MODEL_ENABLED:
@@ -822,7 +822,7 @@ overlay:
           FREE_TIER_EMERGENCY_STOP:
             value: 'false'
           HOSTED_PARAKEET_API_URL:
-            value: http://parakeet.omi.me
+            value: http://172.16.160.20/parakeet
           HOSTED_SPEAKER_EMBEDDING_API_URL:
             value: http://172.16.160.20/diarizer
           MEMORY_BELIEF_MODEL_ENABLED:
@@ -988,7 +988,7 @@ overlay:
           BASIC_PLAN_GATE_EAGER_EXTRACTION_ENABLED:
             value: 'false'
           HOSTED_PARAKEET_API_URL:
-            value: http://parakeet.omi.me
+            value: http://172.16.160.20/parakeet
           HOSTED_SPEAKER_EMBEDDING_API_URL:
             value: http://172.16.160.20/diarizer
           MEMORY_BELIEF_MODEL_ENABLED:
@@ -1137,7 +1137,7 @@ overlay:
           FREE_TIER_EMERGENCY_STOP:
             value: 'false'
           HOSTED_PARAKEET_API_URL:
-            value: http://parakeet.omi.me
+            value: http://172.16.160.20/parakeet
           HOSTED_SPEAKER_EMBEDDING_API_URL:
             value: http://172.16.160.20/diarizer
           MEMORY_BELIEF_MODEL_ENABLED:

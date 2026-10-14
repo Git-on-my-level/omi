@@ -437,7 +437,7 @@ env:
   - name: GCP_LOCATION
     value: "us-central1"
   - name: HOSTED_PARAKEET_API_URL
-    value: "http://parakeet.omi.me"
+    value: "http://172.16.160.20/parakeet"
   - name: STT_PRERECORDED_MODEL
     value: "parakeet,modulate-velma-2"
   - name: DEEPGRAM_SELF_HOSTED_ENABLED

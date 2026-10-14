@@ -461,7 +461,7 @@ env:
   - name: DEEPGRAM_SELF_HOSTED_URL
     value: "https://dg.omi.me"
   - name: HOSTED_PARAKEET_API_URL
-    value: "http://parakeet.omi.me"
+    value: "http://172.16.160.20/parakeet"
   - name: STT_PRERECORDED_MODEL
     value: "parakeet,modulate-velma-2"
   - name: STT_SERVICE_MODELS
