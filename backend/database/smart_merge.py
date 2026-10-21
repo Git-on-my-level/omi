@@ -51,6 +51,7 @@ _PRECEDING_FIELDS = (
     'discarded',
     'deleted',
     'is_locked',
+    'sync_clock_run',
     'structured.title',
     'structured.overview',
     'user_title',

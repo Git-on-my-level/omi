@@ -2,20 +2,36 @@
 
 import os
 
-from utils.sync.clock_run import SYNC_CLOCK_RUN_FIELD
+from utils.sync.clock_run import SYNC_CLOCK_RUN_FIELD, clock_run_partition_enabled
 
 
 def live_overlap_enabled() -> bool:
     return os.getenv('SYNC_LIVE_OVERLAP_ENABLED', 'true').strip().lower() in {'true', '1', 'yes', 'on'}
 
 
+def same_clock_run(left: dict, right: dict) -> bool:
+    """Whether two captures share one estimated-clock run.
+
+    The run comparison follows the ``SYNC_CLOCK_RUN_PARTITION_ENABLED`` kill
+    switch: when the partition is disabled, no comparison — assignment,
+    live-overlap, or smart-merge — may keep splitting on it, or turning the
+    switch off would not restore pre-partition behaviour for rows that
+    already carry a stored run.
+    """
+    if not clock_run_partition_enabled():
+        return True
+    return left.get(SYNC_CLOCK_RUN_FIELD) == right.get(SYNC_CLOCK_RUN_FIELD)
+
+
 def compatible_capture(left: dict, right: dict) -> bool:
     # Unknown is a partition, not a wildcard: wildcard equality is non-transitive.
     # An estimated-clock run (utils/sync/clock_run.py) is a partition too: its
     # times never prove adjacency to another run or to device-clocked audio.
-    return all(
-        left.get(key) == right.get(key) for key in ('source', 'client_device_id', SYNC_CLOCK_RUN_FIELD)
-    ) and bool(left.get('is_locked')) == bool(right.get('is_locked'))
+    return (
+        all(left.get(key) == right.get(key) for key in ('source', 'client_device_id'))
+        and bool(left.get('is_locked')) == bool(right.get('is_locked'))
+        and same_clock_run(left, right)
+    )
 
 
 def _strict_overlap_seconds(row: dict, incoming: dict) -> float:

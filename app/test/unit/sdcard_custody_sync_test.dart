@@ -3,7 +3,9 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:omi/backend/preferences.dart';
 import 'package:omi/backend/schema/bt_device/bt_device.dart';
 import 'package:omi/backend/schema/conversation.dart';
 import 'package:omi/services/devices/connectors/device_connection.dart';
@@ -133,6 +135,8 @@ void main() {
 
   setUp(() async {
     _FakeLocalSync.eventSeq = 0;
+    SharedPreferences.setMockInitialValues({});
+    await SharedPreferencesUtil.init();
     tempDir = await Directory.systemTemp.createTemp('sdcard_custody_test_');
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
       const MethodChannel('plugins.flutter.io/path_provider'),
@@ -303,6 +307,77 @@ void main() {
     expect(local.added[1].timerStart, epochMarker);
     expect(card.cleared, isTrue);
     expect(wal.status, WalStatus.synced);
+  });
+
+  test('marker path: a marker at an exact chunk boundary is still applied', () async {
+    const frameLen = 40;
+    const epochMarker = 1700000999;
+    const framesPerPacket = 10;
+    // sdcardChunkSizeSecs (60) * 100 fps = 6000 frames = exactly one full chunk.
+    final chunkPackets = sdcardChunkSizeSecs * 100 ~/ framesPerPacket;
+    final packets = <List<int>>[
+      for (var i = 0; i < chunkPackets; i++) _packed440(List.filled(framesPerPacket, frameLen)),
+      // The marker lands at frame index 6000 — exactly the flush frontier
+      // after the first full chunk (zero residual frames before it).
+      _packed440(List.filled(2, frameLen), markerEpoch: epochMarker, markerAt: 0),
+      [100],
+    ];
+    final wal = makeWal(totalBytes: (chunkPackets + 1) * 440, seconds: 60);
+    wal.timerStart = 1111;
+    final local = _FakeLocalSync();
+    final card = _FakeSdCard(packets: packets);
+    final sync = syncWith(local, card, wal, firmware: '3.0.17');
+
+    await sync.syncWal(wal: wal);
+
+    expect(local.added, hasLength(2));
+    expect(local.added[0].totalFrames, chunkPackets * framesPerPacket);
+    expect(local.added[0].timerStart, 1111);
+    // The exact-boundary marker must retime the following segment to its epoch;
+    // skipping it would leave later chunks on the estimated timeline forever.
+    expect(local.added[1].totalFrames, 2);
+    expect(local.added[1].timerStart, epochMarker);
+    expect(card.cleared, isTrue);
+    expect(wal.status, WalStatus.synced);
+  });
+
+  test('an interrupted SD-card transfer retries with the same clock run until the card clears', () async {
+    // Legacy firmware (no markers, no listing timestamp): every chunk is
+    // estimated. A BLE drop leaves the card uncleared, so the relisted
+    // recording must keep the run of its already-saved chunks — a fresh nonce
+    // would split one recording into two backend partitions.
+    const packets = sdcardChunkSizeSecs * 100 * 2 + 1; // 2 full chunks + tail
+    List<List<int>> cardPackets() => [
+          for (var i = 0; i < packets; i++) _legacyPacket(10),
+          [100],
+        ];
+
+    // Connection 1: one chunk lands durable, then the transfer fails.
+    final wal1 = makeWal(totalBytes: packets * 80, seconds: 60);
+    final local1 = _FakeLocalSync()..failOnChunk = 2;
+    final sync1 = syncWith(local1, _FakeSdCard(packets: cardPackets()), wal1);
+    await expectLater(sync1.syncWal(wal: wal1), throwsA(anything));
+    expect(local1.added, hasLength(1));
+    final firstRun = local1.added.single.clockRun;
+    expect(firstRun, isNotNull);
+
+    // Connection 2 (fresh instance, relisted recording): same run.
+    final wal2 = makeWal(totalBytes: packets * 80, seconds: 60);
+    final local2 = _FakeLocalSync();
+    final sync2 = syncWith(local2, _FakeSdCard(packets: cardPackets()), wal2);
+    await sync2.syncWal(wal: wal2);
+    expect(local2.added, isNotEmpty);
+    expect(local2.added.every((w) => w.clockRun == firstRun), isTrue,
+        reason: 'a retried recording must reuse the run of its saved chunks');
+
+    // After the confirmed clear, the next recording is a new run.
+    final wal3 = makeWal(totalBytes: packets * 80, seconds: 60);
+    final local3 = _FakeLocalSync();
+    final sync3 = syncWith(local3, _FakeSdCard(packets: cardPackets()), wal3);
+    await sync3.syncWal(wal: wal3);
+    expect(local3.added, isNotEmpty);
+    expect(local3.added.first.clockRun, isNotNull);
+    expect(local3.added.first.clockRun, isNot(firstRun));
   });
 
   test('a recording opened before a reconnect still transfers the relisted recording', () async {

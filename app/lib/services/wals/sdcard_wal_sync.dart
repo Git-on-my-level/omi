@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
+import 'package:omi/backend/preferences.dart';
 import 'package:omi/utils/debug_log_manager.dart';
 import 'package:omi/utils/logger.dart';
 import 'package:version/version.dart';
@@ -136,6 +137,8 @@ class SDCardWalSyncImpl implements SDCardWalSync {
       Logger.debug("SDCardWalSync.deleteWal: device did not confirm deletion of ${wal.id}, keeping WAL");
       return;
     }
+    // The card is confirmed empty; the next recording is a new run.
+    _forgetEstimatedClockRun(wal.device);
 
     _wals.removeWhere((w) => w.id == wal.id);
     listener.onWalUpdated();
@@ -191,7 +194,9 @@ class SDCardWalSyncImpl implements SDCardWalSync {
         timerStart = storageFiles[2];
       } else {
         timerStart = DateTime.now().millisecondsSinceEpoch ~/ 1000 - seconds;
-        clockRun = Wal.newClockRun();
+        // Retry-stable: the card is relisted (not cleared) after a partial
+        // transfer, so the same recording must reuse its first run.
+        clockRun = await _estimatedClockRunFor(deviceId);
       }
       Logger.debug(
         'SDCardWalSync: totalBytes=$totalBytes storageOffset=$storageOffset frameLengthInBytes=${codec.getFramesLengthInBytes()} fps=${codec.getFramesPerSecond()} calculatedSeconds=$seconds timerStart=$timerStart now=${DateTime.now().millisecondsSinceEpoch ~/ 1000}',
@@ -274,6 +279,25 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   /// Non-null while the chunks being flushed carry an app-estimated start
   /// time; see [Wal.clockRun]. A device timestamp marker clears it.
   String? _activeClockRun;
+
+  /// Preference key holding the retry-stable run of the card's current
+  /// estimated recording. The card is deliberately left uncleared when a
+  /// transfer fails partway; the next connection relists the same recording,
+  /// and a fresh nonce would split it into two backend partitions.
+  static const _estimatedClockRunPrefPrefix = 'sdcard_estimated_clock_run_';
+
+  Future<String> _estimatedClockRunFor(String deviceId) async {
+    final key = '$_estimatedClockRunPrefPrefix$deviceId';
+    final stored = SharedPreferencesUtil().getString(key);
+    if (stored.isNotEmpty) return stored;
+    final run = Wal.newClockRun();
+    await SharedPreferencesUtil().saveString(key, run);
+    return run;
+  }
+
+  void _forgetEstimatedClockRun(String deviceId) {
+    unawaited(SharedPreferencesUtil().remove('$_estimatedClockRunPrefPrefix$deviceId'));
+  }
 
   Future<File> _flushToDisk(Wal wal, List<List<int>> chunk, int timerStart) async {
     final directory = await getApplicationDocumentsDirectory();
@@ -467,7 +491,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
       int accurateDuration = totalFrames ~/ wal.codec.getFramesPerSecond();
       // This firmware stores no recording time: every chunk's start is an estimate.
       int timerStart = DateTime.now().millisecondsSinceEpoch ~/ 1000 - accurateDuration;
-      _activeClockRun = wal.clockRun ?? Wal.newClockRun();
+      _activeClockRun = wal.clockRun ?? await _estimatedClockRunFor(wal.device);
 
       int bytesLeft = 0;
       int chunkOffset = wal.storageOffset;
@@ -515,6 +539,11 @@ class SDCardWalSyncImpl implements SDCardWalSync {
     var bytesLeft = 0;
     var chunkSize = sdcardChunkSizeSecs * wal.codec.getFramesPerSecond();
     List<MapEntry<int, int>> timestampMarkers = [];
+    // Markers arrive in byte order; this cursor counts the prefix already
+    // applied to timerStart. Without it a marker sitting exactly at the flush
+    // frontier would be re-applied on every later notification, rewinding
+    // timerStart for chunks that already advanced past its epoch.
+    var appliedMarkers = 0;
     await _storageStream?.cancel();
     final completer = Completer<bool>();
     bool hasError = false;
@@ -618,13 +647,20 @@ class SDCardWalSyncImpl implements SDCardWalSync {
 
         cbQueue = cbQueue.then((_) async {
           if (hasError) return;
-          // Find the next marker boundary (if any) after bytesLeft
+          // Apply markers the flush frontier has already reached — including
+          // one that lands exactly at the frontier (zero residual frames
+          // before it) or was recorded only after a full chunk consumed its
+          // position. Skipping either leaves later chunks on the estimated
+          // timeline and run forever.
+          while (appliedMarkers < timestampMarkers.length && timestampMarkers[appliedMarkers].key <= bytesLeft) {
+            timerStart = timestampMarkers[appliedMarkers].value;
+            _activeClockRun = null;
+            appliedMarkers++;
+          }
+          // Find the next unapplied marker boundary (if any) after bytesLeft
           int nextMarkerIdx = bytesData.length;
-          for (var m in timestampMarkers) {
-            if (m.key > bytesLeft) {
-              nextMarkerIdx = m.key;
-              break;
-            }
+          if (appliedMarkers < timestampMarkers.length) {
+            nextMarkerIdx = timestampMarkers[appliedMarkers].key;
           }
           // Chunk up to the next marker boundary or chunkSize, whichever comes first
           while (bytesData.length - bytesLeft >= chunkSize && bytesLeft + chunkSize <= nextMarkerIdx) {
@@ -647,35 +683,31 @@ class SDCardWalSyncImpl implements SDCardWalSync {
           }
 
           // If we've reached a marker boundary, flush remaining frames before it and advance timerStart
-          if (timestampMarkers.any((m) => m.key == nextMarkerIdx) &&
-              nextMarkerIdx <= bytesData.length &&
-              bytesLeft < nextMarkerIdx) {
-            var chunk = bytesData.sublist(bytesLeft, nextMarkerIdx);
-            var chunkFrames = chunk.length;
-            if (chunkFrames > 0) {
+          if (appliedMarkers < timestampMarkers.length && nextMarkerIdx <= bytesData.length) {
+            if (bytesLeft < nextMarkerIdx) {
+              var chunk = bytesData.sublist(bytesLeft, nextMarkerIdx);
+              var chunkFrames = chunk.length;
               var chunkSecs = chunkFrames ~/ wal.codec.getFramesPerSecond();
               bytesLeft = nextMarkerIdx;
               try {
                 var file = await _flushToDisk(wal, chunk, timerStart);
                 await callback(file, offset, timerStart, chunkFrames);
+                timerStart += chunkSecs;
               } catch (e) {
                 Logger.debug('Error flushing segment at marker: $e');
                 hasError = true;
                 if (!completer.isCompleted) completer.completeError(e);
                 rethrow;
               }
-              timerStart += chunkSecs;
             } else {
               bytesLeft = nextMarkerIdx;
             }
-            // Apply the marker's epoch
-            for (var m in timestampMarkers) {
-              if (m.key == nextMarkerIdx) {
-                timerStart = m.value;
-                _activeClockRun = null;
-                break;
-              }
-            }
+            // Apply the marker's epoch — including when it sits exactly at the
+            // flush frontier (zero residual frames before it); the old
+            // `bytesLeft < nextMarkerIdx` guard skipped those forever.
+            timerStart = timestampMarkers[appliedMarkers].value;
+            _activeClockRun = null;
+            appliedMarkers++;
           }
         }).catchError((_) {});
       },
@@ -827,6 +859,8 @@ class SDCardWalSyncImpl implements SDCardWalSync {
       Logger.debug('SDCard: CLEAR not acknowledged — leaving wal as miss');
       throw StateError('SD card clear not acknowledged');
     }
+    // The card is empty; a future recording must not reuse this run.
+    _forgetEstimatedClockRun(wal.device);
 
     return SyncLocalFilesResponse(newConversationIds: [], updatedConversationIds: []);
   }

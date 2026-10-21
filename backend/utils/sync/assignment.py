@@ -28,7 +28,7 @@ from utils.conversations.smart_merge_policy import user_managed as _policy_user_
 from utils.conversations.relevance_rules import deterministic_relevance
 from utils.batch_pipeline.live_projection import replace_record
 from utils.sync.capture_repeat_evidence import capture_covered_indices
-from utils.sync.clock_run import SYNC_CLOCK_RUN_FIELD
+from utils.sync.live_overlap import same_clock_run
 from utils.sync.live_speech_dedupe import (
     MAX_LIVE_SEGMENTS,
     append_alignment_method,
@@ -74,7 +74,7 @@ def capture_mismatch(left: dict, right: dict) -> str:
     ]
     if bool(left.get('is_locked')) != bool(right.get('is_locked')):
         fields.append('lock')
-    if left.get(SYNC_CLOCK_RUN_FIELD) != right.get(SYNC_CLOCK_RUN_FIELD):
+    if not same_clock_run(left, right):
         fields.append('clock')
     return '_'.join(fields) or 'none'
 

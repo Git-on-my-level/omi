@@ -37,7 +37,7 @@ from config.conversation_smart_merge import (
 )
 from utils.conversations.smart_merge_state import Fragment
 from utils.conversations.wake_word import find_wake_word_matches
-from utils.sync.clock_run import SYNC_CLOCK_RUN_FIELD
+from utils.sync.clock_run import SYNC_CLOCK_RUN_FIELD, clock_run_partition_enabled
 from utils.stt.speaker_identity import ConversationSpeakerIdAllocator
 
 SMART_MERGE_FIELD = 'smart_merge'
@@ -112,12 +112,14 @@ def partition(row: Mapping[str, Any]) -> tuple[Any, Any, bool, Any]:
     """Unknown device is its own partition, never a wildcard (same rule as sync).
 
     So is an estimated-clock run: its recorded gap to any other row is fiction.
+    The run key follows the partition kill switch (see ``same_clock_run``), so
+    disabling the partition also disables smart-merge splitting on stored runs.
     """
     return (
         row.get('source'),
         row.get('client_device_id'),
         bool(row.get('is_locked')),
-        row.get(SYNC_CLOCK_RUN_FIELD),
+        row.get(SYNC_CLOCK_RUN_FIELD) if clock_run_partition_enabled() else None,
     )
 
 

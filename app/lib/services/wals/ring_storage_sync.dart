@@ -61,7 +61,12 @@ const ringRecordGapBreakSeconds = 60;
   required String? currentRun,
 }) {
   if (!rtcValid || ts <= 0) {
-    return (breaks: false, run: currentRun ?? Wal.newClockRun());
+    // Entering an untimed stretch from a device-clocked record must break the
+    // chunk: a chunk carries its first record's run, so a timed record first
+    // would upload the estimated audio untagged and free to merge with
+    // unrelated device-clocked audio.
+    final fromTimed = rtcValid && (previousTs ?? 0) > 0;
+    return (breaks: fromTimed, run: currentRun ?? Wal.newClockRun());
   }
   if (previousTs == null) return (breaks: false, run: currentRun);
   // A device-clocked record after an untimed one starts a new recording.
@@ -759,6 +764,11 @@ class RingStorageSyncImpl implements RingStorageSync {
         if (await _custody.isDurableLiveRecord(custodyDeviceId, ringId, seq)) {
           skippedDuplicates++;
           if (seq == provenSeq) provenSeq = seq + 1;
+          // A skipped record still occupies the recording timeline: without
+          // its timestamp the first offline record after a live prefix looks
+          // like the first record ever and its stale clock could merge with
+          // unrelated device-clocked audio.
+          lastRecordTs = ts;
           continue;
         }
 

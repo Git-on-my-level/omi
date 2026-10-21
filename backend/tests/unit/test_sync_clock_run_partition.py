@@ -101,6 +101,55 @@ def test_kill_switch_restores_previous_behaviour(monkeypatch):
     assert segment_name_prefix('audio_x_opus_16000_1_fs160_clkeab12_1792157893.bin') == ''
 
 
+def test_kill_switch_ignores_persisted_runs_in_every_comparison(monkeypatch):
+    """Rows already carrying a stored run must stop splitting when the switch
+    is off: retries of one recording re-merge, and stored-run rows can join
+    plain temporal merging again (assignment, capture_mismatch, smart-merge)."""
+    monkeypatch.setenv('SYNC_CLOCK_RUN_PARTITION_ENABLED', 'false')
+    store = StrictFirestore()
+    # First piece ingested while the switch was on keeps its stored run.
+    intake(store, piece('stored', SYNC_AT - 3600, run='old'))
+    # The retry arrives with no token at all (clock_run_from_path is off).
+    intake(store, piece('retry', SYNC_AT - 3600 + 60))
+    rows = conversations(store)
+    assert len(rows) == 1
+    trusted = {'source': 'omi', 'client_device_id': 'd', 'is_locked': False}
+    stored = {**trusted, SYNC_CLOCK_RUN_FIELD: 'r1'}
+    incoming = {**trusted, SYNC_CLOCK_RUN_FIELD: 'r2'}
+    assert compatible_capture(stored, dict(incoming))
+    assert capture_mismatch(stored, incoming) == 'none'
+    assert partition(stored) == partition(dict(trusted))
+
+
+def test_smart_merge_predecessor_projection_carries_the_run():
+    """Without the run in the predecessor projection, every same-run predecessor
+    reads as run-less and is rejected before its full document is read."""
+    from types import SimpleNamespace
+
+    from database import smart_merge as smart_merge_db
+
+    selected = {}
+
+    class Query:
+        def __getattr__(self, name):
+            def step(*args, **kwargs):
+                if name == 'select':
+                    selected['fields'] = args[0]
+                return self
+
+            return step
+
+        def stream(self):
+            return iter([])
+
+    client = SimpleNamespace(collection=lambda name: Query())
+    created_before = datetime.fromtimestamp(SYNC_AT, timezone.utc)
+    smart_merge_db.find_preceding_conversations(
+        'u', source='omi', created_before=created_before, limit=1, firestore_client=client
+    )
+    assert SYNC_CLOCK_RUN_FIELD in selected['fields']
+
+
 def test_estimated_piece_never_joins_overlapping_device_clocked_conversation():
     """A stale clock can overlap real audio; overlap of invented time is not proof."""
     store = StrictFirestore()

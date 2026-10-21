@@ -79,6 +79,23 @@ void main() {
       expect(second.run, first.run);
     });
 
+    test('an uptime-flagged record after a trusted one breaks the chunk (P1)', () {
+      // rtcValid true, but the record itself carries the uptime flag -> ts 0.
+      final b = ringRecordClockBoundary(previousTs: 1792157893, ts: 0, rtcValid: true, currentRun: null);
+      expect(b.breaks, isTrue);
+      expect(b.run, isNotNull);
+      // The following untimed records stay in that run without further breaks.
+      final next = ringRecordClockBoundary(previousTs: 0, ts: 0, rtcValid: true, currentRun: b.run);
+      expect(next.breaks, isFalse);
+      expect(next.run, b.run);
+    });
+
+    test('the first record of a download never breaks (no previous to differ from)', () {
+      final b = ringRecordClockBoundary(previousTs: null, ts: 0, rtcValid: true, currentRun: null);
+      expect(b.breaks, isFalse);
+      expect(b.run, isNotNull);
+    });
+
     test('a device-clocked record after an untimed one starts a new recording', () {
       final b = ringRecordClockBoundary(previousTs: 0, ts: 1792157893, rtcValid: true, currentRun: 'est');
       expect(b.breaks, isTrue);
