@@ -348,7 +348,12 @@ def make_emulator() -> StoreHarness:
     return harness
 
 
-def make_postgres() -> StoreHarness:
+def make_postgres(*, keep: bool = False) -> StoreHarness:
+    """A throwaway ``batch_pipeline_test_*`` namespace on the configured Postgres.
+
+    ``keep=True`` closes the pool but leaves the namespace rows in place so a caller can read
+    post-run state (the staging load receipt's parity leg) and purge them itself.
+    """
     from database.jobstore.connection import Pool
     from database.jobstore.postgres_store import PostgresStore
     from testing.pipeline_sim.store import CustomerData
@@ -361,7 +366,8 @@ def make_postgres() -> StoreHarness:
     harness = StoreHarness('postgres', store, customer, namespace, token)
 
     def cleanup() -> None:
-        store.purge_namespace()
+        if not keep:
+            store.purge_namespace()
         pool.close()
 
     harness.cleanup_steps.append(cleanup)

@@ -30,13 +30,13 @@ def _ms(values: list[float], q: float) -> float | None:
     return round(ordered[min(len(ordered) - 1, int(q * len(ordered)))] * 1000, 1)
 
 
-def _stores(backend: str, replicas: int, pool_size: int):
+def _stores(backend: str, replicas: int, pool_size: int, keep: bool = False):
     if backend == 'postgres':
         from database.jobstore.connection import Pool
         from database.jobstore.postgres_store import PostgresStore
         from testing.store_fixtures import make_postgres, postgres_connect
 
-        harness = make_postgres()
+        harness = make_postgres(keep=keep)
         stores = [
             PostgresStore(
                 harness.namespace,
@@ -59,7 +59,7 @@ def run(args: argparse.Namespace) -> dict:
     from utils.batch_pipeline.contracts import Priority, WorkItem, WorkResult
     from utils.batch_pipeline.scheduler import Scheduler
 
-    harness, stores = _stores(args.backend, args.replicas, args.pool)
+    harness, stores = _stores(args.backend, args.replicas, args.pool, keep=getattr(args, 'keep', False))
     rng = random.Random(args.seed)
     items = []
     for o in range(args.owners):
@@ -109,7 +109,10 @@ def run(args: argparse.Namespace) -> dict:
             enqueue(scheduler, item)
 
     def pull(replica):
-        scheduler = Scheduler(stores[replica], worker_id=f'r{replica}')
+        try:
+            scheduler = Scheduler(stores[replica], worker_id=f'r{replica}')
+        except TypeError:  # older images predate the producer-token worker id
+            scheduler = Scheduler(stores[replica])
         while not stop.is_set():
             started = time.monotonic()
             try:
@@ -164,6 +167,7 @@ def run(args: argparse.Namespace) -> dict:
                 store.pool.close()
     return {
         'config': vars(args),
+        'namespace': harness.namespace,
         'jobs': len(items),
         'leased': len(leased),
         'leased_twice': sum(1 for count in leased.values() if count > 1),
@@ -190,6 +194,11 @@ def main() -> None:
     parser.add_argument('--spread', choices=('true', 'false'), default='true')
     parser.add_argument('--pool', type=int, default=4)
     parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument(
+        '--keep',
+        action='store_true',
+        help='leave the batch_pipeline_test_* namespace rows in place (the caller purges them)',
+    )
     print(json.dumps(run(parser.parse_args()), indent=1))
 
 
