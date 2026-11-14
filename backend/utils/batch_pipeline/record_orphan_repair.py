@@ -101,7 +101,12 @@ def candidate_refusal(row, now):
 def owner_privacy_read(tx, uid, expected_generation=None):
     snapshots = {}
     generation = assert_batch_write_allowed(
-        tx.client, tx.transaction, uid, expected_generation=expected_generation, snapshots=snapshots
+        tx.client,
+        tx.transaction,
+        uid,
+        expected_generation=expected_generation,
+        snapshots=snapshots,
+        allow_token_mint=False,
     )
     # A certified memo decision serves no rows; read the one row this caller
     # needs in the same transaction. The token read that certified the decision
@@ -130,6 +135,7 @@ def privacy_read(tx, uid, conversation_ids=(), expected_generation=None):
         conversation_ids=conversation_ids,
         expected_generation=expected_generation,
         snapshots=snapshots,
+        allow_token_mint=False,
     )
     return generation
 

@@ -91,6 +91,7 @@ def assert_batch_write_allowed(
     conversation_ids: Iterable[str] = (),
     expected_generation: int | None = None,
     snapshots: dict | None = None,
+    allow_token_mint: bool = True,
     read_budget=None,
     verified_out: set | None = None,
 ) -> int:
@@ -136,6 +137,8 @@ def assert_batch_write_allowed(
         read_budget=read_budget,
         verified_out=verified_out,
     )
+    if enforce:
+        kwargs['allow_token_mint'] = allow_token_mint
     # The candidate always gets a throwaway export: a comparison may fill its
     # own copy but can never publish rows or perturb the caller's export. It
     # also decides with the owner path ON (owner_candidate): it must compute
@@ -146,6 +149,7 @@ def assert_batch_write_allowed(
         snapshots={} if snapshots is not None else None,
         read_budget=read_budget,
         owner_candidate=True,
+        allow_token_mint=allow_token_mint,
     )
     function = _assert_batch_write_allowed_memo if enforce else _assert_batch_write_allowed_live
     live_evidence = metrics.DecisionEvidence() if shadow or enforce else None
@@ -203,6 +207,7 @@ def _assert_batch_write_allowed_memo(
     conversation_ids: Iterable[str] = (),
     expected_generation: int | None = None,
     snapshots: dict | None = None,
+    allow_token_mint: bool = True,
     read_budget=None,
     verified_out: set | None = None,
     owner_candidate: bool = False,
@@ -355,7 +360,7 @@ def _assert_batch_write_allowed_memo(
             metrics.memo_result('batch', 'hit')
             return generation
         metrics.memo_result('batch', 'miss' if eligible else 'ineligible')
-        if not eligible and _mintable(snapshot):
+        if allow_token_mint and not eligible and _mintable(snapshot):
             metrics.memo_result('batch', 'no_token')
             try:
                 schedule_token_mint(client, reference, uid)
