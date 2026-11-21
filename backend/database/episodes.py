@@ -42,7 +42,7 @@ from config.episodes import (
 from utils.conversations.recorded_time import conversation_span, sync_recorded_end
 from utils.conversations.fragment_visibility import is_relevance_discarded
 
-from database import episode_receipts, episode_timeline
+from database import episode_receipts, episode_timeline, live_member_notes
 from database._client import get_firestore_client
 from database.transcript_pointer import run_preloaded_transactional as run_transactional
 from database.conversations import decode_transcript_segments_verified
@@ -155,7 +155,10 @@ def get_episode_membership_snapshot(
         return None
     return {
         'id': episode_id,
-        **{key: raw.get(key) for key in ('status', 'conversation_ids', 'member_activity', 'recorded_merged_into')},
+        **{
+            key: raw.get(key)
+            for key in ('status', 'conversation_ids', 'member_activity', 'recorded_merged_into', 'last_activity_at')
+        },
     }
 
 
@@ -778,6 +781,7 @@ def _close(
     split_after: Optional[datetime] = None,
     retained_member_window: bool = False,
     synced_f: bool = False,
+    idle_member: live_member_notes.IdleMemberClose | None = None,
 ) -> Optional[dict[str, Any]]:
     timeline_enabled = recorded_episodes_enabled()
     timeline_row = None
@@ -795,6 +799,15 @@ def _close(
         and raw.get('last_activity_at') != expected_activity_at
     ):
         return None  # Speech won the race with a lazy reader's stale idle decision.
+    replay_member = None
+    replay_expires = None
+    if idle_member is not None:
+        if reason != 'idle' or expected_activity_at is None:
+            return None
+        replay = idle_member.authorize(transaction, client, uid, episode_id, raw)
+        if replay is None:
+            return None
+        replay_member, replay_expires = replay
     if expected_conversation_ids is not None and set(raw.get('conversation_ids') or []) != set(
         expected_conversation_ids
     ):
@@ -817,15 +830,18 @@ def _close(
     ends = []
     hidden = set(raw.get('discarded_conversation_ids') or []) | set(raw.get('duplicate_conversation_ids') or [])
     for cid in window.get('conversation_ids') or []:
-        member = (
-            client.collection('users')
-            .document(uid)
-            .collection('conversations')
-            .document(cid)
-            .get(transaction=transaction)
-            .to_dict()
-            or {}
-        )
+        if idle_member is not None and cid == idle_member.conversation_id:
+            member = replay_member or {}
+        else:
+            member = (
+                client.collection('users')
+                .document(uid)
+                .collection('conversations')
+                .document(cid)
+                .get(transaction=transaction)
+                .to_dict()
+                or {}
+            )
         if (
             cid in hidden
             or is_relevance_discarded(member)
@@ -860,10 +876,13 @@ def _close(
             fence_row=timeline_row,
             **({'candidate_limit': episode_timeline.F_JOIN_CANDIDATE_LIMIT} if synced_f else {}),
         )
-        if fence:
-            transaction.set(fence[0], {'version': fence[1]})
     else:
         merged['recorded_end'] = end
+        fence = None
+    if replay_expires is not None and replay_expires <= datetime.now(timezone.utc):
+        return None
+    if fence:
+        transaction.set(fence[0], {'version': fence[1]})
     merged['last_activity_at'] = end
     merged['state_version'] = int(raw.get('state_version') or 0) + 1
     transaction.set(ref, seal(uid, merged))
@@ -886,6 +905,7 @@ def close_episode(
     firestore_client: Any = None,
     retained_member_window: bool = False,
     synced_f: bool = False,
+    idle_member: live_member_notes.IdleMemberClose | None = None,
 ) -> Optional[dict[str, Any]]:
     """Close a live episode once. Returns the closed state, or None when it was not live.
 
@@ -895,7 +915,9 @@ def close_episode(
     """
     client = _client(firestore_client)
     transaction_options: dict[str, Any] = (
-        {'attempts': 1, 'initial_transaction': client.transaction(max_attempts=1)} if synced_f else {}
+        {'attempts': 1, 'initial_transaction': client.transaction(max_attempts=1)}
+        if synced_f or idle_member is not None
+        else {}
     )
     return run_transactional(
         client,
@@ -911,6 +933,7 @@ def close_episode(
         split_after,
         retained_member_window,
         synced_f,
+        idle_member,
         **transaction_options,
     )
 

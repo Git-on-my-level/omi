@@ -55,6 +55,7 @@ from utils.sync.repeat_work_metrics import conversation_scope
 from utils.episodes.timeline import episode_owning_recorded_time, choose_recorded_episode
 from utils.episodes.timeline import episode_at as episode_at, episodes_between as episodes_between
 from database import episode_timeline, episode_attach_memo
+from database.live_member_notes import IdleMemberClose
 from database import episode_live_members as live_members_db
 from config import episode_live_members as live_members
 from database._client import get_firestore_client
@@ -361,6 +362,7 @@ def _close(
     retained_member_window: bool = False,
     f_detaches: Optional[set[str]] = None,
     synced_f: bool = False,
+    idle_member: IdleMemberClose | None = None,
 ) -> Optional[dict[str, Any]]:
     """Close once, returning committed state; None when the compare-and-swap loses.
 
@@ -387,16 +389,20 @@ def _close(
         ):
             return None
         episode = fresh
-    for cid in episode.get('recovered_conversation_ids') or []:
-        if cid == detach:
-            continue
-        row = read_product_conversation(
-            conversations_db.get_conversation, uid, cid, firestore_client=c.firestore_client
-        )
-        if row and not any(row.get(key) for key in ('deleted', 'discarded', 'sync_merged_into')):
-            _record_recovered(uid, str(episode['id']), cid, row, c)
-    if not synced_f:
-        episode = episodes_db.get_episode(uid, str(episode['id']), firestore_client=c.firestore_client) or episode
+    if idle_member is not None:
+        if episode.get('recovered_conversation_ids') or not policy.idle_close_due(episode, now):
+            return None
+    else:
+        for cid in episode.get('recovered_conversation_ids') or []:
+            if cid == detach:
+                continue
+            row = read_product_conversation(
+                conversations_db.get_conversation, uid, cid, firestore_client=c.firestore_client
+            )
+            if row and not any(row.get(key) for key in ('deleted', 'discarded', 'sync_merged_into')):
+                _record_recovered(uid, str(episode['id']), cid, row, c)
+        if not synced_f:
+            episode = episodes_db.get_episode(uid, str(episode['id']), firestore_client=c.firestore_client) or episode
     items = provisional_items(episode)
     transferred = [
         dict(item)
@@ -448,6 +454,7 @@ def _close(
         firestore_client=c.firestore_client,
         **({'retained_member_window': True} if retained_member_window else {}),
         **({'synced_f': True} if synced_f else {}),
+        **({'idle_member': idle_member} if idle_member is not None else {}),
     )
     if closed is not None:
         if (
@@ -497,6 +504,11 @@ def settle_episode_for_read(uid: str, episode: dict[str, Any], c: Collaborators)
             or episode
         )
     return episode
+
+
+def settle_episode_for_member_replay(uid: str, episode: dict[str, Any], idle_member: IdleMemberClose) -> bool:
+    c = Collaborators()
+    return _close(uid, episode, 'idle', c, now=_now(c), idle_member=idle_member) is not None
 
 
 def _close_stale_current(

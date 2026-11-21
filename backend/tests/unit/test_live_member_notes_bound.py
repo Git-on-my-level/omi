@@ -309,3 +309,95 @@ def test_idle_retry_reuses_real_transaction_and_speech_wins(monkeypatch, new_spe
     assert stored['status'] == ('live' if new_speech else 'closed')
     assert stored['conversation_ids'] == ['first', 'last']
     assert schedule.call_count == int(not new_speech)
+
+
+@pytest.mark.parametrize(
+    'race',
+    [None, 'speech', 'lease', 'membership', 'redirect', 'custody', 'deletion', 'byok', 'recovered', 'concurrent'],
+)
+def test_idle_non_omi_replay_closes_only_with_current_custody(deferred, monkeypatch, race):
+    owner, _, row = deferred
+    owner.update(last_activity_at=NOW - timedelta(minutes=31), state_version=1)
+    row.update(source='desktop', finalization_revision=1)
+    job = {
+        'uid': 'synthetic',
+        'conversation_id': 'first',
+        'status': 'leased',
+        'dispatch_generation': 7,
+        'lease_epoch': 8,
+        'lease_expires_at': datetime.max.replace(tzinfo=timezone.utc),
+        'finalization_revision': 1,
+        'processing_trigger': 'capture_end',
+        'last_failure_code': 'live_episode_notes',
+    }
+    episode_path = ('users', 'synthetic', 'episodes', 'episode')
+    link_path = ('users', 'synthetic', 'episode_links', 'first')
+    member_path = ('users', 'synthetic', 'conversations', 'first')
+    job_path = ('conversation_finalization_jobs', 'job')
+    store = StrictFirestore(
+        {
+            episode_path: dict(owner),
+            link_path: {'episode_id': 'episode'},
+            member_path: dict(row),
+            job_path: job,
+        }
+    )
+    monkeypatch.setenv('EPISODE_RECORDED_TIME_ENABLED', 'false')
+    monkeypatch.setattr(episodes, '_client', lambda c=None: store)
+    monkeypatch.setattr(service, '_now', lambda c: NOW)
+    schedule = Mock()
+    monkeypatch.setattr(service.composer, 'schedule_after_close', schedule)
+    paid = Mock(side_effect=AssertionError('non-Omi must not claim the paid age fallback'))
+    monkeypatch.setattr(permits, 'claim', paid)
+    close = episodes.close_episode
+
+    def racing_close(*args, **kwargs):
+        if race == 'speech':
+            store.rows[episode_path]['last_activity_at'] = NOW
+        elif race == 'lease':
+            store.rows[job_path]['lease_epoch'] += 1
+        elif race == 'membership':
+            store.rows[link_path]['episode_id'] = 'new-owner'
+        elif race == 'redirect':
+            store.rows[episode_path]['recorded_merged_into'] = 'new-owner'
+        elif race == 'custody':
+            store.rows[member_path]['record_lane_owner'] = 'batch_sync_v1'
+        elif race == 'deletion':
+            store.rows[('account_deletions', 'synthetic')] = {'wipe_status': 'pending'}
+        elif race == 'byok':
+            store.rows[job_path]['requires_byok'] = True
+        elif race == 'recovered':
+            store.rows[episode_path]['recovered_conversation_ids'] = ['first']
+        elif race == 'concurrent':
+            assert close(*args, **kwargs)['status'] == 'closed'
+        return close(*args, **kwargs)
+
+    monkeypatch.setattr(episodes, 'close_episode', racing_close)
+    assert member_notes.waits('synthetic', row, ProcessingTrigger.CAPTURE_END, ('job', 7, 8)) is (race is not None)
+    closed = race in {None, 'concurrent'}
+    assert store.rows[episode_path]['status'] == ('closed' if closed else 'live')
+    assert store.rows[episode_path]['conversation_ids'] == ['first', 'last']
+    assert store.rows[member_path]['status'] == 'processing'
+    assert schedule.call_count == int(race is None)
+    member_notes.before_model(
+        'synthetic',
+        SimpleNamespace(id='first', source='desktop'),
+        ProcessingTrigger.CAPTURE_END,
+        finalization_fence=('job', 7, 8),
+    )
+    paid.assert_not_called()
+
+
+@pytest.mark.parametrize('mode', ['active', 'kill_switch', 'no_replay_fence'])
+def test_non_omi_replay_stops_before_full_episode_read(deferred, monkeypatch, mode):
+    owner, _, row = deferred
+    row['source'] = 'desktop'
+    if mode != 'active':
+        owner['last_activity_at'] = NOW - timedelta(hours=1)
+    if mode == 'kill_switch':
+        monkeypatch.setenv('HOME_LIVE_MEMBER_NOTES_BOUNDED_ENABLED', 'off')
+    full = Mock(side_effect=AssertionError('idle-recovery preconditions did not hold'))
+    monkeypatch.setattr(episodes, 'get_episode', full)
+    fence = None if mode == 'no_replay_fence' else ('job', 7, 8)
+    assert member_notes.waits('synthetic', row, ProcessingTrigger.CAPTURE_END, fence)
+    full.assert_not_called()

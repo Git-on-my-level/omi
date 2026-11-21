@@ -86,7 +86,12 @@ def _settle_idle_owner(uid, owner):
     return full or owner
 
 
-def waits(uid: str, row: dict, trigger=ProcessingTrigger.SYNC_UPDATE) -> bool:
+def waits(
+    uid: str,
+    row: dict,
+    trigger=ProcessingTrigger.SYNC_UPDATE,
+    idle_replay_fence: tuple[str, int, int] | None = None,
+) -> bool:
     if not live_member_notes_enabled(uid) or trigger in EXPLICIT or not row.get('id'):
         return False
     try:
@@ -96,6 +101,30 @@ def waits(uid: str, row: dict, trigger=ProcessingTrigger.SYNC_UPDATE) -> bool:
         return False
     if not owner or owner.get('status') != 'live' or row['id'] not in owned_member_ids(owner):
         return False
+    if (
+        idle_replay_fence is not None
+        and trigger is ProcessingTrigger.CAPTURE_END
+        and bounded_member_notes_enabled()
+        and live_member_notes.eligible_idle_replay_member(row)
+        and row.get('finalization_job_id') == idle_replay_fence[0]
+        and not owner.get('recorded_merged_into')
+        and idle_close_due(owner, datetime.fromtimestamp(time.time(), timezone.utc))
+    ):
+        try:
+            full = episodes.get_episode(uid, owner['id'], follow_redirects=False)
+            if full is None or row['id'] not in owned_member_ids(full):
+                return True
+            version = full.get('state_version')
+            if type(version) is not int:
+                return True
+            service = importlib.import_module('utils.episodes.service')
+            close = live_member_notes.IdleMemberClose(row['id'], *idle_replay_fence, version)
+            if service.settle_episode_for_member_replay(uid, full, close):
+                logger.info('event=home_member_idle_recovery outcome=closed')
+                return False
+        except Exception as error:
+            _unavailable('idle_replay_recovery_unavailable', error)
+        return True  # A lost close fence leaves the job on its normal replay.
     if bounded_member_notes_enabled() and _bounded_retry(row):
         try:
             owner = _settle_idle_owner(uid, owner)

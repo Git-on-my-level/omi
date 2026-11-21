@@ -355,10 +355,15 @@ async def finalize_persisted_conversation(
             raise RuntimeError('desktop batch completion fenced')
         return ConversationFinalizationDisposition.completed
     await _episode_at_finalization_start(uid, conversation_id, conversation_data, trigger)
+    idle_replay_fence = (
+        (finalization_job_id, dispatch_generation, lease_epoch)
+        if not getattr(conversation, 'record_lane_owner', None)
+        else None
+    )
     if (
         conversation_data.get('transcript_segments')
         and live_member_notes_enabled(uid)
-        and await run_blocking(db_executor, member_notes.waits, uid, conversation_data, trigger)
+        and await run_blocking(db_executor, member_notes.waits, uid, conversation_data, trigger, idle_replay_fence)
     ):
         await _register_before_notes_wait(uid, conversation_data)
         return await _yield_live_member_notes(finalization_job_id, dispatch_generation, lease_epoch)
