@@ -454,7 +454,7 @@ def _close(
         firestore_client=c.firestore_client,
         **({'retained_member_window': True} if retained_member_window else {}),
         **({'synced_f': True} if synced_f else {}),
-        **({'idle_member': idle_member} if idle_member is not None else {}),
+        idle_member=idle_member,
     )
     if closed is not None:
         if (
